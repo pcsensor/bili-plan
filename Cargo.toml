@@ -1,0 +1,27 @@
+[package]
+name = "bili-planner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Bilibili 合集观看计划生成器（跨平台桌面应用，Rust + fenestra）"
+license = "MIT"
+
+[lib]
+name = "bili_planner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bili-planner"
+path = "src/main.rs"
+
+[dependencies]
+fenestra = "0.40"
+ureq = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+pollster = "0.4"
+
+# vello/wgpu are unusably slow without optimization; keep deps optimized even in dev.
+[profile.dev.package."*"]
+opt-level = 2
