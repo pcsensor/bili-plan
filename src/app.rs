@@ -2,6 +2,15 @@
 //!
 //! 与 Python 脚本功能一一对应；核心算法在 api / parse / plan / export
 //! 模块中，本模块只做状态编排与 UI。
+//!
+//! ## UI：macOS Liquid Glass
+//!
+//! 整体使用 fenestra 内置的 [`Surface::Glass`](fenestra_core::Surface::Glass)
+//! 材质——半透明 vibrancy tint 加 CPU 双通道背景模糊（`Material::popover`，
+//! `blur_radius` 18），加上高光边缘（`SpecularEdge`）、定向主体光泽（`Sheen`）
+//! 与背景自适应色温（`AdaptiveTint`）。页面背景用主题色 `accent_gradient`
+//! 加少量装饰色斑，让模糊层采样到彩色内容；交互元素在 hover/press 时由
+//! kit 自带的 state_layer + Fast color transition 保持玻璃质感一致。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,6 +22,10 @@ use crate::plan::{build_plan, fmt_human, fmt_seconds, note_for, trunc, Mode, Pla
 use crate::{extract_sid, Error};
 
 use fenestra::prelude::*;
+// fenestra 顶层重导出 fenestra_core::theme::Mode (Light/Dark)，与
+// crate::plan::Mode (split/whole) 同名，这里用别名区分。
+use fenestra::Mode as ThemeMode;
+
 // ---------------------------------------------------------------------------
 // 消息与状态
 // ---------------------------------------------------------------------------
@@ -187,30 +200,27 @@ impl PlannerApp {
     // -----------------------------------------------------------------------
 
     fn view(&self) -> Element<Msg> {
-        let header = row().w_full().items_center().justify_between().children([
-            text("Bilibili 合集观看计划")
-                .size(TextSize::Xl)
-                .weight(Weight::Semibold),
-            Element::from(
-                button(if self.dark { "亮色" } else { "暗色" })
-                    .variant(ButtonVariant::Secondary)
-                    .on_click(Msg::DarkToggled),
-            ),
-        ]);
+        let theme = self.theme();
 
-        let mut children: Vec<Element<Msg>> = vec![header, self.form_card()];
+        // 顶栏玻璃面板：承载标题与亮/暗切换。
+        let header = self.glass_header(&theme);
+
+        // 装饰色斑层（绝对定位，全屏），位于玻璃卡片之下。accent_gradient
+        // 已经提供主色变化，这里再叠几块低饱和度色斑，强化"毛玻璃背后有
+        // 真实彩色内容"的层次感。
+        let atmospheric = self.atmospheric_layer(&theme);
+
+        let mut children: Vec<Element<Msg>> = vec![atmospheric, header];
+
+        // 表单玻璃卡片。
+        children.push(self.form_card());
 
         if let Some(err) = &self.last_error {
-            children.push(callout(Status::Danger, err.clone()));
+            children.push(self.error_callout(err));
         }
 
         match &self.phase {
-            Phase::Loading => children.push(
-                row()
-                    .gap(SP2)
-                    .items_center()
-                    .children([spinner(), text("正在获取视频信息…")]),
-            ),
+            Phase::Loading => children.push(self.loading_row()),
             Phase::Ready(rd) => children.extend(self.ready_children(rd)),
             Phase::Input => {}
         }
@@ -220,42 +230,172 @@ impl PlannerApp {
                 .on_dismiss(Msg::DismissToast),
         ));
 
+        // 根容器：accent_gradient 作为页面底色（玻璃层要从中采样模糊内容），
+        // 并启用 animate_layout 让合集状态切换时各卡片位置平滑过渡。
         col()
             .w_full()
             .h_full()
+            .bg(theme.accent_gradient(135.0))
             .p(SP6)
             .gap(SP4)
             .scroll_y()
+            .animate_layout()
             .children(children)
+    }
+
+    /// Liquid Glass 风格的顶栏：玻璃面板承载标题与亮/暗切换按钮。
+    fn glass_header(&self, theme: &Theme) -> Element<Msg> {
+        // 顶栏右侧的二级按钮：叠一层自定义玻璃 fill + highlight top sheen，
+        // 让 Secondary 按钮在玻璃面板中保持"半透明胶囊"质感；hover/press
+        // 时由 kit state_layer 平滑叠加文字色 veil，玻璃底纹不破碎。
+        let theme_toggle = Element::from(
+            button(if self.dark { "亮色" } else { "暗色" })
+                .variant(ButtonVariant::Secondary)
+                .on_click(Msg::DarkToggled),
+        )
+        .themed(move |t: &Theme, s| {
+            s.bg(t.surface_raised.with_alpha(0.45))
+                .border(1.0, t.border_subtle)
+                .highlight_top(t.on_accent.with_alpha(0.10))
+        });
+
+        let _ = theme; // 当前未直接使用，预留给后续 per-element 主题
+        row()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .px(SP4)
+            .py(SP3)
+            .rounded(R_LG)
+            .surface(Surface::Glass)
+            .overflow_hidden()
+            .transition(Transition::colors())
+            .children([
+                text("Bilibili 合集观看计划")
+                    .size(TextSize::Xl)
+                    .weight(Weight::Semibold),
+                theme_toggle,
+            ])
+    }
+
+    /// 装饰性低饱和度色斑，给毛玻璃模糊层提供采样内容；同时让暗色 / 亮色
+    /// 模式下都有彩色基调。三个绝对定位的大圆斑，按 z-order 在玻璃卡片之下。
+    fn atmospheric_layer(&self, theme: &Theme) -> Element<Msg> {
+        let _ = theme; // 颜色由 themed() 闭包内部解析
+                       // 左上：品牌色高饱和斑（accent step 10）
+        let blob_a = div()
+            .absolute()
+            .top(-180.0)
+            .left(-140.0)
+            .w(560.0)
+            .h(560.0)
+            .rounded_full()
+            .themed(|t: &Theme, s| s.bg(t.accents.step(10).with_alpha(0.42)));
+        // 右下：品牌色中饱和斑（accent step 8）做色彩呼应
+        let blob_b = div()
+            .absolute()
+            .bottom(-220.0)
+            .right(-180.0)
+            .w(640.0)
+            .h(640.0)
+            .rounded_full()
+            .themed(|t: &Theme, s| s.bg(t.accents.step(8).with_alpha(0.36)));
+        // 中右：浅色 step 7 斑，让背景略偏冷蓝
+        let blob_c = div()
+            .absolute()
+            .top(80.0)
+            .right(120.0)
+            .w(380.0)
+            .h(380.0)
+            .rounded_full()
+            .themed(|t: &Theme, s| s.bg(t.accents.step(7).with_alpha(0.28)));
+        // 左下：浅色 step 6 斑，进一步丰富背景
+        let blob_d = div()
+            .absolute()
+            .bottom(40.0)
+            .left(60.0)
+            .w(420.0)
+            .h(420.0)
+            .rounded_full()
+            .themed(|t: &Theme, s| s.bg(t.accents.step(6).with_alpha(0.30)));
+
+        div()
+            .absolute()
+            .top(0.0)
+            .left(0.0)
+            .w_full()
+            .h_full()
+            .overflow_hidden()
+            .children([blob_a, blob_b, blob_c, blob_d])
+    }
+
+    /// 玻璃材质卡片（替代 kit `card()`）：padding/gap 与 `card()` 一致，
+    /// 但渲染为 `Surface::Glass`（毛玻璃 + 边缘高光 + 深阴影）。
+    /// `overflow_hidden` 让玻璃面板里的 sheen 高光和子元素不会突破圆角。
+    fn glass_card<Msg: 'static>() -> Element<Msg> {
+        col()
+            .p(SP6)
+            .gap(SP3)
+            .surface(Surface::Glass)
+            .overflow_hidden()
+            .transition(Transition::colors())
     }
 
     fn form_card(&self) -> Element<Msg> {
         let loading = self.loading();
-        let days_field = field("目标观看天数").child(
+
+        // 玻璃化输入框：在 kit 输入控件上直接应用 Surface::Glass 材质——
+        // kit 的 text_input 自身有 bg/border，surface() 会用玻璃 fill + 高光
+        // 边缘覆盖它们，但保留 hover（border_strong）/ focus（accent）两条
+        // themed 路径，因此输入框在玻璃面板中既透出底色又有清晰的聚焦环。
+        let link_input = Element::from(
+            text_input(&self.input)
+                .placeholder("https://www.bilibili.com/video/BV1ps4y1d73V 或 BV 号 或 sid=6789")
+                .width(560.0)
+                .on_input(Msg::EditInput)
+                .id("input"),
+        )
+        .surface(Surface::Glass);
+
+        let days_input = Element::from(
             text_input(&self.days_text)
                 .placeholder("如 30")
                 .width(120.0)
                 .on_input(Msg::EditDays)
                 .id("days"),
-        );
+        )
+        .surface(Surface::Glass);
+
+        let cookie_input = Element::from(
+            text_input(&self.cookie)
+                .placeholder("SESSDATA=xxx")
+                .width(560.0)
+                .on_input(Msg::EditCookie)
+                .id("cookie"),
+        )
+        .surface(Surface::Glass);
+
+        // 主按钮（玻璃上的实色强调）：保留 Primary 实色填充，但在玻璃表面
+        // 上加 highlight_top sheen 让按钮本身也呈现高光，与 Liquid Glass
+        // 调性一致；press 时由 kit 默认的 active_themed 切换到 accent_active。
+        let primary_btn = Element::from(
+            button("获取视频信息")
+                .on_click(Msg::Fetch)
+                .disabled(loading),
+        )
+        .themed(|t: &Theme, s| s.highlight_top(t.on_accent.with_alpha(0.18)));
+
+        let days_field = field("目标观看天数").child(days_input);
         let mode_field = field("计划模式").child(segmented(
             self.mode.index(),
             ["split 精确切分", "whole 完整不拆"],
             Msg::ModeChanged,
         ));
-        card().children([
+        Self::glass_card().children([
             Element::from(
                 field("链接 / BV 号 / 合集 sid")
                     .help("支持 https://www.bilibili.com/video/BVxxxx、BV 号或合集 sid=xxxx 链接")
-                    .child(
-                        text_input(&self.input)
-                            .placeholder(
-                                "https://www.bilibili.com/video/BV1ps4y1d73V 或 BV 号 或 sid=6789",
-                            )
-                            .width(560.0)
-                            .on_input(Msg::EditInput)
-                            .id("input"),
-                    ),
+                    .child(link_input),
             ),
             row()
                 .gap(SP4)
@@ -264,20 +404,10 @@ impl PlannerApp {
             Element::from(
                 field("Cookie（可选，风控时使用）")
                     .help("例如 SESSDATA=xxx；留空则匿名请求")
-                    .child(
-                        text_input(&self.cookie)
-                            .placeholder("SESSDATA=xxx")
-                            .width(560.0)
-                            .on_input(Msg::EditCookie)
-                            .id("cookie"),
-                    ),
+                    .child(cookie_input),
             ),
             row().gap(SP3).items_center().children([
-                Element::from(
-                    button("获取视频信息")
-                        .on_click(Msg::Fetch)
-                        .disabled(loading),
-                ),
+                primary_btn,
                 if loading {
                     text("获取中…请稍候").size(TextSize::Sm)
                 } else {
@@ -287,6 +417,26 @@ impl PlannerApp {
                 },
             ]),
         ])
+    }
+
+    fn error_callout(&self, err: &str) -> Element<Msg> {
+        // 错误提示玻璃面板：kit `callout()` 自身已有 status 色调；包一层玻璃
+        // 让错误信息在半透明面板上更醒目，outer rounded + inner rounded 同
+        // 心（Surface::Glass 的半径减去 SP1）。
+        callout(Status::Danger, err.to_string())
+            .surface(Surface::Glass)
+            .overflow_hidden()
+    }
+
+    fn loading_row(&self) -> Element<Msg> {
+        row()
+            .gap(SP2)
+            .items_center()
+            .surface(Surface::Glass)
+            .overflow_hidden()
+            .p(SP4)
+            .rounded(R_LG)
+            .children([spinner(), text("正在获取视频信息…")])
     }
 
     fn ready_children(&self, rd: &ReadyState) -> Vec<Element<Msg>> {
@@ -320,7 +470,7 @@ impl PlannerApp {
                 .size(TextSize::Sm),
             ]);
         }
-        out.push(card().children(info));
+        out.push(Self::glass_card().children(info));
 
         // 多科目选择
         if rd.groups.len() > 1 {
@@ -346,29 +496,33 @@ impl PlannerApp {
                         .on_select(Msg::SelectGroup(i)),
                 ));
             }
-            out.push(card().children(sel));
+            out.push(Self::glass_card().children(sel));
         }
 
-        // 操作按钮
+        // 操作按钮：主按钮（生成）保留 Primary 实色，副按钮（导出）用玻璃
+        // 玻璃的 Secondary 半透明胶囊，与整体调性统一。
         let has_plan = rd.plan.is_some();
-        out.push(
-            row().gap(SP3).children([
-                Element::from(
-                    button("生成观看计划")
-                        .variant(ButtonVariant::Secondary)
-                        .on_click(Msg::Generate),
-                ),
-                Element::from(
-                    button("导出计划文本（UTF-8）")
-                        .on_click(Msg::Export)
-                        .disabled(!has_plan),
-                ),
-            ]),
-        );
+        let generate_btn = Element::from(
+            button("生成观看计划")
+                .variant(ButtonVariant::Secondary)
+                .on_click(Msg::Generate),
+        )
+        .themed(|t: &Theme, s| {
+            s.bg(t.surface_raised.with_alpha(0.45))
+                .border(1.0, t.border_subtle)
+                .highlight_top(t.on_accent.with_alpha(0.10))
+        });
+        let export_btn = Element::from(
+            button("导出计划文本（UTF-8）")
+                .on_click(Msg::Export)
+                .disabled(!has_plan),
+        )
+        .themed(|t: &Theme, s| s.highlight_top(t.on_accent.with_alpha(0.18)));
+        out.push(row().gap(SP3).children([generate_btn, export_btn]));
 
-        // 计划表格
+        // 计划表格：包裹玻璃面板，让表格内容悬浮在毛玻璃上。
         if let Some(p) = &rd.plan {
-            out.push(self.plan_table(p));
+            out.push(self.plan_table_glass(p));
         } else {
             out.push(
                 text("填写目标天数后点击「生成观看计划」。")
@@ -380,7 +534,7 @@ impl PlannerApp {
         out
     }
 
-    fn plan_table(&self, p: &PlanData) -> Element<Msg> {
+    fn plan_table_glass(&self, p: &PlanData) -> Element<Msg> {
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut cumulative: i64 = 0;
         for (di, entries) in p.plan.iter().enumerate() {
@@ -423,11 +577,18 @@ impl PlannerApp {
             }
         }
 
-        Element::from(
-            data_table(["天", "视频#", "标题", "本日时长", "备注"], rows)
-                .id("plan-table")
-                .column_widths([64.0, 84.0, 320.0, 116.0, 400.0]),
-        )
+        // 玻璃面板包住 data_table；面板的 SP1 padding 让表格内容与玻璃边缘
+        // 留呼吸空间，overflow_hidden 让表格内部可能溢出的横线不出破圆角。
+        col()
+            .p(SP1)
+            .rounded(R_LG)
+            .surface(Surface::Glass)
+            .overflow_hidden()
+            .child(Element::from(
+                data_table(["天", "视频#", "标题", "本日时长", "备注"], rows)
+                    .id("plan-table")
+                    .column_widths([64.0, 84.0, 320.0, 116.0, 400.0]),
+            ))
     }
 }
 
@@ -673,11 +834,16 @@ impl App for PlannerApp {
     }
 
     fn theme(&self) -> Theme {
-        if self.dark {
-            Theme::dark()
+        // Liquid Glass 配色：duotone 中性场（冷色 220°，适度饱和度 4）+ 同
+        // 色系重音（200° 青蓝），让页面既有彩色基调又有冷色玻璃感。提高
+        // corner_smoothing 到 0.8，把所有圆角推向 Apple "fuller squircle"
+        // 调性，配合 Surface::Glass 的边缘高光形成统一语言。
+        let mode = if self.dark {
+            ThemeMode::Dark
         } else {
-            Theme::light()
-        }
+            ThemeMode::Light
+        };
+        Theme::duotone(220.0, 4.0, 200.0, mode).with_corner_smoothing(0.8)
     }
 
     fn view(&self) -> Element<Msg> {

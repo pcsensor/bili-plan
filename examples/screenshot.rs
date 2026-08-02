@@ -67,11 +67,13 @@ fn main() {
     app.days_text = "5".to_string();
     app.phase = Phase::Ready(rd);
 
-    let light = render_app(&mut app, &[], (1120, 820), &Theme::light());
+    let light_theme = app.theme();
+    let light = render_app(&mut app, &[], (1120, 820), &light_theme);
     light.save("ui_preview_light.png").expect("save light png");
 
     app.dark = true;
-    let dark = render_app(&mut app, &[], (1120, 820), &Theme::dark());
+    let dark_theme = app.theme();
+    let dark = render_app(&mut app, &[], (1120, 820), &dark_theme);
     dark.save("ui_preview_dark.png").expect("save dark png");
 
     println!("saved ui_preview_light.png / ui_preview_dark.png");
