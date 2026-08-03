@@ -79,9 +79,10 @@ fn main() {
     let dark = render_app(&mut app, &[], (1120, 1560), &dark_theme);
     dark.save("ui_preview_dark.png").expect("save dark png");
 
-    // 长计划场景（60 视频 / 10 天 ≈ 70 行）：回归验证——超过 data_table
-    // 的 50 行自动虚拟化阈值时，整表必须 inline 渲染（2026-08-03 修复，
-    // 否则第 4 天起的行在页面上"消失"）。
+    // 长计划场景（60 视频 / 10 天 ≈ 70 行）：超过 data_table 的 50 行
+    // 自动虚拟化阈值时，表体切换为内部滚动 + 虚拟化（每帧只构建可视窗口
+    // 内的行，长计划滑动保持 60fps；2026-08-03 修复）。截图在真实窗口
+    // 高度即可看到卡片内的固定高度表体与吸顶表头。
     let long_episodes: Vec<EpisodeItem> = (1..=60)
         .map(|i| EpisodeItem {
             title: format!("P{i} 离散数学 第{i}讲"),
@@ -114,7 +115,7 @@ fn main() {
     long_app.days_text = long_days.to_string();
     long_app.phase = Phase::Ready(long_rd);
     let long_theme = long_app.theme();
-    let long = render_app(&mut long_app, &[], (1120, 3400), &long_theme);
+    let long = render_app(&mut long_app, &[], (1120, 1560), &long_theme);
     long.save("ui_preview_long.png").expect("save long png");
 
     println!("saved ui_preview_light.png / ui_preview_dark.png / ui_preview_long.png");

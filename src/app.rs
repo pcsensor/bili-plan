@@ -694,6 +694,13 @@ impl PlannerApp {
         out
     }
 
+    /// kit `data_table` 的自动虚拟化行数阈值（与 fenestra-kit
+    /// `AUTO_SCROLL_ROWS` 保持一致）：超过该阈值表体切换为内部滚动 +
+    /// 虚拟化，每帧只构建/绘制可视窗口内的行（O(1)），长计划滑动不掉帧。
+    const PLAN_TABLE_VIRTUAL_ROWS: usize = 50;
+    /// 虚拟化计划表的卡片高度（logical px）：约 15 行 + 表头 + 留白。
+    const PLAN_TABLE_HEIGHT: f32 = 560.0;
+
     fn plan_table_card(&self, p: &PlanData) -> Element<Msg> {
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut cumulative: i64 = 0;
@@ -743,26 +750,36 @@ impl PlannerApp {
             }
         }
 
+        let n_rows = rows.len();
+        let table = Element::from(
+            data_table(["天", "视频#", "标题", "本日时长", "备注"], rows)
+                .id("plan-table")
+                .column_widths([64.0, 84.0, 320.0, 116.0, 400.0]),
+        );
+
         // Apple 卡片包住 data_table；面板的 SP1 padding 让表格内容与卡片
         // 边缘留呼吸空间，overflow_hidden 保证内部横线不突破 squircle 圆角。
         //
-        // `sticky_header(false)` 关键：kit data_table 在行数 > 50 时会自动
-        // 切换为虚拟化滚动表体（h_full 填满父高 + 内部滚动）。本应用的表格
-        // 嵌在页面级滚动流里，虚拟化会让表格高度塌缩为视口高度——例如
-        // 10 天计划约 80 行，只有前 ~23 行（约 3 天）可见，其余行看似
-        // "消失"。强制 inline 渲染让整表随页面一起滚动。
-        col()
+        // 行数超过 kit 的自动虚拟化阈值时，data_table 切换为虚拟化滚动
+        // 表体（内部滚动 + 吸顶表头）。此前用 `sticky_header(false)` 强制
+        // inline 整表随页面滚动——每帧都要重建/布局/绘制全部 70+ 行，
+        // 长计划滑动明显掉帧。虚拟化后每帧只处理可视窗口内的行（O(1)），
+        // 滑动恢复极致丝滑。
+        //
+        // 代价：虚拟化表体用 `h_full` 填满父高，必须有一个确定高度，
+        // 否则在页面级滚动流里会塌缩为视口高度（2026-08-03 的"第 4 天起
+        // 行消失"回归）。这里只对超过阈值的表给卡片固定高度；小表仍 inline
+        // 随页面滚动，保持原有的整页滚动体验。
+        let mut card = col()
             .p(SP1)
             .rounded(R_LG)
             .shrink0()
             .surface(Surface::Card)
-            .overflow_hidden()
-            .child(Element::from(
-                data_table(["天", "视频#", "标题", "本日时长", "备注"], rows)
-                    .id("plan-table")
-                    .column_widths([64.0, 84.0, 320.0, 116.0, 400.0])
-                    .sticky_header(false),
-            ))
+            .overflow_hidden();
+        if n_rows > Self::PLAN_TABLE_VIRTUAL_ROWS {
+            card = card.h(Self::PLAN_TABLE_HEIGHT);
+        }
+        card.child(table)
     }
 }
 

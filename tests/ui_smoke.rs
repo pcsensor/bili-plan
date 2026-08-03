@@ -60,8 +60,9 @@ fn ready_app() -> PlannerApp {
 }
 
 /// 长计划（70 行）：超过 kit data_table 的 50 行自动虚拟化阈值。
-/// 表格被强制 inline 渲染（sticky_header(false)），所有行必须出现在
-/// 访问树中——否则第 4 天起的行在页面上"消失"（2026-08-03 回归）。
+/// 表体切换为虚拟化内部滚动——首屏只构建可视窗口内的行，滚动到底后
+/// 末尾行必须可见（2026-08-03 修复：inline 整表每帧重建 70+ 行导致
+/// 滚动卡顿）。
 fn long_plan_app() -> PlannerApp {
     let episodes: Vec<EpisodeItem> = (1..=60)
         .map(|i| EpisodeItem {
@@ -98,18 +99,53 @@ fn long_plan_app() -> PlannerApp {
 }
 
 #[test]
-fn long_plan_all_days_visible() {
-    let frame = frame_for(&long_plan_app());
-    // 70 行（10 天 × (1 汇总 + 6 视频)）全部 inline 渲染
+fn long_plan_virtualized_table_scrolls() {
+    let mut state = FrameState::new();
+    let mut fonts = Fonts::embedded();
+    let app = long_plan_app();
+    let mut frame = build_frame(
+        &app.view(),
+        &Theme::light(),
+        &mut fonts,
+        &mut state,
+        (1120.0, 820.0),
+        1.0,
+    );
+    // 虚拟化表体：首屏只物化可视窗口内的行，末尾行不应出现在访问树里。
+    assert!(
+        !frame.get_all(&by::label_contains("【第 1 天】")).is_empty(),
+        "首屏应包含第 1 天汇总行"
+    );
+    assert!(
+        frame
+            .get_all(&by::label_contains("【第 10 天】"))
+            .is_empty(),
+        "虚拟化表体不应提前物化末尾行（每帧只处理窗口内行）"
+    );
+    // 表体是独立的内部滚动容器（dt-body-plan-table）。
+    let body = frame
+        .query(&by::id("dt-body-plan-table"))
+        .expect("虚拟化表体滚动容器存在");
+    // 滚到底：第 10 天汇总与最后一个视频必须可见（2026-08-03 回归：
+    // 曾因 inline 整表在页面滚动流里行数 >50 时"消失"）。
+    state.scroll_to(body.id, f32::MAX);
+    frame = build_frame(
+        &app.view(),
+        &Theme::light(),
+        &mut fonts,
+        &mut state,
+        (1120.0, 820.0),
+        1.0,
+    );
     assert!(
         !frame
             .get_all(&by::label_contains("【第 10 天】"))
             .is_empty(),
-        "第 10 天汇总行可见（虚拟化回归：>50 行时后续行消失）"
+        "滚动到底后第 10 天汇总行可见"
     );
     assert!(
         !frame.get_all(&by::label_contains("P60")).is_empty(),
-        "最后一个视频行可见"
+        "滚动到底后最后一个视频行可见"
     );
 }
 
