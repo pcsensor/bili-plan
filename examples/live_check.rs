@@ -2,7 +2,7 @@
 //! 用法：cargo run --example live_check -- "<链接/BV/sid>" [days] [all|科目号] [split|whole]
 //! 环境变量 BILI_COOKIE 可传 Cookie。
 
-use bili_planner::app::{fetch_and_parse, generate_plan, Selection};
+use bili_planner::app::{fetch_and_parse, generate_plan, FetchSource, Selection};
 use bili_planner::export;
 use bili_planner::plan::Mode;
 
@@ -21,7 +21,8 @@ fn main() {
     };
     let cookie = std::env::var("BILI_COOKIE").ok();
 
-    let mut rd = fetch_and_parse(&input, cookie.as_deref()).expect("fetch/parse 失败");
+    let mut rd =
+        fetch_and_parse(&input, &FetchSource::Bilibili { cookie }).expect("fetch/parse 失败");
     eprintln!("结构识别：{}", rd.structure);
     eprintln!("科目数：{}", rd.groups.len());
     // 与 Python 脚本一致：仅多科目时 select 生效；单科目保持默认

@@ -85,6 +85,9 @@ $RECYCLE.BIN/
 *.log
 logs/
 
+# live_check 真机联调输出（含私有服务器信息，不入库）
+live_check*.out
+
 # 性能分析 / 覆盖率
 coverage/
 *.lcov

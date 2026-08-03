@@ -231,7 +231,10 @@ fn section_title<Msg: 'static>(icon: Element<Msg>, label: String) -> Element<Msg
 pub enum Msg {
     EditInput(String),
     EditCookie(String),
+    EditJfServer(String),
+    EditJfToken(String),
     EditDays(String),
+    SourceChanged(usize),
     ModeChanged(usize),
     DarkToggled,
     Fetch,
@@ -250,6 +253,49 @@ pub enum Msg {
 pub enum Selection {
     All,
     Single(usize),
+}
+
+/// 视频来源：决定 `fetch_and_parse` 走 B 站还是 Jellyfin 适配器。
+///
+/// UI 通过 segmented 切换；后台线程构造本枚举传给 `fetch_and_parse`，
+/// 实现一处入口、两条适配器路径。
+#[derive(Debug, Clone)]
+pub enum FetchSource {
+    /// B 站：可选 Cookie（SESSDATA），用于风控时匿名→登录升级。
+    Bilibili { cookie: Option<String> },
+    /// Jellyfin：服务器地址 + API Token（必填）。
+    Jellyfin { server_url: String, token: String },
+}
+
+/// UI 来源 segmented 的状态枚举（与 `plan::Mode` 同样模式：`from_index`/`index`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceMode {
+    #[default]
+    Bilibili,
+    Jellyfin,
+}
+
+impl SourceMode {
+    pub fn from_index(i: usize) -> Self {
+        if i == 0 {
+            Self::Bilibili
+        } else {
+            Self::Jellyfin
+        }
+    }
+    pub fn index(self) -> usize {
+        match self {
+            Self::Bilibili => 0,
+            Self::Jellyfin => 1,
+        }
+    }
+}
+
+/// 持久化到本机的 Jellyfin 凭证（JSON 文件，工作目录旁）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct JellyfinConfig {
+    pub server_url: String,
+    pub token: String,
 }
 
 /// 已获取的合集/视频数据。
@@ -282,6 +328,9 @@ pub enum Phase {
 pub struct PlannerApp {
     pub input: String,
     pub cookie: String,
+    pub jf_server: String,
+    pub jf_token: String,
+    pub source: SourceMode,
     pub days_text: String,
     pub mode: Mode,
     pub dark: bool,
@@ -298,6 +347,9 @@ impl PlannerApp {
         Self {
             input: String::new(),
             cookie: String::new(),
+            jf_server: String::new(),
+            jf_token: String::new(),
+            source: SourceMode::Bilibili,
             days_text: String::new(),
             mode: Mode::Split,
             dark: false,
@@ -507,12 +559,29 @@ impl PlannerApp {
     fn form_card(&self) -> Element<Msg> {
         let loading = self.loading();
 
-        // Apple 输入框：白底 + 发丝描边 + squircle 圆角（kit 默认即 macOS
-        // 文本框质感：hover 加深描边、focus 切换 System Blue 聚焦环）。
-        // 链接/Cookie 输入框 w_full 全宽，随窗口伸缩（响应式）。
+        // 顶部「来源」segmented：决定后续字段集与 fetch 走哪条适配器路径。
+        let source_field = field("来源").child(segmented(
+            self.source.index(),
+            ["B 站", "Jellyfin"],
+            Msg::SourceChanged,
+        ));
+
+        // 链接字段：placeholder/help 随来源切换——避免误粘贴场景的提示错位。
+        let (link_placeholder, link_label, link_help) = match self.source {
+            SourceMode::Bilibili => (
+                "https://www.bilibili.com/video/BV1ps4y1d73V 或 BV 号 或 sid=6789",
+                "链接 / BV 号 / 合集 sid",
+                "支持 https://www.bilibili.com/video/BVxxxx、BV 号或合集 sid=xxxx 链接",
+            ),
+            SourceMode::Jellyfin => (
+                "https://host/web/#!/details?id=xxx 或直接粘贴 item ID",
+                "Jellyfin 链接 / item ID",
+                "粘贴 Jellyfin 网页详情页链接（取 ?id= 后部分）或直接 item ID；首次填写服务器/Token 后会自动保存到本机",
+            ),
+        };
         let link_input = Element::from(
             text_input(&self.input)
-                .placeholder("https://www.bilibili.com/video/BV1ps4y1d73V 或 BV 号 或 sid=6789")
+                .placeholder(link_placeholder)
                 .on_input(Msg::EditInput)
                 .id("input"),
         )
@@ -526,13 +595,51 @@ impl PlannerApp {
                 .id("days"),
         );
 
-        let cookie_input = Element::from(
-            text_input(&self.cookie)
-                .placeholder("SESSDATA=xxx")
-                .on_input(Msg::EditCookie)
-                .id("cookie"),
-        )
-        .w_full();
+        // 来源相关字段组：B 站 → Cookie；Jellyfin → 服务器地址 + Token。
+        let source_specific: Vec<Element<Msg>> = match self.source {
+            SourceMode::Bilibili => {
+                let cookie_input = Element::from(
+                    text_input(&self.cookie)
+                        .placeholder("SESSDATA=xxx")
+                        .on_input(Msg::EditCookie)
+                        .id("cookie"),
+                )
+                .w_full();
+                vec![Element::from(
+                    field("Cookie（可选，风控时使用）")
+                        .help("例如 SESSDATA=xxx；留空则匿名请求")
+                        .child(cookie_input),
+                )]
+            }
+            SourceMode::Jellyfin => {
+                let server_input = Element::from(
+                    text_input(&self.jf_server)
+                        .placeholder("https://media.example.com:8096")
+                        .on_input(Msg::EditJfServer)
+                        .id("jf_server"),
+                )
+                .w_full();
+                let token_input = Element::from(
+                    text_input(&self.jf_token)
+                        .placeholder("API Token（Jellyfin 后台「控制台 → 高级 → API 密钥」生成）")
+                        .on_input(Msg::EditJfToken)
+                        .id("jf_token"),
+                )
+                .w_full();
+                vec![
+                    Element::from(
+                        field("Jellyfin 服务器地址")
+                            .help("形如 https://media.example.com:8096，无尾斜杠亦可")
+                            .child(server_input),
+                    ),
+                    Element::from(
+                        field("Jellyfin API Token")
+                            .help("在 Jellyfin 后台「控制台 → 高级 → API 密钥」生成；获取成功后会自动保存")
+                            .child(token_input),
+                    ),
+                ]
+            }
+        };
 
         // 主按钮：System Blue 实色胶囊 + 顶部高光（apple.com CTA）。
         let primary_btn = Element::from(
@@ -548,32 +655,46 @@ impl PlannerApp {
             ["split 精确切分", "whole 完整不拆"],
             Msg::ModeChanged,
         ));
-        apple_card().children([
-            Element::from(
-                field("链接 / BV 号 / 合集 sid")
-                    .help("支持 https://www.bilibili.com/video/BVxxxx、BV 号或合集 sid=xxxx 链接")
-                    .child(link_input),
-            ),
+
+        // 提示文字：按来源切换，给到用户当前模式的常见故障提示。
+        let hint_text: Element<Msg> = if loading {
+            text("获取中…请稍候").size(TextSize::Sm)
+        } else {
+            match self.source {
+                SourceMode::Bilibili => {
+                    text("提示：B 站接口可能触发风控，失败时可添加 Cookie 重试")
+                        .size(TextSize::Sm)
+                        .themed(|t: &Theme, s| s.color(t.text_muted))
+                }
+                SourceMode::Jellyfin => {
+                    text("提示：若拉取失败，请确认 Token 有效且 Jellyfin 可访问")
+                        .size(TextSize::Sm)
+                        .themed(|t: &Theme, s| s.color(t.text_muted))
+                }
+            }
+        };
+
+        // 动态拼装表单卡片子项：来源 segmented → 链接 → (days + mode) → 来源相关字段 → 主按钮行。
+        let mut children: Vec<Element<Msg>> = Vec::new();
+        children.push(Element::from(source_field));
+        children.push(Element::from(
+            field(link_label).help(link_help).child(link_input),
+        ));
+        children.push(
             row()
                 .gap(SP4)
                 .items_end()
                 .children([Element::from(days_field), Element::from(mode_field)]),
-            Element::from(
-                field("Cookie（可选，风控时使用）")
-                    .help("例如 SESSDATA=xxx；留空则匿名请求")
-                    .child(cookie_input),
-            ),
-            row().gap(SP3).items_center().children([
-                primary_btn,
-                if loading {
-                    text("获取中…请稍候").size(TextSize::Sm)
-                } else {
-                    text("提示：B 站接口可能触发风控，失败时可添加 Cookie 重试")
-                        .size(TextSize::Sm)
-                        .themed(|t: &Theme, s| s.color(t.text_muted))
-                },
-            ]),
-        ])
+        );
+        children.extend(source_specific);
+        children.push(
+            row()
+                .gap(SP3)
+                .items_center()
+                .children([primary_btn, hint_text]),
+        );
+
+        apple_card().children(children)
     }
 
     fn error_callout(&self, err: &str) -> Element<Msg> {
@@ -787,34 +908,58 @@ impl PlannerApp {
 // 业务逻辑（无 GUI 依赖）
 // ---------------------------------------------------------------------------
 
-/// 后台线程执行：获取视频信息并识别结构。
-pub fn fetch_and_parse(input: &str, cookie: Option<&str>) -> Result<ReadyState, String> {
+/// 后台线程执行：按来源分派获取视频/合集信息并识别结构。
+///
+/// - `FetchSource::Bilibili`：sid → 归档接口；否则 BV → view API → parse_groups
+/// - `FetchSource::Jellyfin`：`JellyfinClient` → `jellyfin::fetch_groups`
+///
+/// 两条路径共用 `ReadyState` 构造与默认选择策略（多科目→All，单科目→Single(0)），
+/// 后续计划生成、表格、导出与来源无关。
+pub fn fetch_and_parse(input: &str, source: &FetchSource) -> Result<ReadyState, String> {
     let r = (|| -> crate::Result<ReadyState> {
-        let (season_title, groups, structure) = if let Some(sid) = extract_sid(input) {
-            let flat = api::fetch_season_archives(sid, cookie)?;
-            if flat.is_empty() {
-                return Err(Error::data("未获取到任何视频，请检查链接是否正确。"));
+        let (season_title, groups, structure) = match source {
+            FetchSource::Bilibili { cookie } => {
+                let cookie = cookie.as_deref();
+                if let Some(sid) = extract_sid(input) {
+                    let flat = api::fetch_season_archives(sid, cookie)?;
+                    if flat.is_empty() {
+                        return Err(Error::data("未获取到任何视频，请检查链接是否正确。"));
+                    }
+                    let groups = vec![Group {
+                        name: format!("合集{sid}"),
+                        episodes: flat
+                            .into_iter()
+                            .map(|it| EpisodeItem {
+                                title: it.title,
+                                duration: it.duration,
+                            })
+                            .collect(),
+                    }];
+                    (
+                        format!("合集{sid}"),
+                        groups,
+                        "合集归档接口（sid 链接）".to_string(),
+                    )
+                } else {
+                    let bvid = parse::extract_bvid(input)?;
+                    let view = api::fetch_view(&bvid, cookie)?;
+                    let r = parse::parse_groups(&view, cookie, &parse::default_fallback)?;
+                    (r.season_title, r.groups, r.structure)
+                }
             }
-            let groups = vec![Group {
-                name: format!("合集{sid}"),
-                episodes: flat
-                    .into_iter()
-                    .map(|it| EpisodeItem {
-                        title: it.title,
-                        duration: it.duration,
-                    })
-                    .collect(),
-            }];
-            (
-                format!("合集{sid}"),
-                groups,
-                "合集归档接口（sid 链接）".to_string(),
-            )
-        } else {
-            let bvid = parse::extract_bvid(input)?;
-            let view = api::fetch_view(&bvid, cookie)?;
-            let r = parse::parse_groups(&view, cookie, &parse::default_fallback)?;
-            (r.season_title, r.groups, r.structure)
+            FetchSource::Jellyfin { server_url, token } => {
+                if server_url.trim().is_empty() {
+                    return Err(Error::input("请填写 Jellyfin 服务器地址。"));
+                }
+                if token.trim().is_empty() {
+                    return Err(Error::input("请填写 Jellyfin API Token。"));
+                }
+                let client = crate::jellyfin::JellyfinClient::new(
+                    server_url.trim().to_string(),
+                    token.trim().to_string(),
+                );
+                crate::jellyfin::fetch_groups(&client, input)?
+            }
         };
         let selection = if groups.len() > 1 {
             Selection::All
@@ -889,6 +1034,37 @@ fn sanitize(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Jellyfin 凭证持久化（0 新依赖：家目录 + serde_json）
+// ---------------------------------------------------------------------------
+
+/// 配置文件路径：用户家目录下 `.bili-planner.json`（比工作目录稳定，
+/// 不同启动目录都能读到）。Windows 取 `%USERPROFILE%`，Unix 取 `$HOME`。
+fn config_path() -> Option<PathBuf> {
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var(key).ok()?;
+    Some(PathBuf::from(home).join(".bili-planner.json"))
+}
+
+/// 启动时尝试加载本机 Jellyfin 凭证；文件不存在或损坏时静默返回 `None`。
+fn load_config() -> Option<JellyfinConfig> {
+    let path = config_path()?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let cfg: JellyfinConfig = serde_json::from_str(&data).ok()?;
+    if cfg.server_url.trim().is_empty() || cfg.token.trim().is_empty() {
+        return None;
+    }
+    Some(cfg)
+}
+
+/// 把 Jellyfin 凭证写到本机（pretty JSON）。失败静默：不阻塞主流程。
+fn save_config(cfg: &JellyfinConfig) {
+    let Some(path) = config_path() else { return };
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App 实现
 // ---------------------------------------------------------------------------
 
@@ -903,6 +1079,11 @@ impl App for PlannerApp {
 
     fn init(&mut self, proxy: Proxy<Msg>) {
         self.proxy = Some(proxy);
+        // 启动时尝试加载本机 Jellyfin 凭证，预热字段——UI 上无需重新填写。
+        if let Some(cfg) = load_config() {
+            self.jf_server = cfg.server_url;
+            self.jf_token = cfg.token;
+        }
     }
 
     fn update(&mut self, msg: Msg) {
@@ -912,11 +1093,21 @@ impl App for PlannerApp {
                 self.last_error = None;
             }
             Msg::EditCookie(s) => self.cookie = s,
+            Msg::EditJfServer(s) => self.jf_server = s,
+            Msg::EditJfToken(s) => self.jf_token = s,
             Msg::EditDays(s) => {
                 self.days_text = s;
                 // 天数变化后，旧计划可能不再有效
                 if let Phase::Ready(rd) = &mut self.phase {
                     rd.plan = None;
+                }
+            }
+            Msg::SourceChanged(i) => {
+                self.source = SourceMode::from_index(i);
+                self.last_error = None;
+                // 来源切换：已识别的合集结构不再适用，丢弃旧的 Ready 状态。
+                if let Phase::Ready(_) = &self.phase {
+                    self.phase = Phase::Input;
                 }
             }
             Msg::ModeChanged(i) => {
@@ -935,13 +1126,35 @@ impl App for PlannerApp {
                 } else {
                     Some(self.cookie.clone())
                 };
+                let source = match self.source {
+                    SourceMode::Bilibili => FetchSource::Bilibili { cookie },
+                    SourceMode::Jellyfin => {
+                        // 前端先做最小校验，避免起线程后才报错；后端会再 trim 检查。
+                        if self.jf_server.trim().is_empty() || self.jf_token.trim().is_empty() {
+                            self.phase = Phase::Input;
+                            self.toast("请填写 Jellyfin 服务器地址与 API Token。", Status::Warning);
+                            return;
+                        }
+                        FetchSource::Jellyfin {
+                            server_url: self.jf_server.clone(),
+                            token: self.jf_token.clone(),
+                        }
+                    }
+                };
                 if let Some(proxy) = self.proxy.clone() {
                     std::thread::spawn(move || {
-                        proxy.send(Msg::Fetched(fetch_and_parse(&input, cookie.as_deref())));
+                        proxy.send(Msg::Fetched(fetch_and_parse(&input, &source)));
                     });
                 }
             }
             Msg::Fetched(Ok(mut rd)) => {
+                // Jellyfin 来源且本次成功：默认写盘记住凭证，下次启动免重填。
+                if matches!(self.source, SourceMode::Jellyfin) {
+                    save_config(&JellyfinConfig {
+                        server_url: self.jf_server.trim().to_string(),
+                        token: self.jf_token.trim().to_string(),
+                    });
+                }
                 match self.parse_days() {
                     Ok(days) => {
                         let result = generate_plan(&mut rd, days, self.mode);

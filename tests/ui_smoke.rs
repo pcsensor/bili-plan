@@ -167,6 +167,26 @@ fn form_has_controls() {
 }
 
 #[test]
+fn jellyfin_source_shows_jellyfin_fields() {
+    let mut app = PlannerApp::new();
+    app.source = bili_planner::app::SourceMode::Jellyfin;
+    let frame = frame_for(&app);
+    assert!(
+        frame.query(&by::id("jf_server")).is_some(),
+        "Jellyfin 模式应显示服务器地址输入框"
+    );
+    assert!(
+        frame.query(&by::id("jf_token")).is_some(),
+        "Jellyfin 模式应显示 Token 输入框"
+    );
+    // 切到 Jellyfin 后，B 站专用 Cookie 字段不应再出现。
+    assert!(
+        frame.query(&by::id("cookie")).is_none(),
+        "Jellyfin 模式不应再显示 Cookie 输入框"
+    );
+}
+
+#[test]
 fn ready_state_shows_structure_and_actions() {
     let frame = frame_for(&ready_app());
     assert!(
