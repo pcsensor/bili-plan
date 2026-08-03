@@ -59,6 +59,60 @@ fn ready_app() -> PlannerApp {
     app
 }
 
+/// 长计划（70 行）：超过 kit data_table 的 50 行自动虚拟化阈值。
+/// 表格被强制 inline 渲染（sticky_header(false)），所有行必须出现在
+/// 访问树中——否则第 4 天起的行在页面上"消失"（2026-08-03 回归）。
+fn long_plan_app() -> PlannerApp {
+    let episodes: Vec<EpisodeItem> = (1..=60)
+        .map(|i| EpisodeItem {
+            title: format!("P{i} 离散数学 第{i}讲"),
+            duration: 3600,
+        })
+        .collect();
+    let groups = vec![Group {
+        name: "全部课程".into(),
+        episodes: episodes.clone(),
+    }];
+    let total: i64 = episodes.iter().map(|e| e.duration).sum();
+    let days = 10;
+    let out = build_plan(&episodes, days, Mode::Split).expect("plan");
+    let plan = bili_planner::app::PlanData {
+        plan: out.plan,
+        capacities: out.capacities,
+        total,
+        days,
+        avg: total as f64 / days as f64,
+        scope_desc: "全部课程（60 个视频）".to_string(),
+    };
+    let rd = ReadyState {
+        season_title: "离散数学（长计划回归）".to_string(),
+        structure: "单分栏合集".to_string(),
+        groups,
+        selection: Selection::Single(0),
+        plan: Some(plan),
+    };
+    let mut app = PlannerApp::new();
+    app.days_text = days.to_string();
+    app.phase = Phase::Ready(rd);
+    app
+}
+
+#[test]
+fn long_plan_all_days_visible() {
+    let frame = frame_for(&long_plan_app());
+    // 70 行（10 天 × (1 汇总 + 6 视频)）全部 inline 渲染
+    assert!(
+        !frame
+            .get_all(&by::label_contains("【第 10 天】"))
+            .is_empty(),
+        "第 10 天汇总行可见（虚拟化回归：>50 行时后续行消失）"
+    );
+    assert!(
+        !frame.get_all(&by::label_contains("P60")).is_empty(),
+        "最后一个视频行可见"
+    );
+}
+
 #[test]
 fn form_has_controls() {
     let frame = frame_for(&PlannerApp::new());

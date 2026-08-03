@@ -3,14 +3,23 @@
 //! 与 Python 脚本功能一一对应；核心算法在 api / parse / plan / export
 //! 模块中，本模块只做状态编排与 UI。
 //!
-//! ## UI：macOS Liquid Glass
+//! ## UI：Apple Human Interface Guidelines（1:1 复刻）
 //!
-//! 整体使用 fenestra 内置的 [`Surface::Glass`](fenestra_core::Surface::Glass)
-//! 材质——半透明 vibrancy tint 加 CPU 双通道背景模糊（`Material::popover`，
-//! `blur_radius` 18），加上高光边缘（`SpecularEdge`）、定向主体光泽（`Sheen`）
-//! 与背景自适应色温（`AdaptiveTint`）。页面背景用主题色 `accent_gradient`
-//! 加少量装饰色斑，让模糊层采样到彩色内容；交互元素在 hover/press 时由
-//! kit 自带的 state_layer + Fast color transition 保持玻璃质感一致。
+//! - **极简布局**：纯色银灰底（亮色 `#F5F5F7` / 暗色深空灰 `#1B1B1D`），
+//!   大留白（SP8/SP6 内边距、SP5 卡片间距），内容纵向卡片流。
+//! - **字体**：内嵌 Inter（SF Pro 的度量兼容开源替代），CJK 由系统
+//!   PingFang / Microsoft YaHei 回退；字号字重走 kit 光学字号梯度。
+//! - **圆角**：`corner_smoothing 0.6` 的 Apple squircle 连续曲率，
+//!   半径梯度 6/10/14/20；按钮为 Apple 标志性全圆角胶囊（pill）。
+//! - **配色**：System Blue（亮 `#007AFF` / 暗 `#0A84FF`）、深空灰文字
+//!   `#1D1D1F`、次要文字 `#86868B`、发丝线 `#D2D2D7`、iOS 系统状态色。
+//! - **阴影与毛玻璃**：内容卡片为实心面板 + 发丝描边 + 细腻分层投影
+//!   （`Surface::Card`）；浮动工具栏保留 `Surface::Glass` vibrancy
+//!   （高光边缘 + Sheen + AdaptiveTint），与 macOS 工具栏质感一致。
+//! - **动效**：统一 `cubic-bezier(0.25, 0.1, 0.25, 1.0)` Apple ease-out、
+//!   250ms；布局变化走 `animate_layout` FLIP 弹簧；segmented 拇指弹簧。
+//! - **图标**：lucide 线性图标（2px 圆头描边，最接近 SF Symbols 风格）。
+//! - **响应式**：输入框全宽自适应，窗口缩放时卡片流自然伸缩。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,6 +34,194 @@ use fenestra::prelude::*;
 // fenestra 顶层重导出 fenestra_core::theme::Mode (Light/Dark)，与
 // crate::plan::Mode (split/whole) 同名，这里用别名区分。
 use fenestra::Mode as ThemeMode;
+
+// ---------------------------------------------------------------------------
+// Apple HIG 设计系统
+// ---------------------------------------------------------------------------
+
+/// Apple 标志性动画曲线 `cubic-bezier(0.25, 0.1, 0.25, 1.0)`——iOS/macOS
+/// 视图动画的标准 ease-out：起段迅速响应、尾段长衰减，体感"快而不突兀"。
+const APPLE_EASE: CubicBezier = CubicBezier {
+    x1: 0.25,
+    y1: 0.1,
+    x2: 0.25,
+    y2: 1.0,
+};
+
+/// Apple 交互过渡：颜色/阴影统一 250ms + [`APPLE_EASE`]。
+fn apple_transition() -> Transition {
+    Transition::colors().easing(APPLE_EASE).duration_ms(250.0)
+}
+
+/// sRGB hex 便捷构造（`0xRRGGBB`）。
+const fn hex(rgb: u32) -> Color {
+    Color::from_rgb8(
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+    )
+}
+
+/// 1:1 Apple Human Interface Guidelines 主题。
+///
+/// 以 System Blue 的 OKLCH 色相（≈259°）生成完整色板后，再用 Apple 官方
+/// hex 精确覆写中性色阶、语义色与 iOS 状态色；圆角取 squircle 连续曲率。
+fn apple_theme(mode: ThemeMode) -> Theme {
+    let mut t = Theme::from_accent(259.0, mode).with_corner_smoothing(0.6);
+    match mode {
+        ThemeMode::Light => {
+            // Apple 官网系灰阶：银灰底、深空灰文字、发丝线。
+            t.neutrals = Ramp([
+                hex(0xF5F5F7), // N1  页面底（Apple 标志性银灰）
+                hex(0xF2F2F4), // N2  表头等次级底
+                hex(0xE5E5EA), // N3  控件底（iOS systemGray5）
+                hex(0xD9D9DE), // N4  控件 hover
+                hex(0xD2D2D7), // N5  发丝线（Apple hairline）
+                hex(0xC7C7CC), // N6  描边（iOS systemGray4）
+                hex(0xAEAEB2), // N7  强描边（iOS systemGray2）
+                hex(0x8E8E93), // N8  禁用文字（iOS systemGray）
+                hex(0x86868B), // N9  次要文字（apple.com secondary）
+                hex(0x6E6E73), // N10 弱化正文
+                hex(0x48484A), // N11 强调正文
+                hex(0x1D1D1F), // N12 主文字（深空灰黑）
+            ]);
+            t.bg = hex(0xF5F5F7);
+            t.surface = hex(0xFFFFFF);
+            t.surface_raised = hex(0xFFFFFF);
+            t.element = hex(0xE5E5EA);
+            t.element_hover = hex(0xD9D9DE);
+            t.element_active = hex(0xD2D2D7);
+            t.border_subtle = hex(0xD2D2D7);
+            t.border = hex(0xC7C7CC);
+            t.border_strong = hex(0xAEAEB2);
+            t.text = hex(0x1D1D1F);
+            t.text_muted = hex(0x6E6E73);
+            t.text_subtle = hex(0x86868B);
+            t.text_disabled = hex(0x8E8E93);
+            // System Blue + apple.com 按钮蓝梯度。
+            t.accent = hex(0x007AFF);
+            t.accent_hover = hex(0x0071E3);
+            t.accent_active = hex(0x0062C4);
+            t.accent_bg = hex(0xE5F1FF);
+            t.accent_border = hex(0x4095FF);
+            t.accent_text = hex(0x0060C9);
+            t.on_accent = hex(0xFFFFFF);
+            // iOS 系统状态色。
+            t.danger.bg = hex(0xFFECEB);
+            t.danger.border = hex(0xFFB3AE);
+            t.danger.solid = hex(0xFF3B30);
+            t.danger.solid_hover = hex(0xE0342B);
+            t.danger.solid_active = hex(0xC22E26);
+            t.danger.text = hex(0xD70015);
+            t.warning.bg = hex(0xFFF4E5);
+            t.warning.border = hex(0xFFD9A3);
+            t.warning.solid = hex(0xFF9500);
+            t.warning.solid_hover = hex(0xF08C00);
+            t.warning.solid_active = hex(0xD97F00);
+            t.warning.text = hex(0xB25000);
+            t.success.bg = hex(0xE9F8EE);
+            t.success.border = hex(0xA9E3BC);
+            t.success.solid = hex(0x34C759);
+            t.success.solid_hover = hex(0x2EB350);
+            t.success.solid_active = hex(0x289A46);
+            t.success.text = hex(0x1F7A38);
+        }
+        ThemeMode::Dark => {
+            // 深空灰阶：近黑底、逐级抬升的灰面板、冷白文字。
+            t.neutrals = Ramp([
+                hex(0x1B1B1D), // N1  页面底（深空灰）
+                hex(0x242426), // N2  表头等次级底
+                hex(0x2C2C2E), // N3  控件底（iOS dark secondary）
+                hex(0x3A3A3C), // N4  控件 hover（iOS systemGray5 dark）
+                hex(0x48484A), // N5  发丝线（iOS systemGray4 dark）
+                hex(0x545456), // N6  描边
+                hex(0x636366), // N7  强描边（iOS systemGray3 dark）
+                hex(0x8E8E93), // N8  禁用文字（iOS systemGray）
+                hex(0x98989D), // N9  次要文字
+                hex(0xAEAEB2), // N10 弱化正文（iOS systemGray2）
+                hex(0xD1D1D6), // N11 强调正文
+                hex(0xF5F5F7), // N12 主文字（冷白）
+            ]);
+            t.bg = hex(0x1B1B1D);
+            t.surface = hex(0x242426);
+            t.surface_raised = hex(0x2C2C2E);
+            t.element = hex(0x2C2C2E);
+            t.element_hover = hex(0x3A3A3C);
+            t.element_active = hex(0x48484A);
+            t.border_subtle = hex(0x38383A);
+            t.border = hex(0x48484A);
+            t.border_strong = hex(0x636366);
+            t.text = hex(0xF5F5F7);
+            t.text_muted = hex(0xAEAEB2);
+            t.text_subtle = hex(0x98989D);
+            t.text_disabled = hex(0x636366);
+            // 暗色 System Blue（更亮以保证对比度）。
+            t.accent = hex(0x0A84FF);
+            t.accent_hover = hex(0x409CFF);
+            t.accent_active = hex(0x007AFF);
+            t.accent_bg = hex(0x0F2A4A);
+            t.accent_border = hex(0x0A84FF);
+            t.accent_text = hex(0x409CFF);
+            t.on_accent = hex(0xFFFFFF);
+            // iOS 暗色状态色。
+            t.danger.bg = hex(0x3B2422);
+            t.danger.border = hex(0x7A3532);
+            t.danger.solid = hex(0xFF453A);
+            t.danger.solid_hover = hex(0xFF5A50);
+            t.danger.solid_active = hex(0xE03A30);
+            t.danger.text = hex(0xFF6961);
+            t.warning.bg = hex(0x3A2E1C);
+            t.warning.border = hex(0x8A6116);
+            t.warning.solid = hex(0xFF9F0A);
+            t.warning.solid_hover = hex(0xFFAA1F);
+            t.warning.solid_active = hex(0xE08E09);
+            t.warning.text = hex(0xFFB340);
+            t.success.bg = hex(0x1D3626);
+            t.success.border = hex(0x2C6B40);
+            t.success.solid = hex(0x30D158);
+            t.success.solid_hover = hex(0x45DE6B);
+            t.success.solid_active = hex(0x2AB94E);
+            t.success.text = hex(0x32D74B);
+        }
+    }
+    t
+}
+
+/// Apple 卡片：实心面板 + 1px 发丝线 + 细腻分层投影（App Store 卡片语言），
+/// squircle 连续圆角由主题 `corner_smoothing` 保证。`shrink0` 关键：根滚动
+/// 容器是固定高度 flex 列，内容超出视口时未禁缩的卡片会被 flex-shrink
+/// 压缩（children 溢出并被 overflow_hidden 裁切），必须让卡片保持固有
+/// 高度、交给 scroll_y 滚动。
+fn apple_card<Msg: 'static>() -> Element<Msg> {
+    col()
+        .p(SP6)
+        .gap(SP3)
+        .shrink0()
+        .surface(Surface::Card)
+        .overflow_hidden()
+        .transition(apple_transition())
+}
+
+/// Apple 主按钮：System Blue 实色胶囊 + 顶部高光（apple.com 的 CTA 质感）。
+fn apple_primary_style() -> impl Fn(&Theme, Style) -> Style {
+    |t: &Theme, s| s.rounded_full().highlight_top(t.on_accent.with_alpha(0.18))
+}
+
+/// Apple 次级按钮：中性灰胶囊、无边框（iOS 灰底按钮质感），
+/// hover/press 由 kit state_layer 平滑叠加。
+fn apple_secondary_style() -> impl Fn(&Theme, Style) -> Style {
+    |t: &Theme, s| s.rounded_full().bg(t.element).border(0.0, t.border_subtle)
+}
+
+/// Apple 分组标题：蓝色小线性图标 + Semibold 标题（iOS 设置分组风格）。
+fn section_title<Msg: 'static>(icon: Element<Msg>, label: String) -> Element<Msg> {
+    row().gap(SP2).items_center().children([
+        icon.w(16.0)
+            .h(16.0)
+            .themed(|t: &Theme, s| s.color(t.accent)),
+        text(label).weight(Weight::Semibold),
+    ])
+}
 
 // ---------------------------------------------------------------------------
 // 消息与状态
@@ -202,17 +399,16 @@ impl PlannerApp {
     fn view(&self) -> Element<Msg> {
         let theme = self.theme();
 
-        // 顶栏玻璃面板：承载标题与亮/暗切换。
-        let header = self.glass_header(&theme);
+        // 浮动玻璃工具栏：承载标题与亮/暗切换（macOS 工具栏 vibrancy）。
+        let toolbar = self.apple_toolbar();
 
-        // 装饰色斑层（绝对定位，全屏），位于玻璃卡片之下。accent_gradient
-        // 已经提供主色变化，这里再叠几块低饱和度色斑，强化"毛玻璃背后有
-        // 真实彩色内容"的层次感。
+        // 极淡的装饰色斑层（绝对定位，全屏），位于卡片之下：给浮动工具栏
+        // 的 vibrancy 模糊层提供可采样的彩色内容，同时不破坏极简纯色底。
         let atmospheric = self.atmospheric_layer(&theme);
 
-        let mut children: Vec<Element<Msg>> = vec![atmospheric, header];
+        let mut children: Vec<Element<Msg>> = vec![atmospheric, toolbar];
 
-        // 表单玻璃卡片。
+        // 表单卡片。
         children.push(self.form_card());
 
         if let Some(err) = &self.last_error {
@@ -230,94 +426,73 @@ impl PlannerApp {
                 .on_dismiss(Msg::DismissToast),
         ));
 
-        // 根容器：accent_gradient 作为页面底色（玻璃层要从中采样模糊内容），
-        // 并启用 animate_layout 让合集状态切换时各卡片位置平滑过渡。
+        // 根容器：纯色 Apple 银灰/深空灰底 + 大留白；animate_layout 让
+        // 合集状态切换时各卡片位置以弹簧曲线平滑过渡。
         col()
             .w_full()
             .h_full()
-            .bg(theme.accent_gradient(135.0))
-            .p(SP6)
-            .gap(SP4)
+            .bg(theme.bg)
+            .px(SP8)
+            .py(SP6)
+            .gap(SP5)
             .scroll_y()
             .animate_layout()
             .children(children)
     }
 
-    /// Liquid Glass 风格的顶栏：玻璃面板承载标题与亮/暗切换按钮。
-    fn glass_header(&self, theme: &Theme) -> Element<Msg> {
-        // 顶栏右侧的二级按钮：叠一层自定义玻璃 fill + highlight top sheen，
-        // 让 Secondary 按钮在玻璃面板中保持"半透明胶囊"质感；hover/press
-        // 时由 kit state_layer 平滑叠加文字色 veil，玻璃底纹不破碎。
-        let theme_toggle = Element::from(
-            button(if self.dark { "亮色" } else { "暗色" })
-                .variant(ButtonVariant::Secondary)
-                .on_click(Msg::DarkToggled),
-        )
-        .themed(move |t: &Theme, s| {
-            s.bg(t.surface_raised.with_alpha(0.45))
-                .border(1.0, t.border_subtle)
-                .highlight_top(t.on_accent.with_alpha(0.10))
-        });
+    /// Apple 风格浮动工具栏：玻璃 vibrancy 面板承载 Semibold 标题与
+    /// 线性图标亮/暗切换（SF Symbols 风格的 sun/moon）。
+    fn apple_toolbar(&self) -> Element<Msg> {
+        let (glyph, name) = if self.dark {
+            (icons::lucide::sun(), "亮色")
+        } else {
+            (icons::lucide::moon(), "暗色")
+        };
+        let theme_toggle = Element::from(icon_button(glyph).label(name).on_click(Msg::DarkToggled));
 
-        let _ = theme; // 当前未直接使用，预留给后续 per-element 主题
         row()
             .w_full()
             .items_center()
             .justify_between()
-            .px(SP4)
+            .px(SP5)
             .py(SP3)
             .rounded(R_LG)
+            .shrink0()
             .surface(Surface::Glass)
             .overflow_hidden()
-            .transition(Transition::colors())
+            .transition(apple_transition())
             .children([
                 text("Bilibili 合集观看计划")
-                    .size(TextSize::Xl)
+                    .size(TextSize::Lg)
                     .weight(Weight::Semibold),
                 theme_toggle,
             ])
     }
 
-    /// 装饰性低饱和度色斑，给毛玻璃模糊层提供采样内容；同时让暗色 / 亮色
-    /// 模式下都有彩色基调。三个绝对定位的大圆斑，按 z-order 在玻璃卡片之下。
+    /// 极淡的装饰色斑：两块 Apple 蓝系圆形色斑，alpha 压到几乎不可见，
+    /// 只为浮动工具栏的玻璃模糊层提供细微色彩变化（纯色底下 vibrancy
+    /// 退化为 tint，仍然成立，但略带层次更接近 macOS 桌面观感）。
     fn atmospheric_layer(&self, theme: &Theme) -> Element<Msg> {
-        let _ = theme; // 颜色由 themed() 闭包内部解析
-                       // 左上：品牌色高饱和斑（accent step 10）
+        let dark = matches!(theme.mode, ThemeMode::Dark);
+        let (a_strong, a_soft) = if dark { (0.22, 0.16) } else { (0.14, 0.10) };
+        // 左上：System Blue 主斑
         let blob_a = div()
             .absolute()
-            .top(-180.0)
-            .left(-140.0)
+            .top(-200.0)
+            .left(-160.0)
             .w(560.0)
             .h(560.0)
             .rounded_full()
-            .themed(|t: &Theme, s| s.bg(t.accents.step(10).with_alpha(0.42)));
-        // 右下：品牌色中饱和斑（accent step 8）做色彩呼应
+            .themed(move |t: &Theme, s| s.bg(t.accents.step(9).with_alpha(a_strong)));
+        // 右下：浅蓝呼应斑
         let blob_b = div()
             .absolute()
-            .bottom(-220.0)
-            .right(-180.0)
+            .bottom(-240.0)
+            .right(-200.0)
             .w(640.0)
             .h(640.0)
             .rounded_full()
-            .themed(|t: &Theme, s| s.bg(t.accents.step(8).with_alpha(0.36)));
-        // 中右：浅色 step 7 斑，让背景略偏冷蓝
-        let blob_c = div()
-            .absolute()
-            .top(80.0)
-            .right(120.0)
-            .w(380.0)
-            .h(380.0)
-            .rounded_full()
-            .themed(|t: &Theme, s| s.bg(t.accents.step(7).with_alpha(0.28)));
-        // 左下：浅色 step 6 斑，进一步丰富背景
-        let blob_d = div()
-            .absolute()
-            .bottom(40.0)
-            .left(60.0)
-            .w(420.0)
-            .h(420.0)
-            .rounded_full()
-            .themed(|t: &Theme, s| s.bg(t.accents.step(6).with_alpha(0.30)));
+            .themed(move |t: &Theme, s| s.bg(t.accents.step(7).with_alpha(a_soft)));
 
         div()
             .absolute()
@@ -326,36 +501,22 @@ impl PlannerApp {
             .w_full()
             .h_full()
             .overflow_hidden()
-            .children([blob_a, blob_b, blob_c, blob_d])
-    }
-
-    /// 玻璃材质卡片（替代 kit `card()`）：padding/gap 与 `card()` 一致，
-    /// 但渲染为 `Surface::Glass`（毛玻璃 + 边缘高光 + 深阴影）。
-    /// `overflow_hidden` 让玻璃面板里的 sheen 高光和子元素不会突破圆角。
-    fn glass_card<Msg: 'static>() -> Element<Msg> {
-        col()
-            .p(SP6)
-            .gap(SP3)
-            .surface(Surface::Glass)
-            .overflow_hidden()
-            .transition(Transition::colors())
+            .children([blob_a, blob_b])
     }
 
     fn form_card(&self) -> Element<Msg> {
         let loading = self.loading();
 
-        // 玻璃化输入框：在 kit 输入控件上直接应用 Surface::Glass 材质——
-        // kit 的 text_input 自身有 bg/border，surface() 会用玻璃 fill + 高光
-        // 边缘覆盖它们，但保留 hover（border_strong）/ focus（accent）两条
-        // themed 路径，因此输入框在玻璃面板中既透出底色又有清晰的聚焦环。
+        // Apple 输入框：白底 + 发丝描边 + squircle 圆角（kit 默认即 macOS
+        // 文本框质感：hover 加深描边、focus 切换 System Blue 聚焦环）。
+        // 链接/Cookie 输入框 w_full 全宽，随窗口伸缩（响应式）。
         let link_input = Element::from(
             text_input(&self.input)
                 .placeholder("https://www.bilibili.com/video/BV1ps4y1d73V 或 BV 号 或 sid=6789")
-                .width(560.0)
                 .on_input(Msg::EditInput)
                 .id("input"),
         )
-        .surface(Surface::Glass);
+        .w_full();
 
         let days_input = Element::from(
             text_input(&self.days_text)
@@ -363,27 +524,23 @@ impl PlannerApp {
                 .width(120.0)
                 .on_input(Msg::EditDays)
                 .id("days"),
-        )
-        .surface(Surface::Glass);
+        );
 
         let cookie_input = Element::from(
             text_input(&self.cookie)
                 .placeholder("SESSDATA=xxx")
-                .width(560.0)
                 .on_input(Msg::EditCookie)
                 .id("cookie"),
         )
-        .surface(Surface::Glass);
+        .w_full();
 
-        // 主按钮（玻璃上的实色强调）：保留 Primary 实色填充，但在玻璃表面
-        // 上加 highlight_top sheen 让按钮本身也呈现高光，与 Liquid Glass
-        // 调性一致；press 时由 kit 默认的 active_themed 切换到 accent_active。
+        // 主按钮：System Blue 实色胶囊 + 顶部高光（apple.com CTA）。
         let primary_btn = Element::from(
             button("获取视频信息")
                 .on_click(Msg::Fetch)
                 .disabled(loading),
         )
-        .themed(|t: &Theme, s| s.highlight_top(t.on_accent.with_alpha(0.18)));
+        .themed(apple_primary_style());
 
         let days_field = field("目标观看天数").child(days_input);
         let mode_field = field("计划模式").child(segmented(
@@ -391,7 +548,7 @@ impl PlannerApp {
             ["split 精确切分", "whole 完整不拆"],
             Msg::ModeChanged,
         ));
-        Self::glass_card().children([
+        apple_card().children([
             Element::from(
                 field("链接 / BV 号 / 合集 sid")
                     .help("支持 https://www.bilibili.com/video/BVxxxx、BV 号或合集 sid=xxxx 链接")
@@ -420,31 +577,36 @@ impl PlannerApp {
     }
 
     fn error_callout(&self, err: &str) -> Element<Msg> {
-        // 错误提示玻璃面板：kit `callout()` 自身已有 status 色调；包一层玻璃
-        // 让错误信息在半透明面板上更醒目，outer rounded + inner rounded 同
-        // 心（Surface::Glass 的半径减去 SP1）。
+        // Apple 风格错误横幅：iOS 系统红浅底 + 状态色文字与图标，
+        // squircle 圆角由主题统一。
         callout(Status::Danger, err.to_string())
-            .surface(Surface::Glass)
+            .shrink0()
             .overflow_hidden()
     }
 
     fn loading_row(&self) -> Element<Msg> {
+        // Apple 活动指示条：实心卡片胶囊 + spinner。
         row()
             .gap(SP2)
             .items_center()
-            .surface(Surface::Glass)
+            .shrink0()
+            .surface(Surface::Card)
             .overflow_hidden()
-            .p(SP4)
-            .rounded(R_LG)
+            .px(SP4)
+            .py(SP3)
+            .rounded_full()
             .children([spinner(), text("正在获取视频信息…")])
     }
 
     fn ready_children(&self, rd: &ReadyState) -> Vec<Element<Msg>> {
         let mut out: Vec<Element<Msg>> = Vec::new();
 
-        // 结构卡片
+        // 合集信息卡片：Apple 分组标题 + 次级文字统计行。
         let mut info: Vec<Element<Msg>> = vec![
-            text(format!("合集：《{}》", rd.season_title)).weight(Weight::Semibold),
+            section_title(
+                icons::lucide::info(),
+                format!("合集：《{}》", rd.season_title),
+            ),
             text(format!("结构识别：{}", rd.structure))
                 .size(TextSize::Sm)
                 .themed(|t: &Theme, s| s.color(t.text_muted)),
@@ -470,12 +632,12 @@ impl PlannerApp {
                 .size(TextSize::Sm),
             ]);
         }
-        out.push(Self::glass_card().children(info));
+        out.push(apple_card().children(info));
 
         // 多科目选择
         if rd.groups.len() > 1 {
             let mut sel: Vec<Element<Msg>> = vec![
-                text("科目选择（统计范围）").weight(Weight::Semibold),
+                section_title(icons::lucide::filter(), "科目选择（统计范围）".to_string()),
                 Element::from(
                     radio(rd.selection == Selection::All)
                         .label("整个合集（全部科目）")
@@ -496,33 +658,31 @@ impl PlannerApp {
                         .on_select(Msg::SelectGroup(i)),
                 ));
             }
-            out.push(Self::glass_card().children(sel));
+            out.push(apple_card().children(sel));
         }
 
-        // 操作按钮：主按钮（生成）保留 Primary 实色，副按钮（导出）用玻璃
-        // 玻璃的 Secondary 半透明胶囊，与整体调性统一。
+        // 操作按钮：主操作（生成）为 System Blue 实色胶囊，次操作（导出）
+        // 为中性灰胶囊——apple.com 的 CTA 层级。
         let has_plan = rd.plan.is_some();
-        let generate_btn = Element::from(
-            button("生成观看计划")
-                .variant(ButtonVariant::Secondary)
-                .on_click(Msg::Generate),
-        )
-        .themed(|t: &Theme, s| {
-            s.bg(t.surface_raised.with_alpha(0.45))
-                .border(1.0, t.border_subtle)
-                .highlight_top(t.on_accent.with_alpha(0.10))
-        });
+        let generate_btn = Element::from(button("生成观看计划").on_click(Msg::Generate))
+            .themed(apple_primary_style());
         let export_btn = Element::from(
             button("导出计划文本（UTF-8）")
+                .variant(ButtonVariant::Secondary)
                 .on_click(Msg::Export)
                 .disabled(!has_plan),
         )
-        .themed(|t: &Theme, s| s.highlight_top(t.on_accent.with_alpha(0.18)));
-        out.push(row().gap(SP3).children([generate_btn, export_btn]));
+        .themed(apple_secondary_style());
+        out.push(
+            row()
+                .gap(SP3)
+                .shrink0()
+                .children([generate_btn, export_btn]),
+        );
 
-        // 计划表格：包裹玻璃面板，让表格内容悬浮在毛玻璃上。
+        // 计划表格：Apple 卡片包裹，发丝线分隔行。
         if let Some(p) = &rd.plan {
-            out.push(self.plan_table_glass(p));
+            out.push(self.plan_table_card(p));
         } else {
             out.push(
                 text("填写目标天数后点击「生成观看计划」。")
@@ -534,18 +694,24 @@ impl PlannerApp {
         out
     }
 
-    fn plan_table_glass(&self, p: &PlanData) -> Element<Msg> {
+    fn plan_table_card(&self, p: &PlanData) -> Element<Msg> {
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut cumulative: i64 = 0;
         for (di, entries) in p.plan.iter().enumerate() {
             let day_total: i64 = entries.iter().map(|e| e.portion).sum();
             cumulative += day_total;
             let remaining = p.total - cumulative;
-            let summary = format!(
-                "【第 {} 天】目标 {} ｜ 当日累计 {} ｜ 进度 {:.1}% ｜ 剩余总时长 {}",
+            // 每日汇总拆到「标题 / 备注」两列：kit data_table 行高固定，
+            // 单列长文本会换行溢出与下行重叠；拆分后每行均单行显示，
+            // 符合 Apple 表格的整洁单行排版。
+            let day_head = format!(
+                "【第 {} 天】目标 {} ｜ 累计 {}",
                 di + 1,
                 fmt_seconds(p.capacities[di] as f64, true),
                 fmt_seconds(day_total as f64, true),
+            );
+            let day_note = format!(
+                "进度 {:.1}% ｜ 剩余总时长 {}",
                 cumulative as f64 / p.total as f64 * 100.0,
                 fmt_seconds(remaining as f64, true),
             );
@@ -555,39 +721,47 @@ impl PlannerApp {
                     String::new(),
                     "（本日无安排 / 休息）".to_string(),
                     String::new(),
-                    summary,
+                    day_note,
                 ]);
                 continue;
             }
             rows.push(vec![
                 (di + 1).to_string(),
                 String::new(),
-                summary,
+                day_head,
                 String::new(),
-                String::new(),
+                day_note,
             ]);
             for e in entries {
                 rows.push(vec![
                     String::new(),
                     format!("#{}", e.vid_no),
-                    trunc(&e.title, 36),
+                    trunc(&e.title, 22),
                     fmt_seconds(e.portion as f64, true),
-                    trunc(&note_for(e, di), 56),
+                    trunc(&note_for(e, di), 28),
                 ]);
             }
         }
 
-        // 玻璃面板包住 data_table；面板的 SP1 padding 让表格内容与玻璃边缘
-        // 留呼吸空间，overflow_hidden 让表格内部可能溢出的横线不出破圆角。
+        // Apple 卡片包住 data_table；面板的 SP1 padding 让表格内容与卡片
+        // 边缘留呼吸空间，overflow_hidden 保证内部横线不突破 squircle 圆角。
+        //
+        // `sticky_header(false)` 关键：kit data_table 在行数 > 50 时会自动
+        // 切换为虚拟化滚动表体（h_full 填满父高 + 内部滚动）。本应用的表格
+        // 嵌在页面级滚动流里，虚拟化会让表格高度塌缩为视口高度——例如
+        // 10 天计划约 80 行，只有前 ~23 行（约 3 天）可见，其余行看似
+        // "消失"。强制 inline 渲染让整表随页面一起滚动。
         col()
             .p(SP1)
             .rounded(R_LG)
-            .surface(Surface::Glass)
+            .shrink0()
+            .surface(Surface::Card)
             .overflow_hidden()
             .child(Element::from(
                 data_table(["天", "视频#", "标题", "本日时长", "备注"], rows)
                     .id("plan-table")
-                    .column_widths([64.0, 84.0, 320.0, 116.0, 400.0]),
+                    .column_widths([64.0, 84.0, 320.0, 116.0, 400.0])
+                    .sticky_header(false),
             ))
     }
 }
@@ -834,16 +1008,14 @@ impl App for PlannerApp {
     }
 
     fn theme(&self) -> Theme {
-        // Liquid Glass 配色：duotone 中性场（冷色 220°，适度饱和度 4）+ 同
-        // 色系重音（200° 青蓝），让页面既有彩色基调又有冷色玻璃感。提高
-        // corner_smoothing 到 0.8，把所有圆角推向 Apple "fuller squircle"
-        // 调性，配合 Surface::Glass 的边缘高光形成统一语言。
+        // Apple HIG 主题：System Blue 强调 + 深空灰中性色 + squircle 连续
+        // 圆角（0.6 corner smoothing）；亮色银灰底 / 暗色深空灰底。
         let mode = if self.dark {
             ThemeMode::Dark
         } else {
             ThemeMode::Light
         };
-        Theme::duotone(220.0, 4.0, 200.0, mode).with_corner_smoothing(0.8)
+        apple_theme(mode)
     }
 
     fn view(&self) -> Element<Msg> {

@@ -1,5 +1,8 @@
 //! Headless UI 渲染截图（需要 GPU 适配器；用于人工/工具验证界面）。
 //! 运行：cargo run --example screenshot
+//!
+//! 视口加高到 1560 以在一张图里捕获完整页面（真实窗口为 1120x820，
+//! 超出部分在应用内滚动查看）。
 
 use bili_planner::app::{Phase, PlannerApp, ReadyState, Selection};
 use bili_planner::parse::{EpisodeItem, Group};
@@ -68,13 +71,51 @@ fn main() {
     app.phase = Phase::Ready(rd);
 
     let light_theme = app.theme();
-    let light = render_app(&mut app, &[], (1120, 820), &light_theme);
+    let light = render_app(&mut app, &[], (1120, 1560), &light_theme);
     light.save("ui_preview_light.png").expect("save light png");
 
     app.dark = true;
     let dark_theme = app.theme();
-    let dark = render_app(&mut app, &[], (1120, 820), &dark_theme);
+    let dark = render_app(&mut app, &[], (1120, 1560), &dark_theme);
     dark.save("ui_preview_dark.png").expect("save dark png");
 
-    println!("saved ui_preview_light.png / ui_preview_dark.png");
+    // 长计划场景（60 视频 / 10 天 ≈ 70 行）：回归验证——超过 data_table
+    // 的 50 行自动虚拟化阈值时，整表必须 inline 渲染（2026-08-03 修复，
+    // 否则第 4 天起的行在页面上"消失"）。
+    let long_episodes: Vec<EpisodeItem> = (1..=60)
+        .map(|i| EpisodeItem {
+            title: format!("P{i} 离散数学 第{i}讲"),
+            duration: 3600,
+        })
+        .collect();
+    let long_groups = vec![Group {
+        name: "全部课程".into(),
+        episodes: long_episodes.clone(),
+    }];
+    let long_total: i64 = long_episodes.iter().map(|e| e.duration).sum();
+    let long_days = 10;
+    let long_out = build_plan(&long_episodes, long_days, Mode::Split).expect("plan");
+    let long_plan = bili_planner::app::PlanData {
+        plan: long_out.plan,
+        capacities: long_out.capacities,
+        total: long_total,
+        days: long_days,
+        avg: long_total as f64 / long_days as f64,
+        scope_desc: "全部课程（60 个视频）".to_string(),
+    };
+    let long_rd = ReadyState {
+        season_title: "离散数学（长计划回归验证）".to_string(),
+        structure: "单分栏合集".to_string(),
+        groups: long_groups,
+        selection: Selection::Single(0),
+        plan: Some(long_plan),
+    };
+    let mut long_app = PlannerApp::new();
+    long_app.days_text = long_days.to_string();
+    long_app.phase = Phase::Ready(long_rd);
+    let long_theme = long_app.theme();
+    let long = render_app(&mut long_app, &[], (1120, 3400), &long_theme);
+    long.save("ui_preview_long.png").expect("save long png");
+
+    println!("saved ui_preview_light.png / ui_preview_dark.png / ui_preview_long.png");
 }
