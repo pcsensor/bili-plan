@@ -1,7 +1,8 @@
 //! fenestra 桌面应用：状态机、视图与消息处理。
 //!
-//! 与 Python 脚本功能一一对应；核心算法在 api / parse / plan / export
-//! 模块中，本模块只做状态编排与 UI。
+//! 数据来源接入 Bilibili 与 Jellyfin 两条适配器（`api`/`parse` 与
+//! `jellyfin`），统一在 `fetch_and_parse` 按 `FetchSource` 分派；核心
+//! 计划算法在 `plan`/`export` 模块，本模块只做状态编排与 UI。
 //!
 //! ## UI：Apple Human Interface Guidelines（1:1 复刻）
 //!
@@ -514,7 +515,7 @@ impl PlannerApp {
             .overflow_hidden()
             .transition(apple_transition())
             .children([
-                text("Bilibili 合集观看计划")
+                text("bili-planner — 观看计划生成器")
                     .size(TextSize::Lg)
                     .weight(Weight::Semibold),
                 theme_toggle,

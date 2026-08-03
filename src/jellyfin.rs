@@ -25,8 +25,12 @@ use serde::Deserialize;
 const TICKS_PER_SEC: i64 = 10_000_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_RETRIES: u32 = 3;
-const AUTH_PREFIX: &str =
-    "MediaBrowser Client=\"bili-planner\", Device=\"bili-planner\", Version=\"0.1.0\"";
+/// Authorization 前缀，版本号取 `Cargo.toml` 同步，避免手动维护两处。
+const AUTH_PREFIX: &str = concat!(
+    "MediaBrowser Client=\"bili-planner\", Device=\"bili-planner\", Version=\"",
+    env!("CARGO_PKG_VERSION"),
+    "\""
+);
 
 // ---------------------------------------------------------------------------
 // serde 模型（PascalCase 字段，缺失字段默认值，与 model.rs 宽松反序列化思路一致）

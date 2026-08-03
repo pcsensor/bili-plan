@@ -1,10 +1,14 @@
 [package]
 name = "bili-planner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Bilibili 合集观看计划生成器（跨平台桌面应用，Rust + fenestra）"
+description = "Bilibili & Jellyfin 合集观看计划生成器（跨平台桌面应用，Rust + fenestra）"
+authors = ["anonymous"]
 license = "MIT"
+readme = "README.md"
+keywords = ["bilibili", "jellyfin", "planner", "gui", "fenestra"]
+categories = ["multimedia::video"]
 
 [lib]
 name = "bili_planner"
