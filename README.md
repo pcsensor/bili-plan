@@ -33,6 +33,20 @@ cargo build --release
 cargo run            # 启动桌面应用
 ```
 
+
+## 打包安装包（Windows MSI）
+
+前置：安装 [cargo-packager](https://docs.crabnebula.dev/packager/)（打包配置见 `Cargo.toml` 的 `[package.metadata.packager]`）：
+
+```bash
+cargo install cargo-packager --locked
+cargo packager --release    # 生成 target/release/bili-planner_0.2.0_x64_en-US.msi
+```
+
+> 说明：
+> - `identifier` 目前为占位符 `com.example.bili-planner`，正式发布前请改成你自己的反向域名（影响 MSI 的 Manufacturer 与 UpgradeCode）。
+> - `icons/` 图标素材由 `python tools/gen_icons.py` 生成（与窗口内程序化绘制的图标同款设计）。
+> - 首次打包会自动联网下载 WiX Toolset。
 ## 配置
 
 - Jellyfin 服务器地址与 Token 可保存到本机（`~/.bili-planner.json`），下次启动自动填入

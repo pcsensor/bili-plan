@@ -29,3 +29,22 @@ pollster = "0.4"
 # vello/wgpu are unusably slow without optimization; keep deps optimized even in dev.
 [profile.dev.package."*"]
 opt-level = 2
+[package.metadata.packager]
+# cargo-packager 配置（https://docs.crabnebula.dev/packager/）
+product-name = "bili-planner"
+identifier = "com.example.bili-planner"
+version = "0.2.0"
+description = "Bilibili & Jellyfin 合集观看计划生成器"
+long-description = "输入 B 站或 Jellyfin 的合集链接，识别分栏 / 分 P / 季 / 子合集结构，按目标天数生成每日观看计划，可导出为 UTF-8 文本。"
+authors = ["anonymous"]
+category = "Video"
+copyright = "MIT"
+license-file = "LICENSE"
+icons = [
+  "icons/32x32.png",
+  "icons/128x128.png",
+  "icons/256x256.png",
+  "icons/icon.ico",
+]
+formats = ["wix"]
+before-packaging-command = "cargo build --release"
