@@ -1,6 +1,6 @@
 # bili-planner — Bilibili & Jellyfin 合集观看计划生成器（桌面应用）
 
-用 Rust + [fenestra](https://github.com/richer-richard/fenestra)（v0.40，纯 Rust 原生 GUI：winit + wgpu + vello + taffy + parley）实现的跨平台桌面应用。
+用 Rust + [gpui-component](https://github.com/longbridge/gpui-component)（v0.5，构建于 Zed 的 GPU 加速 UI 框架 [GPUI](https://gpui.rs) 之上的 shadcn 风格组件库）实现的跨平台桌面应用，主题为内置默认亮/暗双模式，主色覆写为 Apple System Blue。
 
 输入 B 站或 Jellyfin 的合集链接，识别分栏 / 分 P / 季 / 子合集结构，按目标天数生成每日观看计划，可导出为 UTF-8 文本。
 
@@ -21,12 +21,12 @@
   - `split`：日均精确切分，标注跨天分割点
   - `whole`：视频保持完整不拆分
   - 休息日提示
-- 计划表展示与 UTF-8 文本导出
-- 亮/暗主题切换（Apple HIG 风格 UI）
+- 计划表展示与 UTF-8 文本导出（虚拟滚动表格，长计划不掉帧）
+- 亮/暗主题切换（gpui-component 默认主题 + Apple System Blue 主色）
 
 ## 构建与运行
 
-前置：Rust 1.88+（含 MSVC 构建工具，Windows）。
+前置：最新 stable Rust（gpui 使用 2024 edition）；macOS 需 Xcode 及 Metal 工具链（`xcodebuild -downloadComponent MetalToolchain`）。
 
 ```bash
 cargo build --release
@@ -55,19 +55,17 @@ cargo packager --release    # 生成 target/release/bili-planner_0.2.0_x64_en-US
 ## 测试与验证
 
 ```bash
-cargo test           # 单元 + 集成 + UI 冒烟（与 Python 输出向量逐项对比）
+cargo test           # 单元 + 集成 + core 编排冒烟 + gpui 无头渲染冒烟
 cargo clippy --all-targets
 cargo fmt --all -- --check
 cargo run --example live_check -- "BV1ps4y1d73V" 30 all split             # B 站端到端（真实 API）
 cargo run --example live_check_jellyfin -- "<Jellyfin 链接>" 30 all split # Jellyfin 端到端
-cargo run --example screenshot                                           # 无头 UI 截图
 ```
 
 ## 跨平台
 
-- 代码无平台专属 API；Windows / macOS / Linux 均可用原生窗口与文件对话框（rfd 在 Linux 走 xdg-portal）。
-- 已在 Windows x86_64 上验证构建与运行；macOS / Linux 需在对应环境构建验证。
-- 中文由操作系统字体渲染（fenestra 窗口内使用系统字体）。
+- gpui 渲染（macOS Metal / Windows DirectX / Linux），中文由系统字体回退渲染。
+- 已在 macOS arm64 上验证构建与运行；Windows / Linux 需在对应环境构建验证。
 
 ## 目录结构
 
@@ -80,10 +78,14 @@ src/parse.rs     B 站输入解析 + 合集结构识别
 src/plan.rs      观看计划算法与格式化（与 Python 逐行对齐）
 src/export.rs    完整文本输出
 src/error.rs     应用错误类型（Input/Api/Network/Data，与 Python 错误消息对齐）
-src/app.rs       fenestra 桌面应用（状态机 + 视图 + 配置持久化）
-src/main.rs      应用入口（窗口标题 + 程序化图标）
-examples/        端到端验证与截图示例
-tests/           测试（含 Python 生成的期望向量 + Jellyfin fixture + UI 冒烟）
+src/core.rs      业务编排层（状态数据 + 获取/生成/导出 + 凭证持久化，无 GUI 依赖）
+src/theme.rs     主题定制（默认主题 + Apple System Blue 主色）
+src/assets.rs    资产源（官方组件图标 + 应用专属图标合并）
+src/app.rs       gpui-component 桌面应用（状态机 + 视图 + 计划表委托）
+src/main.rs      应用入口（Application + 窗口 + Root 包裹）
+assets/icons/    应用专属 lucide 图标（组件内部图标由 gpui-component-assets 提供）
+examples/        端到端验证示例
+tests/           测试（含 Python 期望向量 + Jellyfin fixture + core 编排冒烟）
 ```
 
 ## 许可证

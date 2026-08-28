@@ -2,7 +2,7 @@
 //! 用法：cargo run --example live_check -- "<链接/BV/sid>" [days] [all|科目号] [split|whole]
 //! 环境变量 BILI_COOKIE 可传 Cookie。
 
-use bili_planner::app::{fetch_and_parse, generate_plan, FetchSource, Selection};
+use bili_planner::core::{fetch_and_parse, generate_plan, FetchSource, Selection};
 use bili_planner::export;
 use bili_planner::plan::Mode;
 

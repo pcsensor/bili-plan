@@ -31,6 +31,9 @@ target/
 *.ipr
 out/
 
+# ZCode
+.zcode/
+
 # VS Code
 .vscode/
 .vscode-test/

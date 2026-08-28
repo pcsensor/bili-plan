@@ -2,7 +2,7 @@
 //! 用法：cargo run --example live_check_jellyfin -- "<链接/item ID>" [days] [all|科目号] [split|whole]
 //! 服务器地址可用环境变量 JF_SERVER 覆盖；令牌必须通过 JF_TOKEN 提供（不再内置）。
 
-use bili_planner::app::{fetch_and_parse, generate_plan, FetchSource, Selection};
+use bili_planner::core::{fetch_and_parse, generate_plan, FetchSource, Selection};
 use bili_planner::export;
 use bili_planner::plan::Mode;
 
