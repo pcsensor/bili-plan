@@ -30,7 +30,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     label::Label,
     notification::Notification,
-    radio::{Radio, RadioGroup},
+    resizable::{h_resizable, resizable_panel},
     table::{Column, Table, TableDelegate, TableState},
     v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, Theme, ThemeMode, TitleBar,
     WindowExt,
@@ -40,7 +40,7 @@ use crate::core::{
     clear_history, export_payload, generate_plan, load_config, parse_days, record_history,
     remove_history, save_config, AppConfig, FetchSource, ReadyState, Selection, SourceMode,
 };
-use crate::plan::{fmt_human, fmt_seconds, trunc, Mode, PlanEntry};
+use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 
 /// 右侧计划面板宽度（生成计划后窗口向右扩展的空间）。
 const PLAN_PANEL_WIDTH: gpui::Pixels = px(640.);
@@ -229,6 +229,8 @@ fn bcard(cx: &App) -> gpui::Div {
     let theme = cx.theme();
     let dark = theme.is_dark();
     v_flex()
+        .w_full()
+        .min_w_0()
         .gap_3()
         .p_5()
         .rounded_none()
@@ -534,11 +536,11 @@ impl PlannerApp {
                     let delegate = PlanTableDelegate::new(plan);
                     *plan_table = Some(cx.new(|cx| {
                         let mut state = TableState::new(delegate, window, cx);
-                        // 只读展示表：关闭行/列选择、排序与拖拽。
+                        // 只读展示表：关闭行/列选择与排序（开启列宽拖拽自适应）。
                         state.col_selectable = false;
                         state.row_selectable = false;
                         state.col_movable = false;
-                        state.col_resizable = false;
+                        state.col_resizable = true;
                         state.sortable = false;
                         state
                     }));
@@ -1235,37 +1237,69 @@ impl PlannerApp {
 
         // 多科目选择
         if rd.groups.len() > 1 {
-            let mut group = RadioGroup::vertical("group-sel")
-                .selected_index(match rd.selection {
-                    Selection::All => Some(0),
-                    Selection::Single(i) => Some(i + 1),
-                })
-                .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                    let sel = if *ix == 0 {
-                        Selection::All
-                    } else {
-                        Selection::Single(ix - 1)
-                    };
-                    this.set_selection(sel, window, cx);
-                }))
-                .child(Radio::new("sel-all").label("整个合集（全部科目）"));
+            let dark = cx.theme().is_dark();
+            let is_all_selected = matches!(rd.selection, Selection::All);
+            let all_total_eps: usize = rd.groups.iter().map(|g| g.episodes.len()).sum();
+            let all_total_dur: i64 = rd
+                .groups
+                .iter()
+                .flat_map(|g| g.episodes.iter())
+                .map(|e| e.duration)
+                .sum();
+
+            let mut items: Vec<gpui::AnyElement> = Vec::new();
+
+            // 1. 全部科目
+            items.push(
+                Self::render_subject_item(
+                    "sel-all",
+                    is_all_selected,
+                    "整个合集（全部科目）".to_string(),
+                    Some(format!(
+                        "{} 个视频 · {}",
+                        all_total_eps,
+                        fmt_seconds(all_total_dur as f64, true)
+                    )),
+                    &theme,
+                    dark,
+                    cx.listener(|this, _, window, cx| {
+                        this.set_selection(Selection::All, window, cx);
+                    }),
+                )
+                .into_any_element(),
+            );
+
+            // 2. 各单科目
             for (i, g) in rd.groups.iter().enumerate() {
+                let is_selected = matches!(rd.selection, Selection::Single(ix) if ix == i);
                 let total: i64 = g.episodes.iter().map(|e| e.duration).sum();
-                group = group.child(Radio::new(("sel-group", i)).label(format!(
-                    "{}. {}（{} 个视频，共 {}）",
-                    i + 1,
-                    g.name,
-                    g.episodes.len(),
-                    fmt_seconds(total as f64, true)
-                )));
+                items.push(
+                    Self::render_subject_item(
+                        ("sel-group", i),
+                        is_selected,
+                        format!("{}. {}", i + 1, g.name),
+                        Some(format!(
+                            "{} 个视频 · {}",
+                            g.episodes.len(),
+                            fmt_seconds(total as f64, true)
+                        )),
+                        &theme,
+                        dark,
+                        cx.listener(move |this, _, window, cx| {
+                            this.set_selection(Selection::Single(i), window, cx);
+                        }),
+                    )
+                    .into_any_element(),
+                );
             }
+
             out.push(
                 entrance(
                     "anim-groups",
                     0.26,
                     bcard(cx)
                         .child(section_band("03 · 科目选择", "icons/filter.svg", cx))
-                        .child(group),
+                        .child(v_flex().w_full().min_w_0().gap_2().children(items)),
                 )
                 .into_any_element(),
             );
@@ -1315,6 +1349,7 @@ impl PlannerApp {
             bcard(cx)
                 .flex_1()
                 .min_h_0()
+                .min_w_0()
                 .child(section_band("05 · 每日计划", "icons/table.svg", cx))
                 .child(content)
         };
@@ -1323,6 +1358,7 @@ impl PlannerApp {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .rounded_none()
                     .border_2()
                     .border_color(theme.foreground)
@@ -1377,6 +1413,113 @@ impl PlannerApp {
             )
             .child(Label::new(value.to_string()).text_size(px(13.)))
     }
+
+    /// 渲染科目选择的单选项（野兽风视觉：硬边框、高亮背景、单选指示器与右侧时长徽标）。
+    fn render_subject_item(
+        id: impl Into<gpui::ElementId>,
+        selected: bool,
+        title: String,
+        badge: Option<String>,
+        theme: &gpui_component::ThemeColor,
+        dark: bool,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        let active_bg = if dark {
+            theme.primary.opacity(0.18)
+        } else {
+            theme.primary.opacity(0.12)
+        };
+        let hover_bg = if dark {
+            theme.accent.opacity(0.10)
+        } else {
+            theme.accent.opacity(0.08)
+        };
+
+        h_flex()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_none()
+            .border_2()
+            .border_color(if selected {
+                theme.primary
+            } else {
+                theme.border
+            })
+            .bg(if selected {
+                active_bg
+            } else {
+                theme.background.opacity(0.35)
+            })
+            .cursor_pointer()
+            .hover(move |s| {
+                if !selected {
+                    s.bg(hover_bg)
+                } else {
+                    s
+                }
+            })
+            .on_click(move |event, window, cx| on_click(event, window, cx))
+            .child(
+                // 单选指示器圆圈
+                div()
+                    .flex_shrink_0()
+                    .size(px(16.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if selected {
+                        theme.primary
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(selected, |d| {
+                        d.child(
+                            div()
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(theme.primary),
+                        )
+                    }),
+            )
+            .child(
+                // 科目标题
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.))
+                    .font_weight(if selected {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(theme.foreground)
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(title),
+            )
+            .children(badge.map(|b| {
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.muted_foreground)
+                    .px_2()
+                    .py_0p5()
+                    .bg(theme.muted.opacity(0.5))
+                    .rounded_none()
+                    .border_1()
+                    .border_color(theme.border.opacity(0.4))
+                    .child(b)
+            }))
+    }
 }
 
 impl Render for PlannerApp {
@@ -1416,25 +1559,45 @@ impl Render for PlannerApp {
         }
 
         // 右栏：就绪后展开的计划面板，独立滚动、高度撑满窗口。
-        // 注意必须是 flex 容器（v_flex）：gpui 的裸 div 默认 Display::Block，
-        // 块级布局下子卡片的 flex_1 拿不到高度，计划表会塌陷成空白。
-        let mut body = h_flex().flex_1().min_h_0().child(left);
-        if let Phase::Ready(rd) = &self.phase {
-            body = body.child(
-                v_flex()
-                    .w(PLAN_PANEL_WIDTH)
-                    .h_full()
-                    .flex_shrink_0()
-                    .border_l_2()
-                    .border_color(theme.foreground)
-                    .bg(theme.background.opacity(0.72))
-                    .child(v_flex().flex_1().min_h_0().px_5().py_4().child(entrance(
-                        "anim-plan",
-                        0.15,
-                        self.render_plan_panel(rd, cx),
-                    ))),
-            );
-        }
+        // 通过 h_resizable 提供可拖拽分割线，支持自由调整左右分区大小与自适应排版。
+        let body: gpui::AnyElement = if let Phase::Ready(rd) = &self.phase {
+            h_resizable("main-splitter")
+                .child(
+                    resizable_panel()
+                        .size_range(px(360.)..px(1800.))
+                        .child(left),
+                )
+                .child(
+                    resizable_panel()
+                        .size(PLAN_PANEL_WIDTH)
+                        .size_range(px(380.)..px(2400.))
+                        .child(
+                            v_flex()
+                                .size_full()
+                                .min_h_0()
+                                .min_w_0()
+                                .border_l_2()
+                                .border_color(theme.foreground)
+                                .bg(theme.background.opacity(0.72))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .min_w_0()
+                                        .px_5()
+                                        .py_4()
+                                        .child(entrance(
+                                            "anim-plan",
+                                            0.15,
+                                            self.render_plan_panel(rd, cx),
+                                        )),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            h_flex().flex_1().min_h_0().child(left).into_any_element()
+        };
 
         div()
             .size_full()
@@ -1445,7 +1608,7 @@ impl Render for PlannerApp {
             .text_color(theme.foreground)
             .child(render_backdrop(dark, theme.background))
             .child(self.render_title_bar(dark, cx))
-            .child(body)
+            .child(div().flex_1().min_h_0().child(body))
     }
 }
 
@@ -1522,9 +1685,9 @@ impl PlanTableDelegate {
                     cells: [
                         String::new(),
                         format!("#{}", e.vid_no),
-                        trunc(&compact_subject(&e.title), 14),
+                        compact_subject(&e.title),
                         fmt_seconds(e.portion as f64, true),
-                        trunc(&compact_note(e), 12),
+                        compact_note(e),
                     ],
                     is_day_head: false,
                 });
@@ -1605,6 +1768,7 @@ impl TableDelegate for PlanTableDelegate {
             })
             .whitespace_nowrap()
             .overflow_hidden()
+            .text_ellipsis()
             .child(row.cells[col_ix].clone())
     }
 }
