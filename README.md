@@ -1,6 +1,6 @@
 # bili-planner — Bilibili & Jellyfin 合集观看计划生成器（桌面应用）
 
-用 Rust + [gpui-component](https://github.com/longbridge/gpui-component)（v0.5，构建于 Zed 的 GPU 加速 UI 框架 [GPUI](https://gpui.rs) 之上的 shadcn 风格组件库）实现的跨平台桌面应用，主题为内置默认亮/暗双模式，主色覆写为 Apple System Blue。
+用 Rust + [gpui-component](https://github.com/longbridge/gpui-component)（v0.5，构建于 Zed 的 GPU 加速 UI 框架 [GPUI](https://gpui.rs) 之上的 shadcn 风格组件库）实现的跨平台桌面应用，视觉为 Neo-Brutalist（新野兽风）主题：纸面底色 + 点阵肌理与低透明度几何色块装饰、2px 硬边框、直角、纯偏移硬阴影，卡片以 quint 减速曲线错峰入场；内置亮/暗双模式（亮色电光蓝主色、暗色荧光黄主色）。
 
 输入 B 站或 Jellyfin 的合集链接，识别分栏 / 分 P / 季 / 子合集结构，按目标天数生成每日观看计划，可导出为 UTF-8 文本。
 
@@ -22,7 +22,8 @@
   - `whole`：视频保持完整不拆分
   - 休息日提示
 - 计划表展示与 UTF-8 文本导出（虚拟滚动表格，长计划不掉帧）
-- 亮/暗主题切换（gpui-component 默认主题 + Apple System Blue 主色）
+- 搜索历史：获取成功的输入自动记录（去重、上限 20 条、持久化），点击一键回填链接，支持单条删除与一键清空
+- 亮/暗主题切换（Neo-Brutalist 主题）
 
 ## 构建与运行
 
@@ -49,7 +50,7 @@ cargo packager --release    # 生成 target/release/bili-planner_0.2.0_x64_en-US
 > - 首次打包会自动联网下载 WiX Toolset。
 ## 配置
 
-- Jellyfin 服务器地址与 Token 可保存到本机（`~/.bili-planner.json`），下次启动自动填入
+- Jellyfin 服务器地址、Token 与搜索历史保存到本机（`~/.bili-planner.json`），下次启动自动填入/展示；文件缺 `history` 键也能兼容读入
 - B 站 Cookie 仅在 UI 会话内使用，不持久化
 
 ## 测试与验证

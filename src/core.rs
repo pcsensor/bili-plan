@@ -60,11 +60,78 @@ impl SourceMode {
     }
 }
 
-/// 持久化到本机的 Jellyfin 凭证（JSON 文件，工作目录旁）。
+/// 一条搜索历史（仅记录获取成功的输入）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    /// 用户输入的链接 / BV 号 / item ID（trim 后）。
+    pub input: String,
+    /// 来源："bilibili" 或 "jellyfin"。
+    pub source: String,
+    /// 获取成功时的合集标题（用于列表展示，可为空）。
+    pub title: String,
+    /// 记录时间（unix 秒）。
+    pub at: i64,
+}
+
+/// 持久化到本机的应用配置（JSON 文件，家目录下）。
+///
+/// 字段保持扁平：旧版本文件只有 `server_url`/`token` 两个键，
+/// `history` 缺省为空即可读入，避免升级丢凭证。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-pub struct JellyfinConfig {
+pub struct AppConfig {
     pub server_url: String,
     pub token: String,
+    #[serde(default)]
+    pub history: Vec<HistoryEntry>,
+}
+
+/// 历史记录上限（超出后丢弃最旧的）。
+pub const HISTORY_LIMIT: usize = 20;
+
+/// 来源枚举 → 历史记录里的字符串标记。
+fn source_tag(source: SourceMode) -> &'static str {
+    match source {
+        SourceMode::Bilibili => "bilibili",
+        SourceMode::Jellyfin => "jellyfin",
+    }
+}
+
+/// 记录一条搜索历史：按（来源, 输入）去重、最新在前、超限截断。
+/// 纯内存操作，调用方决定何时 [`save_config`]。
+pub fn record_history(cfg: &mut AppConfig, source: SourceMode, input: &str, title: &str) {
+    let input = input.trim();
+    if input.is_empty() {
+        return;
+    }
+    let tag = source_tag(source);
+    cfg.history
+        .retain(|h| !(h.source == tag && h.input == input));
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    cfg.history.insert(
+        0,
+        HistoryEntry {
+            input: input.to_string(),
+            source: tag.to_string(),
+            title: title.trim().to_string(),
+            at,
+        },
+    );
+    cfg.history.truncate(HISTORY_LIMIT);
+}
+
+/// 删除第 `index` 条历史；越界时静默忽略。
+pub fn remove_history(cfg: &mut AppConfig, index: usize) {
+    if index < cfg.history.len() {
+        cfg.history.remove(index);
+    }
+}
+
+/// 清空全部历史。
+pub fn clear_history(cfg: &mut AppConfig) {
+    cfg.history.clear();
 }
 
 /// 已获取的合集/视频数据。
@@ -262,19 +329,17 @@ fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".bili-planner.json"))
 }
 
-/// 启动时尝试加载本机 Jellyfin 凭证；文件不存在或损坏时静默返回 `None`。
-pub fn load_config() -> Option<JellyfinConfig> {
+/// 启动时尝试加载本机配置（Jellyfin 凭证 + 搜索历史）；
+/// 文件不存在或损坏时静默返回 `None`。
+pub fn load_config() -> Option<AppConfig> {
     let path = config_path()?;
     let data = std::fs::read_to_string(&path).ok()?;
-    let cfg: JellyfinConfig = serde_json::from_str(&data).ok()?;
-    if cfg.server_url.trim().is_empty() || cfg.token.trim().is_empty() {
-        return None;
-    }
+    let cfg: AppConfig = serde_json::from_str(&data).ok()?;
     Some(cfg)
 }
 
-/// 把 Jellyfin 凭证写到本机（pretty JSON）。失败静默：不阻塞主流程。
-pub fn save_config(cfg: &JellyfinConfig) {
+/// 把应用配置写到本机（pretty JSON）。失败静默：不阻塞主流程。
+pub fn save_config(cfg: &AppConfig) {
     let Some(path) = config_path() else { return };
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
         let _ = std::fs::write(&path, json);
@@ -308,5 +373,64 @@ mod tests {
         assert_eq!(SourceMode::from_index(1), SourceMode::Jellyfin);
         assert_eq!(SourceMode::Bilibili.index(), 0);
         assert_eq!(SourceMode::Jellyfin.index(), 1);
+    }
+
+    #[test]
+    fn record_history_dedupes_and_prepends() {
+        let mut cfg = AppConfig::default();
+        record_history(&mut cfg, SourceMode::Bilibili, " BV1abc ", "合集A");
+        record_history(&mut cfg, SourceMode::Jellyfin, "http://jf/?id=1", "课程B");
+        assert_eq!(cfg.history.len(), 2);
+        assert_eq!(cfg.history[0].source, "jellyfin");
+
+        // 相同（来源, 输入）去重并置顶，不产生重复项。
+        record_history(&mut cfg, SourceMode::Bilibili, "BV1abc", "合集A·新标题");
+        assert_eq!(cfg.history.len(), 2);
+        assert_eq!(cfg.history[0].title, "合集A·新标题");
+        // 相同输入、不同来源视为两条。
+        record_history(&mut cfg, SourceMode::Jellyfin, "BV1abc", "");
+        assert_eq!(cfg.history.len(), 3);
+        // 空白输入不记录。
+        record_history(&mut cfg, SourceMode::Bilibili, "   ", "x");
+        assert_eq!(cfg.history.len(), 3);
+    }
+
+    #[test]
+    fn record_history_caps_at_limit() {
+        let total = HISTORY_LIMIT as i64 + 5;
+        let mut cfg = AppConfig::default();
+        for i in 0..total {
+            record_history(&mut cfg, SourceMode::Bilibili, &format!("BV{i:04}"), "");
+        }
+        assert_eq!(cfg.history.len(), HISTORY_LIMIT);
+        // 最新的留在最前，最旧的被截断。
+        assert_eq!(cfg.history[0].input, format!("BV{:04}", total - 1));
+        assert_eq!(
+            cfg.history.last().unwrap().input,
+            format!("BV{:04}", total - HISTORY_LIMIT as i64)
+        );
+    }
+
+    #[test]
+    fn remove_and_clear_history() {
+        let mut cfg = AppConfig::default();
+        record_history(&mut cfg, SourceMode::Bilibili, "BV1", "A");
+        record_history(&mut cfg, SourceMode::Bilibili, "BV2", "B");
+        remove_history(&mut cfg, 0);
+        assert_eq!(cfg.history.len(), 1);
+        assert_eq!(cfg.history[0].input, "BV1");
+        remove_history(&mut cfg, 99); // 越界静默
+        assert_eq!(cfg.history.len(), 1);
+        clear_history(&mut cfg);
+        assert!(cfg.history.is_empty());
+    }
+
+    /// 旧版配置文件（只有 Jellyfin 两键）必须能无损读入。
+    #[test]
+    fn legacy_config_parses_with_empty_history() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"server_url": "http://jf:8096", "token": "t"}"#).unwrap();
+        assert_eq!(cfg.server_url, "http://jf:8096");
+        assert!(cfg.history.is_empty());
     }
 }
