@@ -32,7 +32,7 @@ use gpui_component::{
     notification::Notification,
     resizable::{h_resizable, resizable_panel},
     table::{Column, Table, TableDelegate, TableState},
-    v_flex, ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, Theme, ThemeMode, TitleBar,
+    v_flex, ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, Theme, ThemeMode, TitleBar,
     WindowExt,
 };
 
@@ -392,6 +392,7 @@ pub struct PlannerApp {
     cloud_bind_code: Option<String>,
     cloud_bind_expires: Option<u64>,
     cloud_syncing: bool,
+    has_pending_auto_sync: bool,
     cloud_sync_modal_open: bool,
     cloud_sync_modal_data: Option<(String, bool, Vec<String>)>,
 }
@@ -483,6 +484,7 @@ impl PlannerApp {
             cloud_bind_code: None,
             cloud_bind_expires: None,
             cloud_syncing: false,
+            has_pending_auto_sync: false,
             cloud_sync_modal_open: false,
             cloud_sync_modal_data: None,
         }
@@ -798,6 +800,7 @@ impl PlannerApp {
                 );
                 self.active_tab = AppTab::TodayCheckIn;
                 self.selected_date = today_date_str();
+                self.trigger_auto_sync(window, cx);
             }
             Err(e) => {
                 window.push_notification(Notification::error(e), cx);
@@ -824,6 +827,7 @@ impl PlannerApp {
                 } else {
                     window.push_notification(Notification::info("已撤回该项打卡"), cx);
                 }
+                self.trigger_auto_sync(window, cx);
             }
             Err(e) => {
                 window.push_notification(Notification::error(e), cx);
@@ -848,6 +852,7 @@ impl PlannerApp {
                 Notification::success("🎉 今日该科目任务已全部完成打卡！"),
                 cx,
             );
+            self.trigger_auto_sync(window, cx);
         }
         cx.notify();
     }
@@ -878,6 +883,7 @@ impl PlannerApp {
                 Notification::success(format!("已成功为 {count} 门科目的未完成任务顺延至今日！")),
                 cx,
             );
+            self.trigger_auto_sync(window, cx);
         } else {
             window.push_notification(Notification::info("暂无需要顺延的落后计划"), cx);
         }
@@ -885,8 +891,9 @@ impl PlannerApp {
     }
 
     /// 切换计划状态（暂停/继续）。
-    fn toggle_plan_status_action(&mut self, plan_id: &str, cx: &mut Context<Self>) {
+    fn toggle_plan_status_action(&mut self, plan_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         toggle_study_plan_status(&mut self.config, plan_id);
+        self.trigger_auto_sync(window, cx);
         cx.notify();
     }
 
@@ -894,6 +901,7 @@ impl PlannerApp {
     fn delete_plan_action(&mut self, plan_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         remove_study_plan(&mut self.config, plan_id);
         window.push_notification(Notification::info("已移除该学习计划"), cx);
+        self.trigger_auto_sync(window, cx);
         cx.notify();
     }
 
@@ -908,6 +916,7 @@ impl PlannerApp {
         match push_forward_study_plan(&mut self.config, plan_id, &today) {
             Ok(()) => {
                 window.push_notification(Notification::success("已顺延本科目未完成任务至今日！"), cx);
+                self.trigger_auto_sync(window, cx);
             }
             Err(e) => {
                 window.push_notification(Notification::error(e), cx);
@@ -934,52 +943,140 @@ impl PlannerApp {
         cx.notify();
     }
 
-    /// 触发与云服务双向增量同步。
-    fn sync_cloud_action(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// 触发与云服务双向增量同步（手动同步，弹窗呈现详情）。
+    fn sync_cloud_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.cloud_syncing {
             return;
         }
         self.cloud_syncing = true;
         cx.notify();
 
-        match sync_with_cloud(&mut self.config) {
-            Ok(_) => {
-                let feishu_status = if self.config.feishu_bound {
-                    format!("已绑定 ({})", self.config.feishu_user_name.as_deref().unwrap_or("学习者"))
-                } else {
-                    "未连接飞书机器人 (点击「绑定飞书」开始连接)".to_string()
-                };
-                let plan_count = self.config.plans.len();
-                let today = today_date_str();
-                let today_tasks = get_tasks_for_date(&self.config.plans, &today);
-                let done_count = today_tasks.iter().filter(|t| t.task.completed).count();
+        let mut cfg_clone = self.config.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let res = sync_with_cloud(&mut cfg_clone);
+                    (res, cfg_clone)
+                })
+                .await;
 
-                self.cloud_sync_modal_data = Some((
-                    "云端同步成功".to_string(),
-                    true,
-                    vec![
-                        format!("📚 学习科目：共 {plan_count} 门计划已完成状态对齐"),
-                        format!("📱 飞书状态：{feishu_status}"),
-                        format!("🔥 今日任务：共 {} 项，已完成 {done_count} 项打卡", today_tasks.len()),
-                        "✨ 本地与云端数据已保持最新一致！".to_string(),
-                    ],
-                ));
-                self.cloud_sync_modal_open = true;
-            }
-            Err(e) => {
-                self.cloud_sync_modal_data = Some((
-                    "云端同步失败".to_string(),
-                    false,
-                    vec![
-                        format!("❌ 失败原因：{e}"),
-                        "💡 建议：请检查本地网络连接及云服务器运行状态。".to_string(),
-                    ],
-                ));
-                self.cloud_sync_modal_open = true;
-            }
+            this.update_in(cx, |this, window, cx| {
+                this.cloud_syncing = false;
+                let (res, synced_cfg) = result;
+                match res {
+                    Ok(_) => {
+                        this.config.plans = synced_cfg.plans;
+                        this.config.feishu_bound = synced_cfg.feishu_bound;
+                        this.config.feishu_user_name = synced_cfg.feishu_user_name;
+                        if synced_cfg.sync_device_token.is_some() {
+                            this.config.sync_device_token = synced_cfg.sync_device_token;
+                        }
+                        save_config(&this.config);
+
+                        let feishu_status = if this.config.feishu_bound {
+                            format!(
+                                "已绑定 ({})",
+                                this.config.feishu_user_name.as_deref().unwrap_or("学习者")
+                            )
+                        } else {
+                            "未连接飞书机器人 (点击「绑定飞书」开始连接)".to_string()
+                        };
+                        let plan_count = this.config.plans.len();
+                        let today = today_date_str();
+                        let today_tasks = get_tasks_for_date(&this.config.plans, &today);
+                        let done_count = today_tasks.iter().filter(|t| t.task.completed).count();
+
+                        this.cloud_sync_modal_data = Some((
+                            "云端同步成功".to_string(),
+                            true,
+                            vec![
+                                format!("📚 学习科目：共 {plan_count} 门计划已完成状态对齐"),
+                                format!("📱 飞书状态：{feishu_status}"),
+                                format!("🔥 今日任务：共 {} 项，已完成 {done_count} 项打卡", today_tasks.len()),
+                                "✨ 本地与云端数据已保持最新一致！".to_string(),
+                            ],
+                        ));
+                        this.cloud_sync_modal_open = true;
+                    }
+                    Err(e) => {
+                        this.cloud_sync_modal_data = Some((
+                            "云端同步失败".to_string(),
+                            false,
+                            vec![
+                                format!("❌ 失败原因：{e}"),
+                                "💡 建议：请检查本地网络连接及云服务器运行状态。".to_string(),
+                            ],
+                        ));
+                        this.cloud_sync_modal_open = true;
+                    }
+                }
+                if this.has_pending_auto_sync {
+                    this.has_pending_auto_sync = false;
+                    this.trigger_auto_sync(window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 触发检测到修改后的自动同步（静默异步执行，成功后右上角弹出通知并自动消失）。
+    fn trigger_auto_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.config.auto_sync {
+            return;
         }
-        self.cloud_syncing = false;
+        if self.cloud_syncing {
+            self.has_pending_auto_sync = true;
+            return;
+        }
+        self.cloud_syncing = true;
         cx.notify();
+
+        let mut cfg_clone = self.config.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let res = sync_with_cloud(&mut cfg_clone);
+                    (res, cfg_clone)
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| {
+                this.cloud_syncing = false;
+                let (res, synced_cfg) = result;
+                match res {
+                    Ok(_) => {
+                        this.config.plans = synced_cfg.plans;
+                        this.config.feishu_bound = synced_cfg.feishu_bound;
+                        this.config.feishu_user_name = synced_cfg.feishu_user_name;
+                        if synced_cfg.sync_device_token.is_some() {
+                            this.config.sync_device_token = synced_cfg.sync_device_token;
+                        }
+                        save_config(&this.config);
+                        window.push_notification(
+                            Notification::success("☁️ 检测到修改，已自动同步到云端"),
+                            cx,
+                        );
+                    }
+                    Err(e) => {
+                        window.push_notification(
+                            Notification::warning(format!("⚠️ 自动同步未成功: {e}")),
+                            cx,
+                        );
+                    }
+                }
+                if this.has_pending_auto_sync {
+                    this.has_pending_auto_sync = false;
+                    this.trigger_auto_sync(window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 打开飞书绑定弹窗并生成 6 位验证码。
@@ -1008,7 +1105,7 @@ impl PlannerApp {
                         Notification::success(format!("🎉 飞书绑定成功！已连接到 {name}")),
                         cx,
                     );
-                    let _ = sync_with_cloud(&mut self.config);
+                    self.trigger_auto_sync(window, cx);
                 } else {
                     window.push_notification(
                         Notification::info("尚未检测到绑定消息，请先在飞书聊天框向机器人发送 /bind <验证码>"),
@@ -1349,6 +1446,24 @@ impl PlannerApp {
             .child(tab_btn(AppTab::PlanGenerator, "计划生成器", "icons/calendar-days.svg", None, cx))
             .child(tab_btn(AppTab::MyPlans, "我的计划库", "icons/table.svg", Some(active_plans_count), cx));
 
+        let auto_sync_btn = Button::new("auto-sync-btn")
+            .small()
+            .ghost()
+            .label(if self.config.auto_sync { "⚡ 自动同步: 开" } else { "⚡ 自动同步: 关" })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.config.auto_sync = !this.config.auto_sync;
+                save_config(&this.config);
+                let state_str = if this.config.auto_sync { "开启" } else { "关闭" };
+                window.push_notification(
+                    Notification::info(format!("已{}检测到修改自动同步功能", state_str)),
+                    cx,
+                );
+                if this.config.auto_sync {
+                    this.trigger_auto_sync(window, cx);
+                }
+                cx.notify();
+            }));
+
         let feishu_btn = if self.config.feishu_bound {
             let label = format!("📱 飞书: {}", self.config.feishu_user_name.as_deref().unwrap_or("已绑定"));
             Button::new("feishu-status-btn")
@@ -1381,6 +1496,7 @@ impl PlannerApp {
         let right_actions = h_flex()
             .gap_2()
             .items_center()
+            .child(auto_sync_btn)
             .child(feishu_btn)
             .child(sync_btn)
             .child(toggle);
@@ -2753,8 +2869,8 @@ impl PlannerApp {
                                         Button::new(("pause-plan", p_idx))
                                             .small()
                                             .label(if plan.status == PlanStatus::Paused { "▶️ 继续" } else { "⏸️ 暂停" })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.toggle_plan_status_action(&pid, cx);
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.toggle_plan_status_action(&pid, window, cx);
                                             })),
                                     )
                                     .child(
@@ -3033,7 +3149,7 @@ impl PlannerApp {
 }
 
 impl Render for PlannerApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dark = cx.theme().is_dark();
         let theme = cx.theme().clone();
 
@@ -3045,6 +3161,9 @@ impl Render for PlannerApp {
 
         let bind_modal = self.cloud_bind_modal_open.then(|| self.render_bind_modal(cx));
         let sync_modal = self.cloud_sync_modal_open.then(|| self.render_sync_result_modal(cx));
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
 
         div()
             .size_full()
@@ -3059,6 +3178,9 @@ impl Render for PlannerApp {
             .child(div().flex_1().min_h_0().child(body))
             .children(bind_modal)
             .children(sync_modal)
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }
 

@@ -79,13 +79,19 @@ fn default_sync_server_url() -> String {
     "https://plan.pcsensor.cloud".to_string()
 }
 
+fn default_auto_sync() -> bool {
+    true
+}
+
 /// 持久化到本机的应用配置（JSON 文件，家目录下）。
 ///
 /// 字段保持扁平：旧版本文件只有 `server_url`/`token` 两个键，
 /// `history` 和 `plans` 缺省为空即可读入，避免升级丢数据。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
     pub server_url: String,
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
@@ -99,6 +105,24 @@ pub struct AppConfig {
     pub feishu_bound: bool,
     #[serde(default)]
     pub feishu_user_name: Option<String>,
+    #[serde(default = "default_auto_sync")]
+    pub auto_sync: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            server_url: String::new(),
+            token: String::new(),
+            history: Vec::new(),
+            plans: Vec::new(),
+            sync_server_url: default_sync_server_url(),
+            sync_device_token: None,
+            feishu_bound: false,
+            feishu_user_name: None,
+            auto_sync: true,
+        }
+    }
 }
 
 /// 历史记录上限（超出后丢弃最旧的）。
@@ -651,12 +675,26 @@ mod tests {
         assert!(cfg.history.is_empty());
     }
 
-    /// 旧版配置文件（只有 Jellyfin 两键）必须能无损读入。
+    /// 旧版配置文件（只有 Jellyfin 两键）必须能无损读入，且 auto_sync 缺省为 true。
     #[test]
     fn legacy_config_parses_with_empty_history() {
         let cfg: AppConfig =
             serde_json::from_str(r#"{"server_url": "http://jf:8096", "token": "t"}"#).unwrap();
         assert_eq!(cfg.server_url, "http://jf:8096");
         assert!(cfg.history.is_empty());
+        assert!(cfg.auto_sync);
+    }
+
+    #[test]
+    fn auto_sync_config_roundtrip() {
+        let cfg_default = AppConfig::default();
+        assert!(cfg_default.auto_sync);
+
+        let json = serde_json::to_string(&cfg_default).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.auto_sync);
+
+        let parsed_false: AppConfig = serde_json::from_str(r#"{"auto_sync": false}"#).unwrap();
+        assert!(!parsed_false.auto_sync);
     }
 }
