@@ -75,6 +75,10 @@ pub struct HistoryEntry {
 
 use crate::study::{self, PlanStatus, StudyPlan};
 
+fn default_sync_server_url() -> String {
+    "https://plan.pcsensor.cloud".to_string()
+}
+
 /// 持久化到本机的应用配置（JSON 文件，家目录下）。
 ///
 /// 字段保持扁平：旧版本文件只有 `server_url`/`token` 两个键，
@@ -87,6 +91,14 @@ pub struct AppConfig {
     pub history: Vec<HistoryEntry>,
     #[serde(default)]
     pub plans: Vec<StudyPlan>,
+    #[serde(default = "default_sync_server_url")]
+    pub sync_server_url: String,
+    #[serde(default)]
+    pub sync_device_token: Option<String>,
+    #[serde(default)]
+    pub feishu_bound: bool,
+    #[serde(default)]
+    pub feishu_user_name: Option<String>,
 }
 
 /// 历史记录上限（超出后丢弃最旧的）。
@@ -418,6 +430,135 @@ pub fn push_forward_study_plan(
     study::push_forward_plan(plan, target_start_date)?;
     save_config(cfg);
     Ok(())
+}
+
+/// 请求云端 6 位绑定验证码。
+pub fn request_cloud_bind_code(cfg: &mut AppConfig) -> Result<(String, u64), String> {
+    let server = cfg.sync_server_url.trim_end_matches('/');
+    let body = serde_json::json!({
+        "device_token": cfg.sync_device_token
+    });
+    let url = format!("{}/api/bind/request", server);
+    let payload = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .new_agent();
+
+    let mut resp = agent
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .send(payload)
+        .map_err(|e| format!("请求绑定码失败: {}", e))?;
+
+    let raw = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("读取云端响应失败: {}", e))?;
+
+    let data: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("解析云端响应失败: {}", e))?;
+
+    let code = data["bind_code"]
+        .as_str()
+        .ok_or_else(|| "缺少 bind_code".to_string())?
+        .to_string();
+
+    let token = data["device_token"]
+        .as_str()
+        .ok_or_else(|| "缺少 device_token".to_string())?
+        .to_string();
+
+    let expires = data["expires_in_secs"].as_u64().unwrap_or(600);
+
+    cfg.sync_device_token = Some(token);
+    save_config(cfg);
+
+    Ok((code, expires))
+}
+
+/// 查询云端飞书绑定状态。
+pub fn check_cloud_bind_status(cfg: &mut AppConfig) -> Result<bool, String> {
+    let token = match &cfg.sync_device_token {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+    let server = cfg.sync_server_url.trim_end_matches('/');
+    let url = format!("{}/api/bind/status?device_token={}", server, token);
+
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .new_agent();
+
+    let mut resp = agent
+        .get(&url)
+        .call()
+        .map_err(|e| format!("查询绑定状态失败: {}", e))?;
+
+    let raw = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("读取响应失败: {}", e))?;
+
+    let data: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("解析响应失败: {}", e))?;
+
+    let bound = data["bound"].as_bool().unwrap_or(false);
+    cfg.feishu_bound = bound;
+    cfg.feishu_user_name = data["feishu_user_name"].as_str().map(|s| s.to_string());
+    save_config(cfg);
+
+    Ok(bound)
+}
+
+/// 执行双向增量同步。
+pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
+    let server = cfg.sync_server_url.trim_end_matches('/');
+    let token = cfg.sync_device_token.clone().unwrap_or_default();
+
+    let body = serde_json::json!({
+        "device_token": token,
+        "plans": cfg.plans
+    });
+    let url = format!("{}/api/sync", server);
+    let payload = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .new_agent();
+
+    let mut resp = agent
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .send(payload)
+        .map_err(|e| format!("云端同步网络错误: {}", e))?;
+
+    let raw = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("读取同步响应失败: {}", e))?;
+
+    let data: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("解析同步响应失败: {}", e))?;
+
+    if let Some(plans_val) = data.get("plans") {
+        if let Ok(merged_plans) = serde_json::from_value::<Vec<StudyPlan>>(plans_val.clone()) {
+            cfg.plans = merged_plans;
+        }
+    }
+
+    if let Some(bound) = data.get("feishu_bound").and_then(|b| b.as_bool()) {
+        cfg.feishu_bound = bound;
+    }
+    if let Some(name) = data.get("feishu_user_name").and_then(|n| n.as_str()) {
+        cfg.feishu_user_name = Some(name.to_string());
+    }
+
+    save_config(cfg);
+    Ok("云端同步完成！".to_string())
 }
 
 /// 把应用配置写到本机（原子写入 pretty JSON）。失败静默：不阻塞主流程。

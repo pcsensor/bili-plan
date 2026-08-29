@@ -1,0 +1,17 @@
+version: '3.7'
+
+services:
+  bili-plan-server:
+    build: .
+    container_name: bili-plan-server
+    restart: always
+    ports:
+      - "127.0.0.1:${PORT:-3005}:3005"
+    env_file:
+      - .env
+    environment:
+      - PORT=3005
+      - DATA_DIR=/app/data
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/app/data

@@ -37,10 +37,10 @@ use gpui_component::{
 };
 
 use crate::core::{
-    checkin_study_task, clear_history, enroll_study_plan, export_payload, generate_plan,
-    load_config, parse_days, push_forward_study_plan, record_history, remove_history,
-    remove_study_plan, save_config, toggle_study_plan_status, AppConfig, FetchSource, ReadyState,
-    Selection, SourceMode,
+    check_cloud_bind_status, checkin_study_task, clear_history, enroll_study_plan, export_payload,
+    generate_plan, load_config, parse_days, push_forward_study_plan, record_history, remove_history,
+    remove_study_plan, request_cloud_bind_code, save_config, sync_with_cloud,
+    toggle_study_plan_status, AppConfig, FetchSource, ReadyState, Selection, SourceMode,
 };
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
@@ -386,6 +386,14 @@ pub struct PlannerApp {
 
     /// 首次生成计划时已向右扩展过窗口，避免反复 resize 覆盖用户手动调整。
     window_expanded: bool,
+
+    /// 飞书云同步相关状态
+    cloud_bind_modal_open: bool,
+    cloud_bind_code: Option<String>,
+    cloud_bind_expires: Option<u64>,
+    cloud_syncing: bool,
+    cloud_sync_modal_open: bool,
+    cloud_sync_modal_data: Option<(String, bool, Vec<String>)>,
 }
 
 impl PlannerApp {
@@ -471,6 +479,12 @@ impl PlannerApp {
             config,
             plan_table: None,
             window_expanded: false,
+            cloud_bind_modal_open: false,
+            cloud_bind_code: None,
+            cloud_bind_expires: None,
+            cloud_syncing: false,
+            cloud_sync_modal_open: false,
+            cloud_sync_modal_data: None,
         }
     }
 
@@ -920,6 +934,95 @@ impl PlannerApp {
         cx.notify();
     }
 
+    /// 触发与云服务双向增量同步。
+    fn sync_cloud_action(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.cloud_syncing {
+            return;
+        }
+        self.cloud_syncing = true;
+        cx.notify();
+
+        match sync_with_cloud(&mut self.config) {
+            Ok(_) => {
+                let feishu_status = if self.config.feishu_bound {
+                    format!("已绑定 ({})", self.config.feishu_user_name.as_deref().unwrap_or("学习者"))
+                } else {
+                    "未连接飞书机器人 (点击「绑定飞书」开始连接)".to_string()
+                };
+                let plan_count = self.config.plans.len();
+                let today = today_date_str();
+                let today_tasks = get_tasks_for_date(&self.config.plans, &today);
+                let done_count = today_tasks.iter().filter(|t| t.task.completed).count();
+
+                self.cloud_sync_modal_data = Some((
+                    "云端同步成功".to_string(),
+                    true,
+                    vec![
+                        format!("📚 学习科目：共 {plan_count} 门计划已完成状态对齐"),
+                        format!("📱 飞书状态：{feishu_status}"),
+                        format!("🔥 今日任务：共 {} 项，已完成 {done_count} 项打卡", today_tasks.len()),
+                        "✨ 本地与云端数据已保持最新一致！".to_string(),
+                    ],
+                ));
+                self.cloud_sync_modal_open = true;
+            }
+            Err(e) => {
+                self.cloud_sync_modal_data = Some((
+                    "云端同步失败".to_string(),
+                    false,
+                    vec![
+                        format!("❌ 失败原因：{e}"),
+                        "💡 建议：请检查本地网络连接及云服务器运行状态。".to_string(),
+                    ],
+                ));
+                self.cloud_sync_modal_open = true;
+            }
+        }
+        self.cloud_syncing = false;
+        cx.notify();
+    }
+
+    /// 打开飞书绑定弹窗并生成 6 位验证码。
+    fn request_bind_code_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match request_cloud_bind_code(&mut self.config) {
+            Ok((code, expires)) => {
+                self.cloud_bind_code = Some(code);
+                self.cloud_bind_expires = Some(expires);
+                self.cloud_bind_modal_open = true;
+            }
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 检查飞书绑定状态。
+    fn check_bind_status_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match check_cloud_bind_status(&mut self.config) {
+            Ok(bound) => {
+                if bound {
+                    self.cloud_bind_modal_open = false;
+                    let name = self.config.feishu_user_name.as_deref().unwrap_or("飞书用户");
+                    window.push_notification(
+                        Notification::success(format!("🎉 飞书绑定成功！已连接到 {name}")),
+                        cx,
+                    );
+                    let _ = sync_with_cloud(&mut self.config);
+                } else {
+                    window.push_notification(
+                        Notification::info("尚未检测到绑定消息，请先在飞书聊天框向机器人发送 /bind <验证码>"),
+                        cx,
+                    );
+                }
+            }
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+            }
+        }
+        cx.notify();
+    }
+
     // -----------------------------------------------------------------------
     // 搜索历史
     // -----------------------------------------------------------------------
@@ -1246,6 +1349,42 @@ impl PlannerApp {
             .child(tab_btn(AppTab::PlanGenerator, "计划生成器", "icons/calendar-days.svg", None, cx))
             .child(tab_btn(AppTab::MyPlans, "我的计划库", "icons/table.svg", Some(active_plans_count), cx));
 
+        let feishu_btn = if self.config.feishu_bound {
+            let label = format!("📱 飞书: {}", self.config.feishu_user_name.as_deref().unwrap_or("已绑定"));
+            Button::new("feishu-status-btn")
+                .small()
+                .ghost()
+                .label(label)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.request_bind_code_action(window, cx);
+                }))
+        } else {
+            Button::new("feishu-bind-btn")
+                .small()
+                .primary()
+                .label("📱 绑定飞书")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.request_bind_code_action(window, cx);
+                }))
+        };
+
+        let sync_btn = Button::new("sync-btn")
+            .small()
+            .ghost()
+            .icon(Icon::empty().path("icons/refresh-cw.svg"))
+            .label(if self.cloud_syncing { "同步中…" } else { "云端同步" })
+            .disabled(self.cloud_syncing)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.sync_cloud_action(window, cx);
+            }));
+
+        let right_actions = h_flex()
+            .gap_2()
+            .items_center()
+            .child(feishu_btn)
+            .child(sync_btn)
+            .child(toggle);
+
         TitleBar::new()
             .child(
                 h_flex()
@@ -1265,7 +1404,7 @@ impl PlannerApp {
                     ),
             )
             .child(div().flex_1().flex().justify_center().child(tabs))
-            .child(toggle)
+            .child(right_actions)
     }
 
     /// Hero 区：超大标题 + 关键词高亮块（野兽风海报语言）。
@@ -2689,6 +2828,208 @@ impl PlannerApp {
             .child(entrance("anim-myplans-cards", 0.1, plan_cards))
             .into_any_element()
     }
+
+    /// 渲染飞书绑定弹窗（Neo-Brutalist 弹窗 + 醒目大字验证码）。
+    fn render_bind_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let code_str = self.cloud_bind_code.as_deref().unwrap_or("------");
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(hsla(0.0, 0.0, 0.0, 0.6))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(460.))
+                    .bg(theme.background)
+                    .border_2()
+                    .border_color(theme.foreground)
+                    .shadow_lg()
+                    .p_6()
+                    .gap_4()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(Icon::empty().path("icons/tv.svg").size_5().text_color(theme.primary))
+                                    .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child("📱 绑定飞书学习打卡机器人")),
+                            )
+                            .child(
+                                div()
+                                    .id("close-bind-modal")
+                                    .cursor_pointer()
+                                    .p_1()
+                                    .child(Icon::empty().path("icons/square.svg").size_4().text_color(theme.muted_foreground))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cloud_bind_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.muted_foreground)
+                            .child("在手机或电脑飞书上，打开您的「学习打卡助手」机器人聊天窗口，发送以下指令："),
+                    )
+                    .child(
+                        div()
+                            .py_3()
+                            .px_4()
+                            .bg(theme.primary.opacity(0.15))
+                            .border_2()
+                            .border_color(theme.primary)
+                            .items_center()
+                            .justify_center()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child("复制并在飞书发送："),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(22.))
+                                    .font_weight(FontWeight::BLACK)
+                                    .text_color(theme.foreground)
+                                    .child(format!("/bind {code_str}")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child("• 验证码有效期 10 分钟\n• 绑定后机器人每日 08:30 推送早报、21:30 督促打卡\n• 支持在飞书卡片上直接点击完成打卡"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .justify_end()
+                            .child(
+                                Button::new("cancel-bind")
+                                    .label("稍后再说")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cloud_bind_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-bind")
+                                    .primary()
+                                    .label("✅ 我已发送，完成绑定")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.check_bind_status_action(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 渲染云端同步结果弹窗。
+    fn render_sync_result_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let Some((title, is_success, lines)) = &self.cloud_sync_modal_data else {
+            return div().into_any_element();
+        };
+
+        let title_icon = if *is_success { "icons/square-check.svg" } else { "icons/refresh-cw.svg" };
+        let icon_color = if *is_success { theme.primary } else { theme.danger };
+
+        let content_items: Vec<gpui::AnyElement> = lines
+            .iter()
+            .map(|line| {
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .child(line.clone())
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(hsla(0.0, 0.0, 0.0, 0.6))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(460.))
+                    .bg(theme.background)
+                    .border_2()
+                    .border_color(theme.foreground)
+                    .shadow_lg()
+                    .p_6()
+                    .gap_4()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(Icon::empty().path(title_icon).size_5().text_color(icon_color))
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(title.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("close-sync-modal-x")
+                                    .cursor_pointer()
+                                    .p_1()
+                                    .child(Icon::empty().path("icons/square.svg").size_4().text_color(theme.muted_foreground))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cloud_sync_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .p_3()
+                            .bg(if *is_success { theme.primary.opacity(0.12) } else { theme.danger.opacity(0.12) })
+                            .border_1()
+                            .border_color(if *is_success { theme.primary.opacity(0.6) } else { theme.danger.opacity(0.6) })
+                            .children(content_items),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .child(
+                                Button::new("sync-modal-ok-btn")
+                                    .primary()
+                                    .label("好的")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cloud_sync_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for PlannerApp {
@@ -2702,16 +3043,22 @@ impl Render for PlannerApp {
             AppTab::MyPlans => self.render_my_plans_view(cx),
         };
 
+        let bind_modal = self.cloud_bind_modal_open.then(|| self.render_bind_modal(cx));
+        let sync_modal = self.cloud_sync_modal_open.then(|| self.render_sync_result_modal(cx));
+
         div()
             .size_full()
             .flex()
             .flex_col()
+            .relative()
             // 根节点不再铺底色：底色与装饰纹理由 render_backdrop 先画，
             // 内容层保持透明，卡片阴影/纹理才能透出层次。
             .text_color(theme.foreground)
             .child(render_backdrop(dark, theme.background))
             .child(self.render_title_bar(dark, cx))
             .child(div().flex_1().min_h_0().child(body))
+            .children(bind_modal)
+            .children(sync_modal)
     }
 }
 

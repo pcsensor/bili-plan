@@ -51,6 +51,9 @@ pub struct TaskItem {
     pub completed: bool,
     /// 打卡完成的时间戳（Unix 秒）
     pub completed_at: Option<i64>,
+    /// 状态最后更新时间戳（Unix 秒），用于多端冲突解决 (Last-Write-Wins)
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 /// 某一天的学习排期。
@@ -201,6 +204,7 @@ pub fn create_study_plan(
                 remainder: entry.remainder,
                 completed: false,
                 completed_at: None,
+                updated_at: 0,
             })
             .collect();
 
@@ -295,6 +299,7 @@ pub fn toggle_task_checkin(
                     if task.id == task_id {
                         task.completed = !task.completed;
                         task.completed_at = if task.completed { Some(now) } else { None };
+                        task.updated_at = now;
                         let new_state = task.completed;
                         
                         // 检查计划是否全部完成
@@ -326,6 +331,7 @@ pub fn checkin_entire_day(
                     for task in schedule.tasks.iter_mut() {
                         task.completed = true;
                         task.completed_at = Some(now);
+                        task.updated_at = now;
                     }
                 }
             }
