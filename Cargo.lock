@@ -528,6 +528,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "bili-planner"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -889,6 +890,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
 ]

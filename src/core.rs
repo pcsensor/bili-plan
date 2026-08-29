@@ -73,16 +73,20 @@ pub struct HistoryEntry {
     pub at: i64,
 }
 
+use crate::study::{self, PlanStatus, StudyPlan};
+
 /// 持久化到本机的应用配置（JSON 文件，家目录下）。
 ///
 /// 字段保持扁平：旧版本文件只有 `server_url`/`token` 两个键，
-/// `history` 缺省为空即可读入，避免升级丢凭证。
+/// `history` 和 `plans` 缺省为空即可读入，避免升级丢数据。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct AppConfig {
     pub server_url: String,
     pub token: String,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub plans: Vec<StudyPlan>,
 }
 
 /// 历史记录上限（超出后丢弃最旧的）。
@@ -338,11 +342,92 @@ pub fn load_config() -> Option<AppConfig> {
     Some(cfg)
 }
 
-/// 把应用配置写到本机（pretty JSON）。失败静默：不阻塞主流程。
+/// 把已生成的计划保存到打卡学习计划库。
+pub fn enroll_study_plan(
+    cfg: &mut AppConfig,
+    rd: &ReadyState,
+    source_url: &str,
+    source_type: &str,
+    start_date_str: &str,
+    skip_weekends: bool,
+) -> Result<StudyPlan, String> {
+    let plan_data = rd.plan.as_ref().ok_or_else(|| "尚未生成计划".to_string())?;
+    let plan_out = crate::plan::PlanOut {
+        plan: plan_data.plan.clone(),
+        capacities: plan_data.capacities.clone(),
+        total: plan_data.total,
+    };
+
+    let study_plan = study::create_study_plan(
+        &rd.season_title,
+        source_type,
+        source_url,
+        &plan_data.scope_desc,
+        &plan_out,
+        start_date_str,
+        skip_weekends,
+    );
+
+    // 插入或更新
+    cfg.plans.retain(|p| p.id != study_plan.id);
+    cfg.plans.insert(0, study_plan.clone());
+    save_config(cfg);
+    Ok(study_plan)
+}
+
+/// 删除指定计划。
+pub fn remove_study_plan(cfg: &mut AppConfig, plan_id: &str) {
+    cfg.plans.retain(|p| p.id != plan_id);
+    save_config(cfg);
+}
+
+/// 切换计划状态（在 Active 和 Paused 之间切换）。
+pub fn toggle_study_plan_status(cfg: &mut AppConfig, plan_id: &str) {
+    if let Some(plan) = cfg.plans.iter_mut().find(|p| p.id == plan_id) {
+        plan.status = match plan.status {
+            PlanStatus::Active => PlanStatus::Paused,
+            PlanStatus::Paused => PlanStatus::Active,
+            other => other,
+        };
+        save_config(cfg);
+    }
+}
+
+/// 切换某个任务的打卡状态并持久化。
+pub fn checkin_study_task(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<bool, String> {
+    let res = study::toggle_task_checkin(&mut cfg.plans, plan_id, task_id)?;
+    save_config(cfg);
+    Ok(res)
+}
+
+/// 一键顺延指定计划并持久化。
+pub fn push_forward_study_plan(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    target_start_date: &str,
+) -> Result<(), String> {
+    let plan = cfg
+        .plans
+        .iter_mut()
+        .find(|p| p.id == plan_id)
+        .ok_or_else(|| "未找到指定计划".to_string())?;
+    study::push_forward_plan(plan, target_start_date)?;
+    save_config(cfg);
+    Ok(())
+}
+
+/// 把应用配置写到本机（原子写入 pretty JSON）。失败静默：不阻塞主流程。
 pub fn save_config(cfg: &AppConfig) {
     let Some(path) = config_path() else { return };
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(&path, json);
+        let tmp_path = path.with_extension("tmp");
+        if std::fs::write(&tmp_path, json).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &path);
+        }
     }
 }
 

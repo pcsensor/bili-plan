@@ -10,6 +10,7 @@ pub mod jellyfin;
 pub mod model;
 pub mod parse;
 pub mod plan;
+pub mod study;
 pub mod theme;
 
 pub use error::{Error, ErrorKind, Result};
@@ -19,3 +20,8 @@ pub use jellyfin::{
 };
 pub use parse::{extract_bvid, extract_sid, parse_groups, Group, ParseResult};
 pub use plan::{build_plan, Mode, PlanEntry, PlanOut};
+pub use study::{
+    compute_plan_progress, compute_study_stats, create_study_plan, get_tasks_for_date,
+    push_forward_plan, today_date_str, toggle_task_checkin, DailySchedule, PlanStatus, StudyPlan,
+    StudyStats, TaskItem, TodayTaskView,
+};

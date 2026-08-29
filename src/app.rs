@@ -32,15 +32,85 @@ use gpui_component::{
     notification::Notification,
     resizable::{h_resizable, resizable_panel},
     table::{Column, Table, TableDelegate, TableState},
-    v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, Theme, ThemeMode, TitleBar,
+    v_flex, ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, Theme, ThemeMode, TitleBar,
     WindowExt,
 };
 
 use crate::core::{
-    clear_history, export_payload, generate_plan, load_config, parse_days, record_history,
-    remove_history, save_config, AppConfig, FetchSource, ReadyState, Selection, SourceMode,
+    checkin_study_task, clear_history, enroll_study_plan, export_payload, generate_plan,
+    load_config, parse_days, push_forward_study_plan, record_history, remove_history,
+    remove_study_plan, save_config, toggle_study_plan_status, AppConfig, FetchSource, ReadyState,
+    Selection, SourceMode,
 };
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
+use crate::study::{
+    compute_plan_progress, compute_study_stats, format_date, get_tasks_for_date,
+    parse_date_or_today, today_date_str, PlanStatus,
+};
+
+/// 顶部活动标签页。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppTab {
+    #[default]
+    TodayCheckIn,
+    PlanGenerator,
+    MyPlans,
+}
+
+/// 打开外部视频链接。
+fn open_video_link(source_type: &str, source_url: &str, vid_no: i64) {
+    let url = if source_type == "bilibili" {
+        let trimmed = source_url.trim();
+        if trimmed.starts_with("http") {
+            if trimmed.contains('?') {
+                format!("{trimmed}&p={vid_no}")
+            } else {
+                format!("{trimmed}?p={vid_no}")
+            }
+        } else if trimmed.starts_with("BV") {
+            format!("https://www.bilibili.com/video/{trimmed}?p={vid_no}")
+        } else {
+            format!("https://www.bilibili.com/video/{trimmed}")
+        }
+    } else {
+        source_url.to_string()
+    };
+
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/c", "start", &url]).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+}
+
+/// 格式化日期为带星期的展示标签。
+fn format_date_with_weekday(date_str: &str) -> String {
+    use chrono::Datelike;
+    let d = parse_date_or_today(date_str);
+    let weekday_str = match d.weekday() {
+        chrono::Weekday::Mon => "周一",
+        chrono::Weekday::Tue => "周二",
+        chrono::Weekday::Wed => "周三",
+        chrono::Weekday::Thu => "周四",
+        chrono::Weekday::Fri => "周五",
+        chrono::Weekday::Sat => "周六",
+        chrono::Weekday::Sun => "周日",
+    };
+    let is_today = date_str == today_date_str();
+    if is_today {
+        format!("{date_str} 今日（{weekday_str}）")
+    } else {
+        format!("{date_str}（{weekday_str}）")
+    }
+}
+
+/// 日期平移工具函数。
+fn shift_date_str(date_str: &str, delta_days: i64) -> String {
+    let d = parse_date_or_today(date_str);
+    let shifted = d + chrono::Duration::days(delta_days);
+    format_date(shifted)
+}
 
 /// 右侧计划面板宽度（生成计划后窗口向右扩展的空间）。
 const PLAN_PANEL_WIDTH: gpui::Pixels = px(640.);
@@ -284,6 +354,17 @@ pub enum Phase {
 }
 
 pub struct PlannerApp {
+    /// 当前活动标签页
+    active_tab: AppTab,
+    /// 今日打卡面板当前选中的日历日期 "YYYY-MM-DD"
+    selected_date: String,
+    /// 今日打卡面板按科目过滤 (None = 全部)
+    filter_plan_id: Option<String>,
+    /// 加入打卡时的起始日期输入框
+    start_date_input: Entity<InputState>,
+    /// 加入打卡时是否跳过周末
+    skip_weekends_toggle: bool,
+
     /// gpui-component 输入框为独立 `Entity<InputState>`，这里持有引用并
     /// 在渲染时绑定；取值通过 `read(cx).value()` 按需读取。
     link_input: Entity<InputState>,
@@ -297,7 +378,7 @@ pub struct PlannerApp {
     phase: Phase,
     last_error: Option<String>,
 
-    /// 本机配置（Jellyfin 凭证 + 搜索历史），获取成功/历史操作后写盘。
+    /// 本机配置（Jellyfin 凭证 + 搜索历史 + 学习打卡计划），操作后写盘。
     config: AppConfig,
 
     /// 计划表状态；生成/切换科目/修改天数时重建。
@@ -327,6 +408,11 @@ impl PlannerApp {
                 .masked(true)
         });
         let days_input = cx.new(|cx| InputState::new(window, cx).placeholder("如 30"));
+        let start_date_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(today_date_str(), window, cx);
+            state
+        });
 
         // 链接变化即清除上一次的错误横幅。
         cx.subscribe(&link_input, |this, _, event, cx| {
@@ -361,7 +447,18 @@ impl PlannerApp {
             });
         }
 
+        let initial_tab = if config.plans.is_empty() {
+            AppTab::PlanGenerator
+        } else {
+            AppTab::TodayCheckIn
+        };
+
         Self {
+            active_tab: initial_tab,
+            selected_date: today_date_str(),
+            filter_plan_id: None,
+            start_date_input,
+            skip_weekends_toggle: false,
             link_input,
             cookie_input,
             jf_server_input,
@@ -651,6 +748,179 @@ impl PlannerApp {
     }
 
     // -----------------------------------------------------------------------
+    // 进度打卡与多科目管理交互动作
+    // -----------------------------------------------------------------------
+
+    /// 把当前生成的计划加入打卡计划库。
+    fn enroll_current_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Phase::Ready(rd) = &self.phase else {
+            window.push_notification(Notification::warning("请先获取视频并生成观看计划。"), cx);
+            return;
+        };
+        let input = self.input_value(&self.link_input, cx);
+        let start_date = self.input_value(&self.start_date_input, cx);
+        let start_date = if start_date.trim().is_empty() {
+            today_date_str()
+        } else {
+            start_date.trim().to_string()
+        };
+        let source_tag = match self.source {
+            SourceMode::Bilibili => "bilibili",
+            SourceMode::Jellyfin => "jellyfin",
+        };
+
+        match enroll_study_plan(
+            &mut self.config,
+            rd,
+            &input,
+            source_tag,
+            &start_date,
+            self.skip_weekends_toggle,
+        ) {
+            Ok(plan) => {
+                window.push_notification(
+                    Notification::success(format!("已成功开启《{}》每日打卡计划！", plan.title)),
+                    cx,
+                );
+                self.active_tab = AppTab::TodayCheckIn;
+                self.selected_date = today_date_str();
+            }
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 切换单个学习任务的打卡状态。
+    fn toggle_task_checkin_action(
+        &mut self,
+        plan_id: &str,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match checkin_study_task(&mut self.config, plan_id, task_id) {
+            Ok(completed) => {
+                if completed {
+                    window.push_notification(
+                        Notification::success("已完成打卡！保持专注与节奏 🔥"),
+                        cx,
+                    );
+                } else {
+                    window.push_notification(Notification::info("已撤回该项打卡"), cx);
+                }
+            }
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 一键打卡指定计划在某一天的全部任务。
+    fn checkin_entire_day_action(
+        &mut self,
+        plan_id: &str,
+        date: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = crate::study::checkin_entire_day(&mut self.config.plans, plan_id, date) {
+            window.push_notification(Notification::error(e), cx);
+        } else {
+            save_config(&self.config);
+            window.push_notification(
+                Notification::success("🎉 今日该科目任务已全部完成打卡！"),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 针对所有进行中的计划执行一键落后顺延。
+    fn push_forward_all_behind_action(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let today = today_date_str();
+        let plan_ids: Vec<String> = self
+            .config
+            .plans
+            .iter()
+            .filter(|p| p.status == PlanStatus::Active)
+            .map(|p| p.id.clone())
+            .collect();
+
+        let mut count = 0;
+        for id in plan_ids {
+            if push_forward_study_plan(&mut self.config, &id, &today).is_ok() {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            window.push_notification(
+                Notification::success(format!("已成功为 {count} 门科目的未完成任务顺延至今日！")),
+                cx,
+            );
+        } else {
+            window.push_notification(Notification::info("暂无需要顺延的落后计划"), cx);
+        }
+        cx.notify();
+    }
+
+    /// 切换计划状态（暂停/继续）。
+    fn toggle_plan_status_action(&mut self, plan_id: &str, cx: &mut Context<Self>) {
+        toggle_study_plan_status(&mut self.config, plan_id);
+        cx.notify();
+    }
+
+    /// 删除指定计划。
+    fn delete_plan_action(&mut self, plan_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        remove_study_plan(&mut self.config, plan_id);
+        window.push_notification(Notification::info("已移除该学习计划"), cx);
+        cx.notify();
+    }
+
+    /// 顺延单门计划。
+    fn push_forward_single_plan_action(
+        &mut self,
+        plan_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let today = today_date_str();
+        match push_forward_study_plan(&mut self.config, plan_id, &today) {
+            Ok(()) => {
+                window.push_notification(Notification::success("已顺延本科目未完成任务至今日！"), cx);
+            }
+            Err(e) => {
+                window.push_notification(Notification::error(e), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 日期前翻一天。
+    fn prev_date_action(&mut self, cx: &mut Context<Self>) {
+        self.selected_date = shift_date_str(&self.selected_date, -1);
+        cx.notify();
+    }
+
+    /// 日期后翻一天。
+    fn next_date_action(&mut self, cx: &mut Context<Self>) {
+        self.selected_date = shift_date_str(&self.selected_date, 1);
+        cx.notify();
+    }
+
+    /// 快速回到今天。
+    fn reset_today_action(&mut self, cx: &mut Context<Self>) {
+        self.selected_date = today_date_str();
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
     // 搜索历史
     // -----------------------------------------------------------------------
 
@@ -891,6 +1161,91 @@ impl PlannerApp {
                 Theme::change(mode, Some(window), cx);
             });
 
+        let today_tasks = get_tasks_for_date(&self.config.plans, &today_date_str());
+        let uncompleted_today = today_tasks.iter().filter(|t| !t.task.completed).count();
+        let active_plans_count = self
+            .config
+            .plans
+            .iter()
+            .filter(|p| p.status == PlanStatus::Active)
+            .count();
+
+        let tab_btn = |tab: AppTab, label_text: &'static str, icon_path: &'static str, badge: Option<usize>, cx: &mut Context<Self>| {
+            let active = self.active_tab == tab;
+            let theme = cx.theme();
+            let dark = theme.is_dark();
+            let active_bg = if dark {
+                theme.primary
+            } else {
+                hsla(0.135, 1.0, 0.5, 1.0)
+            };
+            let text_color = if active {
+                hsla(0.0, 0.0, 0.04, 1.0)
+            } else {
+                theme.foreground
+            };
+
+            h_flex()
+                .id(("tab-btn", tab as usize))
+                .items_center()
+                .gap_1p5()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .rounded_none()
+                .border_2()
+                .border_color(if active { theme.foreground } else { theme.border.opacity(0.5) })
+                .bg(if active { active_bg } else { theme.background.opacity(0.3) })
+                .hover(move |s| {
+                    if !active {
+                        s.bg(theme.accent.opacity(0.15))
+                    } else {
+                        s
+                    }
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active_tab = tab;
+                    cx.notify();
+                }))
+                .child(
+                    Icon::empty()
+                        .path(icon_path.to_string())
+                        .size_3p5()
+                        .text_color(text_color),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_weight(if active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                        .text_color(text_color)
+                        .child(label_text),
+                )
+                .children(badge.and_then(|count| {
+                    if count > 0 {
+                        Some(
+                            div()
+                                .px_1p5()
+                                .py_0p5()
+                                .text_size(px(10.))
+                                .font_weight(FontWeight::BOLD)
+                                .rounded_full()
+                                .bg(if active { hsla(0.0, 0.0, 0.04, 0.8) } else { theme.danger })
+                                .text_color(hsla(0.0, 0.0, 1.0, 1.0))
+                                .child(count.to_string()),
+                        )
+                    } else {
+                        None
+                    }
+                }))
+        };
+
+        let tabs = h_flex()
+            .gap_2()
+            .items_center()
+            .child(tab_btn(AppTab::TodayCheckIn, "今日打卡", "icons/square-check.svg", (uncompleted_today > 0).then_some(uncompleted_today), cx))
+            .child(tab_btn(AppTab::PlanGenerator, "计划生成器", "icons/calendar-days.svg", None, cx))
+            .child(tab_btn(AppTab::MyPlans, "我的计划库", "icons/table.svg", Some(active_plans_count), cx));
+
         TitleBar::new()
             .child(
                 h_flex()
@@ -909,7 +1264,7 @@ impl PlannerApp {
                             .child("BILI-PLANNER"),
                     ),
             )
-            .child(div().flex_1())
+            .child(div().flex_1().flex().justify_center().child(tabs))
             .child(toggle)
     }
 
@@ -1339,6 +1694,53 @@ impl PlannerApp {
             .into_any_element(),
         );
 
+        // 05 · 加入打卡计划（生成计划后呈现）
+        if has_plan {
+            let skip_weekends = self.skip_weekends_toggle;
+            out.push(
+                entrance(
+                    "anim-enroll",
+                    0.42,
+                    bcard(cx)
+                        .child(section_band("05 · 开启进度打卡", "icons/square-check.svg", cx))
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .items_end()
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .flex_1()
+                                                .child(Self::field_label("起始学习日期", "YYYY-MM-DD，默认今天", cx))
+                                                .child(Input::new(&self.start_date_input)),
+                                        )
+                                        .child(
+                                            Button::new("toggle-weekend")
+                                                .label(if skip_weekends { "跳过周末：是 ✅" } else { "跳过周末：否 ⬜" })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.skip_weekends_toggle = !this.skip_weekends_toggle;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("enroll-btn")
+                                        .primary()
+                                        .icon(Icon::empty().path("icons/square-check.svg"))
+                                        .label("🚀 加入每日学习打卡并持久化")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.enroll_current_plan(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+            );
+        }
+
         out
     }
 
@@ -1520,15 +1922,11 @@ impl PlannerApp {
                     .child(b)
             }))
     }
-}
-
-impl Render for PlannerApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dark = cx.theme().is_dark();
+    /// 渲染计划生成器标签页（左侧配置 + 右侧计划表）。
+    fn render_plan_generator_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
 
-        // 左栏：hero + 表单 + （就绪后）信息/科目/操作，独立滚动。
-        // 卡片以不同 delay 错峰入场（见 entrance）。
+        // 左栏：hero + 表单 + （就绪后）信息/科目/操作/打卡，独立滚动。
         let mut left = v_flex()
             .id("content-scroll")
             .h_full()
@@ -1559,8 +1957,7 @@ impl Render for PlannerApp {
         }
 
         // 右栏：就绪后展开的计划面板，独立滚动、高度撑满窗口。
-        // 通过 h_resizable 提供可拖拽分割线，支持自由调整左右分区大小与自适应排版。
-        let body: gpui::AnyElement = if let Phase::Ready(rd) = &self.phase {
+        if let Phase::Ready(rd) = &self.phase {
             h_resizable("main-splitter")
                 .child(
                     resizable_panel()
@@ -1591,12 +1988,718 @@ impl Render for PlannerApp {
                                             0.15,
                                             self.render_plan_panel(rd, cx),
                                         )),
-                                ),
+                                    ),
                         ),
                 )
                 .into_any_element()
         } else {
             h_flex().flex_1().min_h_0().child(left).into_any_element()
+        }
+    }
+
+    /// 渲染今日打卡板块（多科目叠加看板与任务打卡）。
+    fn render_today_checkin_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let stats = compute_study_stats(&self.config.plans, &self.selected_date);
+
+        // 1. 统计概览卡片 (Neo-Brutalist 三列硬阴影卡片)
+        let stats_row = h_flex()
+            .w_full()
+            .gap_4()
+            .child(
+                bcard(cx)
+                    .flex_1()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::empty().path("icons/square-check.svg").size_4().text_color(theme.primary))
+                            .child(Label::new("今日任务").text_size(px(13.)).font_weight(FontWeight::BOLD)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(26.))
+                                    .font_weight(FontWeight::BLACK)
+                                    .child(format!("{}/{}", stats.today_completed_tasks, stats.today_total_tasks)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(if stats.today_total_tasks > 0 {
+                                        format!("完成率 {:.0}%", (stats.today_completed_tasks as f64 / stats.today_total_tasks as f64) * 100.0)
+                                    } else {
+                                        "无安排".to_string()
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                bcard(cx)
+                    .flex_1()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::empty().path("icons/clock.svg").size_4().text_color(theme.primary))
+                            .child(Label::new("今日学习时长").text_size(px(13.)).font_weight(FontWeight::BOLD)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(22.))
+                                    .font_weight(FontWeight::BLACK)
+                                    .child(fmt_seconds(stats.today_total_duration as f64, true)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("已学 {}", fmt_seconds(stats.today_completed_duration as f64, true))),
+                            ),
+                    ),
+            )
+            .child(
+                bcard(cx)
+                    .flex_1()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::empty().path("icons/calendar-days.svg").size_4().text_color(theme.primary))
+                            .child(Label::new("连续学习 Streak").text_size(px(13.)).font_weight(FontWeight::BOLD)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(26.))
+                                    .font_weight(FontWeight::BLACK)
+                                    .child(format!("🔥 {} 天", stats.current_streak)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("累计打卡 {} 天", stats.total_days_checked_in)),
+                            ),
+                    ),
+            );
+
+        // 2. 日期选择导航条
+        let is_today = self.selected_date == today_date_str();
+        let date_nav = bcard(cx)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                Button::new("prev-date")
+                                    .label("◀ 前一天")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.prev_date_action(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(format_date_with_weekday(&self.selected_date)),
+                            )
+                            .child(
+                                Button::new("next-date")
+                                    .label("后一天 ▶")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.next_date_action(cx);
+                                    })),
+                            )
+                            .children((!is_today).then(|| {
+                                Button::new("back-today")
+                                    .primary()
+                                    .label("回到今天")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.reset_today_action(cx);
+                                    }))
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("push-forward-all")
+                                    .icon(Icon::empty().path("icons/refresh-cw.svg"))
+                                    .label("一键顺延落后计划")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.push_forward_all_behind_action(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("add-plan-quick")
+                                    .primary()
+                                    .label("➕ 添加新科目")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.active_tab = AppTab::PlanGenerator;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+
+        // 3. 多科目任务聚合
+        let all_tasks = get_tasks_for_date(&self.config.plans, &self.selected_date);
+
+        let filtered_tasks: Vec<_> = if let Some(fid) = &self.filter_plan_id {
+            all_tasks.into_iter().filter(|t| &t.plan_id == fid).collect()
+        } else {
+            all_tasks
+        };
+
+        // 科目过滤标签
+        let active_plans: Vec<_> = self.config.plans.iter().filter(|p| p.status == PlanStatus::Active).collect();
+        let filter_bar = if active_plans.len() > 1 {
+            let mut buttons = Vec::new();
+            let is_all = self.filter_plan_id.is_none();
+            buttons.push(
+                Button::new("filter-all")
+                    .label("全部科目")
+                    .selected(is_all)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.filter_plan_id = None;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            for (idx, p) in active_plans.iter().enumerate() {
+                let pid = p.id.clone();
+                let is_sel = self.filter_plan_id.as_deref() == Some(&pid);
+                let title = p.title.clone();
+                buttons.push(
+                    Button::new(("filter-p", idx))
+                        .label(title)
+                        .selected(is_sel)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.filter_plan_id = Some(pid.clone());
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            Some(h_flex().gap_2().items_center().children(buttons))
+        } else {
+            None
+        };
+
+        // 任务列表分组渲染
+        let task_content: gpui::Div = if self.config.plans.is_empty() {
+            bcard(cx)
+                .items_center()
+                .py_10()
+                .gap_3()
+                .child(
+                    Icon::empty()
+                        .path("icons/calendar-days.svg")
+                        .size_10()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("暂无进行中的学习计划"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme.muted_foreground)
+                        .child("请前往「计划生成器」输入 B 站或 Jellyfin 链接创建您的第一个学习打卡计划！"),
+                )
+                .child(
+                    Button::new("go-generator")
+                        .primary()
+                        .label("🚀 前往计划生成器")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.active_tab = AppTab::PlanGenerator;
+                            cx.notify();
+                        })),
+                )
+        } else if filtered_tasks.is_empty() {
+            bcard(cx)
+                .items_center()
+                .py_10()
+                .gap_3()
+                .child(
+                    Icon::empty()
+                        .path("icons/square-check.svg")
+                        .size_10()
+                        .text_color(theme.primary),
+                )
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("🎉 今日无学习任务安排或为休息日！"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme.muted_foreground)
+                        .child("适当休息劳逸结合，保持最佳学习状态。"),
+                )
+        } else {
+            // 按科目分组展示
+            let mut plan_map: std::collections::BTreeMap<String, Vec<crate::study::TodayTaskView>> = std::collections::BTreeMap::new();
+            for item in filtered_tasks {
+                plan_map.entry(item.plan_id.clone()).or_default().push(item);
+            }
+
+            let mut group_cards = Vec::new();
+            for (grp_idx, (plan_id, items)) in plan_map.into_iter().enumerate() {
+                let plan_title = items[0].plan_title.clone();
+                let day_display = items[0].day_display.clone();
+                let source_type = items[0].source_type.clone();
+                let source_url = items[0].source_url.clone();
+                let total_in_group = items.len();
+                let done_in_group = items.iter().filter(|t| t.task.completed).count();
+                let is_all_group_done = total_in_group > 0 && done_in_group == total_in_group;
+
+                let pid_clone = plan_id.clone();
+                let sel_date_clone = self.selected_date.clone();
+
+                let mut task_rows = Vec::new();
+                for (item_idx, view) in items.into_iter().enumerate() {
+                    let task = view.task;
+                    let tid = task.id.clone();
+                    let st = source_type.clone();
+                    let su = source_url.clone();
+                    let vno = task.vid_no;
+                    let is_done = task.completed;
+
+                    let (chk_icon, chk_color) = if is_done {
+                        ("icons/square-check.svg", theme.primary)
+                    } else {
+                        ("icons/square.svg", theme.muted_foreground)
+                    };
+
+                    let btn_play_id = ("play-task", grp_idx * 1000 + item_idx);
+                    let btn_chk_id = ("check-btn", grp_idx * 1000 + item_idx);
+                    let pid_click1 = plan_id.clone();
+                    let pid_click2 = plan_id.clone();
+                    let tid_click1 = tid.clone();
+                    let tid_click2 = tid.clone();
+
+                    task_rows.push(
+                        h_flex()
+                            .id(("task-row", grp_idx * 1000 + item_idx))
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2p5()
+                            .border_1()
+                            .border_color(if is_done { theme.primary.opacity(0.4) } else { theme.border.opacity(0.6) })
+                            .bg(if is_done { theme.primary.opacity(0.08) } else { theme.background.opacity(0.25) })
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .id(("chk-icon", grp_idx * 1000 + item_idx))
+                                            .cursor_pointer()
+                                            .p_1()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.toggle_task_checkin_action(&pid_click1, &tid_click1, window, cx);
+                                            }))
+                                            .child(
+                                                Icon::empty()
+                                                    .path(chk_icon)
+                                                    .size_5()
+                                                    .text_color(chk_color),
+                                            ),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_0p5()
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.5))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(if is_done { theme.muted_foreground } else { theme.foreground })
+                                                            .child(format!("P{}: {}", task.vid_no, task.title)),
+                                                    )
+                                                    .children(task.from_prev.then(|| {
+                                                        div()
+                                                            .text_size(px(10.5))
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .bg(theme.accent.opacity(0.2))
+                                                            .child("接上一日")
+                                                    }))
+                                                    .children((task.remainder > 0).then(|| {
+                                                        div()
+                                                            .text_size(px(10.5))
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .bg(theme.primary.opacity(0.2))
+                                                            .child("顺延至次日")
+                                                    })),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_3()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.5))
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(format!("⏱️ 本日任务时长：{}", fmt_seconds(task.portion as f64, true))),
+                                                    )
+                                                    .children((task.remainder > 0).then(|| {
+                                                        div()
+                                                            .text_size(px(11.5))
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(format!("剩余顺延：{}", fmt_seconds(task.remainder as f64, true)))
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new(btn_play_id)
+                                            .icon(Icon::empty().path("icons/play.svg"))
+                                            .label("直达播放")
+                                            .small()
+                                            .on_click(move |_, _, _| {
+                                                open_video_link(&st, &su, vno);
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new(btn_chk_id)
+                                            .small()
+                                            .label(if is_done { "已打卡" } else { "打卡" })
+                                            .primary()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.toggle_task_checkin_action(&pid_click2, &tid_click2, window, cx);
+                                            })),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+
+                group_cards.push(
+                    bcard(cx)
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::empty()
+                                                .path(if source_type == "jellyfin" { "icons/film.svg" } else { "icons/tv.svg" })
+                                                .size_4()
+                                                .text_color(theme.primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(15.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child(format!("《{plan_title}》 · {day_display}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .px_2()
+                                                .py_0p5()
+                                                .bg(if is_all_group_done { theme.primary } else { theme.muted })
+                                                .text_color(if is_all_group_done { hsla(0.0, 0.0, 0.04, 1.0) } else { theme.muted_foreground })
+                                                .child(format!("完成 {done_in_group}/{total_in_group}")),
+                                        ),
+                                )
+                                .children((!is_all_group_done).then(|| {
+                                    Button::new(("check-all-grp", grp_idx))
+                                        .small()
+                                        .label("一键打卡本科目今日")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.checkin_entire_day_action(&pid_clone, &sel_date_clone, window, cx);
+                                        }))
+                                })),
+                        )
+                        .child(v_flex().w_full().gap_2().children(task_rows))
+                        .into_any_element(),
+                );
+            }
+
+            v_flex().w_full().gap_4().children(group_cards)
+        };
+
+        v_flex()
+            .id("today-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .px_8()
+            .py_6()
+            .gap_5()
+            .child(entrance("anim-stats", 0.0, stats_row))
+            .child(entrance("anim-nav", 0.08, date_nav))
+            .children(filter_bar.map(|f| entrance("anim-filter", 0.14, f).into_any_element()))
+            .child(entrance("anim-tasks", 0.18, task_content))
+            .into_any_element()
+    }
+
+    /// 渲染我的计划库标签页。
+    fn render_my_plans_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let total_plans = self.config.plans.len();
+        let active_plans = self
+            .config
+            .plans
+            .iter()
+            .filter(|p| p.status == PlanStatus::Active)
+            .count();
+
+        let header = bcard(cx).child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(20.))
+                                .font_weight(FontWeight::BLACK)
+                                .child("📚 我的学习计划库"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_foreground)
+                                .child(format!("共 {total_plans} 门科目 · 进行中 {active_plans} 门")),
+                        ),
+                )
+                .child(
+                    Button::new("new-plan-btn")
+                        .primary()
+                        .label("➕ 设立新计划")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.active_tab = AppTab::PlanGenerator;
+                            cx.notify();
+                        })),
+                ),
+        );
+
+        let plan_cards: gpui::Div = if self.config.plans.is_empty() {
+            bcard(cx)
+                .items_center()
+                .py_12()
+                .gap_3()
+                .child(
+                    Icon::empty()
+                        .path("icons/table.svg")
+                        .size_10()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("暂无任何学习计划"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme.muted_foreground)
+                        .child("点击下方按钮立即创建您的第一个多科目学习打卡计划。"),
+                )
+                .child(
+                    Button::new("empty-create")
+                        .primary()
+                        .label("🚀 前往计划生成器")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.active_tab = AppTab::PlanGenerator;
+                            cx.notify();
+                        })),
+                )
+        } else {
+            let mut cards = Vec::new();
+            for (p_idx, plan) in self.config.plans.iter().enumerate() {
+                let (done_cnt, total_cnt, done_dur, total_dur, ratio) = compute_plan_progress(plan);
+                let pid = plan.id.clone();
+                let pid_del = plan.id.clone();
+                let pid_push = plan.id.clone();
+
+                let status_badge_bg = match plan.status {
+                    PlanStatus::Active => theme.primary,
+                    PlanStatus::Paused => theme.muted,
+                    PlanStatus::Completed => theme.success,
+                    PlanStatus::Archived => theme.muted,
+                };
+                let status_badge_text = match plan.status {
+                    PlanStatus::Active => hsla(0.0, 0.0, 0.04, 1.0),
+                    PlanStatus::Paused => theme.muted_foreground,
+                    PlanStatus::Completed => hsla(0.0, 0.0, 1.0, 1.0),
+                    PlanStatus::Archived => theme.muted_foreground,
+                };
+
+                let card = bcard(cx)
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(format!("《{}》", plan.title)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .bg(theme.muted)
+                                            .child(plan.source_type.to_uppercase()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .px_2()
+                                            .py_0p5()
+                                            .bg(status_badge_bg)
+                                            .text_color(status_badge_text)
+                                            .child(plan.status.label()),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new(("pause-plan", p_idx))
+                                            .small()
+                                            .label(if plan.status == PlanStatus::Paused { "▶️ 继续" } else { "⏸️ 暂停" })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_plan_status_action(&pid, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("push-single", p_idx))
+                                            .small()
+                                            .label("🔄 顺延至今日")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.push_forward_single_plan_action(&pid_push, window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("del-plan", p_idx))
+                                            .small()
+                                            .label("🗑️ 删除")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.delete_plan_action(&pid_del, window, cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1p5()
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("范围：{} · 排期：{} 至 {}（{} 天 · {}）", plan.scope_desc, plan.start_date, plan.end_date, plan.planned_days, if plan.skip_weekends { "跳过周末" } else { "连续每日" })),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(format!("进度：{done_cnt}/{total_cnt} 视频 · {} / {} ({:.1}%)", fmt_seconds(done_dur as f64, true), fmt_seconds(total_dur as f64, true), ratio * 100.0)),
+                                    ),
+                            )
+                            // 野兽风进度条：墨色边框 + 明黄填充
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(12.))
+                                    .border_2()
+                                    .border_color(theme.foreground)
+                                    .bg(theme.background)
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(gpui::DefiniteLength::Fraction(ratio as f32))
+                                            .bg(theme.primary),
+                                    ),
+                            ),
+                    );
+
+                cards.push(card.into_any_element());
+            }
+
+            v_flex().w_full().gap_4().children(cards)
+        };
+
+        v_flex()
+            .id("myplans-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .px_8()
+            .py_6()
+            .gap_5()
+            .child(entrance("anim-myplans-head", 0.0, header))
+            .child(entrance("anim-myplans-cards", 0.1, plan_cards))
+            .into_any_element()
+    }
+}
+
+impl Render for PlannerApp {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dark = cx.theme().is_dark();
+        let theme = cx.theme().clone();
+
+        let body: gpui::AnyElement = match self.active_tab {
+            AppTab::TodayCheckIn => self.render_today_checkin_view(cx),
+            AppTab::PlanGenerator => self.render_plan_generator_view(cx),
+            AppTab::MyPlans => self.render_my_plans_view(cx),
         };
 
         div()
