@@ -68,6 +68,8 @@ impl Store {
             device_token: new_token.clone(),
             feishu_open_id: None,
             feishu_user_name: None,
+            telegram_chat_id: None,
+            telegram_user_name: None,
             bind_code: None,
             bind_code_expires_at: 0,
             created_at: now,
@@ -135,11 +137,61 @@ impl Store {
         }
     }
 
+    /// 使用绑定码绑定 Telegram 用户。
+    pub async fn bind_telegram_by_code(
+        &self,
+        code: &str,
+        chat_id: i64,
+        user_name: Option<&str>,
+    ) -> Result<DeviceUser, &'static str> {
+        let mut guard = self.inner.write().await;
+        let now = Utc::now().timestamp();
+        let mut target_token = None;
+
+        for (token, user) in guard.devices.iter() {
+            if let Some(c) = &user.bind_code {
+                if c == code && user.bind_code_expires_at > now {
+                    target_token = Some(token.clone());
+                    break;
+                }
+            }
+        }
+
+        let token = match target_token {
+            Some(t) => t,
+            None => return Err("验证码无效或已过期，请在电脑端重新生成"),
+        };
+
+        if let Some(user) = guard.devices.get_mut(&token) {
+            user.telegram_chat_id = Some(chat_id);
+            user.telegram_user_name = user_name.map(|s| s.to_string());
+            user.bind_code = None;
+            let result = user.clone();
+            drop(guard);
+            self.persist().await;
+            Ok(result)
+        } else {
+            Err("设备不存在")
+        }
+    }
+
     /// 查找飞书 OpenID 对应的所有计划。
     pub async fn get_plans_by_open_id(&self, open_id: &str) -> Option<(DeviceUser, Vec<StudyPlan>)> {
         let guard = self.inner.read().await;
         for (token, user) in guard.devices.iter() {
             if user.feishu_open_id.as_deref() == Some(open_id) {
+                let plans = guard.plans.get(token).cloned().unwrap_or_default();
+                return Some((user.clone(), plans));
+            }
+        }
+        None
+    }
+
+    /// 查找 Telegram Chat ID 对应的所有计划。
+    pub async fn get_plans_by_telegram_chat_id(&self, chat_id: i64) -> Option<(DeviceUser, Vec<StudyPlan>)> {
+        let guard = self.inner.read().await;
+        for (token, user) in guard.devices.iter() {
+            if user.telegram_chat_id == Some(chat_id) {
                 let plans = guard.plans.get(token).cloned().unwrap_or_default();
                 return Some((user.clone(), plans));
             }
@@ -160,25 +212,42 @@ impl Store {
         list
     }
 
+    /// 获取所有已绑定 Telegram 的用户及计划。
+    pub async fn get_all_telegram_bound_users(&self) -> Vec<(DeviceUser, Vec<StudyPlan>)> {
+        let guard = self.inner.read().await;
+        let mut list = Vec::new();
+        for (token, user) in guard.devices.iter() {
+            if user.telegram_chat_id.is_some() {
+                let plans = guard.plans.get(token).cloned().unwrap_or_default();
+                list.push((user.clone(), plans));
+            }
+        }
+        list
+    }
+
     /// 双向增量同步合并计划。
     pub async fn sync_plans(
         &self,
         device_token: &str,
         incoming_plans: Vec<StudyPlan>,
-    ) -> (Vec<StudyPlan>, bool, Option<String>) {
+    ) -> (Vec<StudyPlan>, bool, Option<String>, bool, Option<String>) {
         let mut guard = self.inner.write().await;
         let user = guard.devices.entry(device_token.to_string()).or_insert_with(|| {
             DeviceUser {
                 device_token: device_token.to_string(),
                 feishu_open_id: None,
                 feishu_user_name: None,
+                telegram_chat_id: None,
+                telegram_user_name: None,
                 bind_code: None,
                 bind_code_expires_at: 0,
                 created_at: Local::now().to_rfc3339(),
             }
         });
-        let bound = user.feishu_open_id.is_some();
-        let user_name = user.feishu_user_name.clone();
+        let feishu_bound = user.feishu_open_id.is_some();
+        let feishu_user_name = user.feishu_user_name.clone();
+        let telegram_bound = user.telegram_chat_id.is_some();
+        let telegram_user_name = user.telegram_user_name.clone();
 
         let remote_plans: Vec<StudyPlan> = guard.plans.remove(device_token).unwrap_or_default();
         let mut remote_map: HashMap<String, StudyPlan> = HashMap::new();
@@ -188,7 +257,7 @@ impl Store {
 
         // 合并策略：
         // 1. 客户端为主控端（计划增删、排期与顺延以客户端结构为准）；
-        // 2. 服务端（如飞书打卡）若有更新的打卡记录 (ex_t.updated_at > in_t.updated_at)，则合并保留；
+        // 2. 服务端（如飞书/TG 打卡）若有更新的打卡记录 (ex_t.updated_at > in_t.updated_at)，则合并保留；
         // 3. 已从客户端删除的计划不再保留。
         let mut final_plans: Vec<StudyPlan> = Vec::new();
 
@@ -224,7 +293,7 @@ impl Store {
         drop(guard);
         self.persist().await;
 
-        (final_plans, bound, user_name)
+        (final_plans, feishu_bound, feishu_user_name, telegram_bound, telegram_user_name)
     }
 
     /// 切换指定任务的打卡状态（由飞书卡片操作触发）。
@@ -246,6 +315,55 @@ impl Store {
         let token = match token_found {
             Some(t) => t,
             None => return Err("未找到绑定设备"),
+        };
+
+        if let Some(plans) = guard.plans.get_mut(&token) {
+            let now = Utc::now().timestamp();
+            for plan in plans.iter_mut() {
+                if plan.id == plan_id {
+                    for sch in plan.schedules.iter_mut() {
+                        for task in sch.tasks.iter_mut() {
+                            if task.id == task_id {
+                                task.completed = !task.completed;
+                                task.completed_at = if task.completed {
+                                    Some(now)
+                                } else {
+                                    None
+                                };
+                                task.updated_at = now;
+                                let is_completed = task.completed;
+                                drop(guard);
+                                self.persist().await;
+                                return Ok(is_completed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Err("未找到对应计划或任务")
+    }
+
+    /// 切换指定任务的打卡状态（由 Telegram 按钮操作触发）。
+    pub async fn toggle_task_by_telegram_chat_id(
+        &self,
+        chat_id: i64,
+        plan_id: &str,
+        task_id: &str,
+    ) -> Result<bool, &'static str> {
+        let mut guard = self.inner.write().await;
+        let mut token_found = None;
+        for (token, user) in guard.devices.iter() {
+            if user.telegram_chat_id == Some(chat_id) {
+                token_found = Some(token.clone());
+                break;
+            }
+        }
+
+        let token = match token_found {
+            Some(t) => t,
+            None => return Err("未找到绑定设备，请先发送 /bind 绑定"),
         };
 
         if let Some(plans) = guard.plans.get_mut(&token) {
@@ -352,15 +470,41 @@ mod tests {
 
         // 1. 初始同步：08-25, 08-26
         let initial_plan = make_test_plan("p1", &["2026-08-25", "2026-08-26"]);
-        let (plans1, _, _) = store.sync_plans(token, vec![initial_plan]).await;
+        let (plans1, _, _, _, _) = store.sync_plans(token, vec![initial_plan]).await;
         assert_eq!(plans1[0].schedules[0].date, "2026-08-25");
 
         // 2. 客户端在本地将未完成任务顺延至 08-30, 08-31，并再次同步
         let postponed_plan = make_test_plan("p1", &["2026-08-30", "2026-08-31"]);
-        let (plans2, _, _) = store.sync_plans(token, vec![postponed_plan]).await;
+        let (plans2, _, _, _, _) = store.sync_plans(token, vec![postponed_plan]).await;
 
         // 服务端应当采纳顺延后的排期结构，而不是固守 08-25
         assert_eq!(plans2[0].schedules[0].date, "2026-08-30");
         assert_eq!(plans2[0].schedules[1].date, "2026-08-31");
+    }
+
+    #[tokio::test]
+    async fn test_telegram_bind_and_toggle() {
+        let temp_dir = std::env::temp_dir().join(format!("store_test_tg_{}", rand::random::<u64>()));
+        let store = Store::new(&temp_dir);
+
+        let user_dev = store.get_or_create_device(None).await;
+        let token = user_dev.device_token;
+        let code = store.generate_bind_code(&token).await.unwrap();
+
+        let plan = make_test_plan("p1", &["2026-08-30"]);
+        store.sync_plans(&token, vec![plan]).await;
+
+        // 使用 Telegram 绑定
+        let user = store.bind_telegram_by_code(&code, 987654321, Some("tg_user")).await.unwrap();
+        assert_eq!(user.telegram_chat_id, Some(987654321));
+        assert_eq!(user.telegram_user_name.as_deref(), Some("tg_user"));
+
+        // 通过 Telegram 进行任务打卡
+        let is_done = store.toggle_task_by_telegram_chat_id(987654321, "p1", "p1_0_0").await.unwrap();
+        assert!(is_done);
+
+        // 查询计划验证已打卡
+        let (_, plans) = store.get_plans_by_telegram_chat_id(987654321).await.unwrap();
+        assert!(plans[0].schedules[0].tasks[0].completed);
     }
 }

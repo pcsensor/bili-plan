@@ -38,14 +38,16 @@ use gpui_component::{
 
 use crate::core::{
     check_cloud_bind_status, checkin_study_task, clear_history, enroll_study_plan, export_payload,
-    generate_plan, load_config, parse_days, push_forward_study_plan, record_history, remove_history,
-    remove_study_plan, request_cloud_bind_code, save_config, sync_with_cloud,
-    toggle_study_plan_status, AppConfig, FetchSource, ReadyState, Selection, SourceMode,
+    generate_plan, load_config, parse_days, push_forward_study_plan, record_history,
+    remove_history, remove_study_plan, request_cloud_bind_code, save_config, set_daily_note,
+    sync_with_cloud, toggle_study_plan_status, AppConfig, FetchSource, ReadyState, Selection,
+    SourceMode,
 };
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
-    compute_plan_progress, compute_study_stats, format_date, get_tasks_for_date,
-    parse_date_or_today, today_date_str, PlanStatus, StudyPlan,
+    compute_month_study_stats, compute_plan_progress, compute_study_stats, format_date,
+    generate_month_calendar_matrix, get_tasks_for_date, parse_date_or_today, today_date_str,
+    PlanStatus, StudyPlan,
 };
 
 /// 顶部活动标签页。
@@ -53,6 +55,7 @@ use crate::study::{
 pub enum AppTab {
     #[default]
     TodayCheckIn,
+    Calendar,
     PlanGenerator,
     MyPlans,
 }
@@ -398,6 +401,14 @@ pub struct PlannerApp {
     /// 首次生成计划时已向右扩展过窗口，避免反复 resize 覆盖用户手动调整。
     window_expanded: bool,
 
+    /// 学习日历面板当前查看的年、月
+    calendar_year: i32,
+    calendar_month: u32,
+    /// 学习日历面板选中的具体日期 "YYYY-MM-DD"
+    calendar_selected_date: String,
+    /// 学习日历面板中对选中日期的备注输入框
+    calendar_note_input: Entity<InputState>,
+
     /// 飞书云同步相关状态
     cloud_bind_modal_open: bool,
     cloud_bind_code: Option<String>,
@@ -434,6 +445,21 @@ impl PlannerApp {
             state
         });
 
+        // 启动时加载本机配置：Jellyfin 凭证预热输入框，历史记录供列表展示。
+        let config = load_config().unwrap_or_default();
+
+        use chrono::Datelike;
+        let now_local = chrono::Local::now();
+        let calendar_year = now_local.year();
+        let calendar_month = now_local.month();
+        let calendar_selected_date = today_date_str();
+        let initial_note = config.daily_notes.get(&calendar_selected_date).cloned().unwrap_or_default();
+        let calendar_note_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(initial_note, window, cx);
+            state.placeholder("写下当天的学习总结、心得体会或重要备忘...")
+        });
+
         // 链接变化即清除上一次的错误横幅。
         cx.subscribe(&link_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) && this.last_error.is_some() {
@@ -454,8 +480,6 @@ impl PlannerApp {
         })
         .detach();
 
-        // 启动时加载本机配置：Jellyfin 凭证预热输入框，历史记录供列表展示。
-        let config = load_config().unwrap_or_default();
         if !config.server_url.trim().is_empty() {
             jf_server_input.update(cx, |state, cx| {
                 state.set_value(config.server_url.clone(), window, cx)
@@ -484,6 +508,10 @@ impl PlannerApp {
             jf_server_input,
             jf_token_input,
             days_input,
+            calendar_year,
+            calendar_month,
+            calendar_selected_date,
+            calendar_note_input,
             source: SourceMode::Bilibili,
             mode: Mode::Split,
             phase: Phase::Input,
@@ -951,6 +979,74 @@ impl PlannerApp {
     /// 快速回到今天。
     fn reset_today_action(&mut self, cx: &mut Context<Self>) {
         self.selected_date = today_date_str();
+        cx.notify();
+    }
+
+    /// 学习日历：前翻一个月。
+    fn prev_calendar_month_action(&mut self, cx: &mut Context<Self>) {
+        if self.calendar_month == 1 {
+            self.calendar_year -= 1;
+            self.calendar_month = 12;
+        } else {
+            self.calendar_month -= 1;
+        }
+        cx.notify();
+    }
+
+    /// 学习日历：后翻一个月。
+    fn next_calendar_month_action(&mut self, cx: &mut Context<Self>) {
+        if self.calendar_month == 12 {
+            self.calendar_year += 1;
+            self.calendar_month = 1;
+        } else {
+            self.calendar_month += 1;
+        }
+        cx.notify();
+    }
+
+    /// 学习日历：快速回到本月与今日。
+    fn reset_calendar_month_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use chrono::Datelike;
+        let now = chrono::Local::now();
+        self.calendar_year = now.year();
+        self.calendar_month = now.month();
+        let today = today_date_str();
+        self.select_calendar_date_action(&today, window, cx);
+    }
+
+    /// 学习日历：选中特定日期（更新右侧详细信息及备注输入框）。
+    fn select_calendar_date_action(&mut self, date_str: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.calendar_selected_date = date_str.to_string();
+        let current_note = self.config.daily_notes.get(date_str).cloned().unwrap_or_default();
+        self.calendar_note_input.update(cx, |state, cx| {
+            state.set_value(current_note, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// 学习日历：保存当日备注。
+    fn save_calendar_note_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let note = self.input_value(&self.calendar_note_input, cx);
+        let date = self.calendar_selected_date.clone();
+        set_daily_note(&mut self.config, &date, &note);
+        window.push_notification(Notification::success(format!("已更新 {date} 的学习备注")), cx);
+        if self.config.auto_sync {
+            self.trigger_auto_sync(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 学习日历：清空当日备注。
+    fn clear_calendar_note_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let date = self.calendar_selected_date.clone();
+        set_daily_note(&mut self.config, &date, "");
+        self.calendar_note_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        window.push_notification(Notification::info(format!("已清除 {date} 的备注")), cx);
+        if self.config.auto_sync {
+            self.trigger_auto_sync(window, cx);
+        }
         cx.notify();
     }
 
@@ -1492,7 +1588,8 @@ impl PlannerApp {
             .gap_2()
             .items_center()
             .child(tab_btn(AppTab::TodayCheckIn, "今日打卡", "icons/square-check.svg", (uncompleted_today > 0).then_some(uncompleted_today), cx))
-            .child(tab_btn(AppTab::PlanGenerator, "计划生成器", "icons/calendar-days.svg", None, cx))
+            .child(tab_btn(AppTab::Calendar, "学习日历", "icons/calendar-days.svg", None, cx))
+            .child(tab_btn(AppTab::PlanGenerator, "计划生成器", "icons/film.svg", None, cx))
             .child(tab_btn(AppTab::MyPlans, "我的计划库", "icons/table.svg", Some(active_plans_count), cx));
 
         let auto_sync_btn = Button::new("auto-sync-btn")
@@ -1513,9 +1610,16 @@ impl PlannerApp {
                 cx.notify();
             }));
 
-        let feishu_btn = if self.config.feishu_bound {
-            let label = format!("📱 飞书: {}", self.config.feishu_user_name.as_deref().unwrap_or("已绑定"));
-            Button::new("feishu-status-btn")
+        let bind_btn = if self.config.feishu_bound || self.config.telegram_bound {
+            let mut labels = Vec::new();
+            if self.config.feishu_bound {
+                labels.push(format!("飞书:{}", self.config.feishu_user_name.as_deref().unwrap_or("已连")));
+            }
+            if self.config.telegram_bound {
+                labels.push(format!("TG:{}", self.config.telegram_user_name.as_deref().unwrap_or("已连")));
+            }
+            let label = format!("📱 {}", labels.join(" | "));
+            Button::new("bot-status-btn")
                 .small()
                 .ghost()
                 .label(label)
@@ -1523,10 +1627,10 @@ impl PlannerApp {
                     this.request_bind_code_action(window, cx);
                 }))
         } else {
-            Button::new("feishu-bind-btn")
+            Button::new("bot-bind-btn")
                 .small()
                 .primary()
-                .label("📱 绑定飞书")
+                .label("📱 绑定机器人")
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.request_bind_code_action(window, cx);
                 }))
@@ -1546,7 +1650,7 @@ impl PlannerApp {
             .gap_2()
             .items_center()
             .child(auto_sync_btn)
-            .child(feishu_btn)
+            .child(bind_btn)
             .child(sync_btn)
             .child(toggle);
 
@@ -2780,6 +2884,529 @@ impl PlannerApp {
             .into_any_element()
     }
 
+    /// 渲染学习日历视图（月度学习看板 + 手动备忘录 + 选中日期右侧明细栏）。
+    fn render_calendar_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let year = self.calendar_year;
+        let month = self.calendar_month;
+        let matrix = generate_month_calendar_matrix(year, month, &self.config.plans);
+        let month_stats = compute_month_study_stats(year, month, &self.config.plans);
+        let selected_date = self.calendar_selected_date.clone();
+        let selected_tasks = get_tasks_for_date(&self.config.plans, &selected_date);
+
+        // 1. 左侧：月度日历看板
+        // 1.1 月份导航与本月统计条
+        let month_nav_bar = bcard(cx)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                Button::new("cal-prev-month")
+                                    .label("◀ 上个月")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.prev_calendar_month_action(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::BLACK)
+                                    .child(format!("{year} 年 {month} 月")),
+                            )
+                            .child(
+                                Button::new("cal-next-month")
+                                    .label("下个月 ▶")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.next_calendar_month_action(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("cal-today-month")
+                                    .small()
+                                    .primary()
+                                    .label("回到本月")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reset_calendar_month_action(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .text_size(px(12.5))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "⏱️ 规划 {} (已学 {})",
+                                fmt_seconds(month_stats.total_duration as f64, true),
+                                fmt_seconds(month_stats.completed_duration as f64, true)
+                            ))
+                            .child(format!("📚 任务 {}/{}", month_stats.completed_tasks, month_stats.total_tasks))
+                            .child(format!("🔥 活跃 {} 天", month_stats.active_study_days)),
+                    ),
+            );
+
+        // 1.2 星期表头 (周一 ~ 周日)
+        // 1.2 星期表头 (周一 ~ 周日)
+        let weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+        let weekday_headers = h_flex()
+            .w_full()
+            .gap_1p5()
+            .children(weekdays.iter().enumerate().map(|(idx, &w)| {
+                let is_wkend = idx >= 5;
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .py_1p5()
+                    .items_center()
+                    .justify_center()
+                    .flex()
+                    .bg(if is_wkend { theme.primary.opacity(0.12) } else { theme.muted.opacity(0.4) })
+                    .border_2()
+                    .border_color(theme.border)
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(if is_wkend { theme.primary } else { theme.foreground })
+                    .child(w)
+            }));
+
+        // 1.3 日历网格主体 (按 7 列分行)
+        let mut grid_rows = Vec::new();
+        for (row_idx, chunk) in matrix.chunks(7).enumerate() {
+            let mut row_cells = Vec::new();
+            for (col_idx, day) in chunk.iter().enumerate() {
+                let cell_index = row_idx * 7 + col_idx;
+
+                // 若非当前所选月份，仅渲染尺寸完全一致的透明占位格，保证每列宽度严格对齐
+                if !day.is_current_month {
+                    let placeholder_el = div()
+                        .id(("cal-ph", cell_index))
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(104.))
+                        .p_1p5()
+                        .border_2()
+                        .border_color(hsla(0.0, 0.0, 0.0, 0.0));
+                    row_cells.push(placeholder_el.into_any_element());
+                    continue;
+                }
+
+                let d_date = day.date.clone();
+                let is_sel = d_date == selected_date;
+                let is_today = day.is_today;
+                let has_note = self.config.daily_notes.get(&d_date).is_some();
+                let note_snippet = self.config.daily_notes.get(&d_date).cloned().unwrap_or_default();
+
+                let bg_color = if is_sel {
+                    theme.primary.opacity(0.18)
+                } else if is_today {
+                    theme.primary.opacity(0.08)
+                } else {
+                    theme.background.opacity(0.35)
+                };
+
+                let border_color = if is_sel {
+                    theme.primary
+                } else if is_today {
+                    theme.primary.opacity(0.6)
+                } else {
+                    theme.border.opacity(0.6)
+                };
+
+                let is_all_done = day.completed_tasks > 0 && day.completed_tasks == day.total_tasks;
+                let status_bg = if is_all_done {
+                    theme.primary.opacity(0.9)
+                } else if day.completed_tasks > 0 {
+                    theme.primary.opacity(0.4)
+                } else {
+                    theme.muted.opacity(0.6)
+                };
+                let status_text_color = if is_all_done {
+                    hsla(0.0, 0.0, 0.04, 1.0)
+                } else {
+                    theme.foreground
+                };
+
+                let cell_el = div()
+                    .id(("cal-cell", cell_index))
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(104.))
+                    .p_1p5()
+                    .gap_1()
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .cursor_pointer()
+                    .bg(bg_color)
+                    .border_2()
+                    .border_color(border_color)
+                    .overflow_hidden()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_calendar_date_action(&d_date, window, cx);
+                    }))
+                    .child(
+                        // 顶部行：左侧[日期数字 + 今日 + 备忘图标]；右上角[学习时间 + 完成进度]
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .w_full()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(13.5))
+                                            .font_weight(if is_today || is_sel { FontWeight::BLACK } else { FontWeight::BOLD })
+                                            .text_color(if is_sel { theme.primary } else { theme.foreground })
+                                            .child(day.day_num.to_string()),
+                                    )
+                                    .children(is_today.then(|| {
+                                        div()
+                                            .px_1()
+                                            .py_0p5()
+                                            .bg(theme.primary)
+                                            .text_color(hsla(0.0, 0.0, 0.04, 1.0))
+                                            .text_size(px(9.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("今日")
+                                    }))
+                                    .children(has_note.then(|| {
+                                        div()
+                                            .text_size(px(11.))
+                                            .child("📝")
+                                    })),
+                            )
+                            // 右上角统一放置完成进度和学习时间
+                            .children(if day.total_tasks > 0 {
+                                Some(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_size(px(10.))
+                                        .child(
+                                            div()
+                                                .text_color(theme.muted_foreground)
+                                                .child(fmt_seconds(day.total_duration as f64, false)),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_1()
+                                                .py_0p5()
+                                                .bg(status_bg)
+                                                .text_color(status_text_color)
+                                                .font_weight(FontWeight::BOLD)
+                                                .child(format!("{}/{}", day.completed_tasks, day.total_tasks)),
+                                        ),
+                                )
+                            } else if day.is_rest_day {
+                                Some(
+                                    h_flex()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(theme.muted_foreground)
+                                                .child("☕ 休息日"),
+                                        ),
+                                )
+                            } else {
+                                None
+                            }),
+                    )
+                    .child(
+                        // 底部课程列表区：每天的课程一行一个依次展示
+                        v_flex()
+                            .w_full()
+                            .gap_0p5()
+                            .children(if day.total_tasks > 0 {
+                                let mut items = Vec::new();
+                                for t in &day.plan_titles {
+                                    items.push(
+                                        div()
+                                            .w_full()
+                                            .text_size(px(9.5))
+                                            .text_color(theme.muted_foreground)
+                                            .whitespace_nowrap()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(format!("• {t}"))
+                                            .into_any_element(),
+                                    );
+                                }
+                                items
+                            } else if has_note {
+                                let preview: String = note_snippet.chars().take(7).collect();
+                                vec![
+                                    div()
+                                        .w_full()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.muted_foreground)
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(format!("📝 {preview}…"))
+                                        .into_any_element(),
+                                ]
+                            } else {
+                                vec![]
+                            }),
+                    );
+
+                row_cells.push(cell_el.into_any_element());
+            }
+            grid_rows.push(h_flex().w_full().gap_1p5().h(px(104.)).children(row_cells));
+        }
+
+        let calendar_left = v_flex()
+            .id("calendar-left-pane")
+            .flex_1()
+            .h_full()
+            .overflow_y_scroll()
+            .min_w_0()
+            .gap_3()
+            .pr_2()
+            .child(month_nav_bar)
+            .child(
+                bcard(cx)
+                    .p_3()
+                    .gap_2()
+                    .child(weekday_headers)
+                    .child(v_flex().w_full().gap_1p5().children(grid_rows)),
+            );
+
+        // 2. 右侧：选中单日明细与备忘录侧边栏
+        let total_day_dur: i64 = selected_tasks.iter().map(|t| t.task.portion).sum();
+        let done_day_dur: i64 = selected_tasks.iter().filter(|t| t.task.completed).map(|t| t.task.portion).sum();
+        let total_day_tasks = selected_tasks.len();
+        let done_day_tasks = selected_tasks.iter().filter(|t| t.task.completed).count();
+
+        let day_detail_card = bcard(cx)
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(format_date_with_weekday(&selected_date)),
+                    )
+                    .children((selected_date == today_date_str()).then(|| {
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .bg(theme.primary)
+                            .text_color(hsla(0.0, 0.0, 0.04, 1.0))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("🔥 今日")
+                    })),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(12.5))
+                    .text_color(theme.muted_foreground)
+                    .child(format!("任务：{done_day_tasks} / {total_day_tasks} 项"))
+                    .child(format!(
+                        "已学 {} / 共 {}",
+                        fmt_seconds(done_day_dur as f64, true),
+                        fmt_seconds(total_day_dur as f64, true)
+                    )),
+            );
+
+        // 备忘录编辑区域
+        let note_edit_card = bcard(cx)
+            .gap_2p5()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::empty().path("icons/square-pen.svg").size_4().text_color(theme.primary))
+                    .child(
+                        div()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::BOLD)
+                            .child("当日学习备忘 / 心得"),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .child(Input::new(&self.calendar_note_input)),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("cal-clear-note-btn")
+                            .small()
+                            .ghost()
+                            .label("🗑️ 清空")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.clear_calendar_note_action(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("cal-save-note-btn")
+                            .small()
+                            .primary()
+                            .label("💾 保存备注")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_calendar_note_action(window, cx);
+                            })),
+                    ),
+            );
+
+        // 当日具体任务列表
+        let tasks_list_card = bcard(cx)
+            .gap_2p5()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::empty().path("icons/square-check.svg").size_4().text_color(theme.primary))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(format!("当日学习项目 (共 {total_day_tasks} 项)")),
+                            ),
+                    ),
+            )
+            .child(
+                if selected_tasks.is_empty() {
+                    v_flex()
+                        .w_full()
+                        .py_8()
+                        .items_center()
+                        .justify_center()
+                        .gap_1p5()
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("✨ 当日无学习任务安排"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .child("可自由复习、预习或休息"),
+                        )
+                        .into_any_element()
+                } else {
+                    let mut task_items = Vec::new();
+                    for (i, t_item) in selected_tasks.iter().enumerate() {
+                        let pid = t_item.plan_id.clone();
+                        let tid = t_item.task.id.clone();
+                        let is_done = t_item.task.completed;
+                        let st = t_item.source_type.clone();
+                        let su = t_item.source_url.clone();
+                        let vno = t_item.task.vid_no;
+
+                        task_items.push(
+                            div()
+                                .id(("cal-task", i))
+                                .w_full()
+                                .p_2()
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(if is_done { theme.primary.opacity(0.08) } else { theme.background.opacity(0.3) })
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(if is_done { theme.muted_foreground } else { theme.foreground })
+                                                .whitespace_nowrap()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .child(format!("《{}》 P{}: {}", t_item.plan_title, t_item.task.vid_no, t_item.task.title)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(theme.muted_foreground)
+                                                .child(fmt_seconds(t_item.task.portion as f64, true)),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            Button::new(("cal-play", i))
+                                                .small()
+                                                .ghost()
+                                                .label("🔗 直达")
+                                                .on_click(move |_, _, _| {
+                                                    open_video_link(&st, &su, vno);
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new(("cal-chk", i))
+                                                .small()
+                                                .primary()
+                                                .label(if is_done { "已完成 ✅" } else { "打卡 ⬜" })
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.toggle_task_checkin_action(&pid, &tid, window, cx);
+                                                })),
+                                        ),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    v_flex().w_full().gap_2().children(task_items).into_any_element()
+                },
+            );
+
+        let calendar_right = v_flex()
+            .id("calendar-right-pane")
+            .w(px(400.))
+            .min_w(px(400.))
+            .h_full()
+            .overflow_y_scroll()
+            .gap_3()
+            .pr_1()
+            .child(day_detail_card)
+            .child(note_edit_card)
+            .child(tasks_list_card);
+
+        h_flex()
+            .id("calendar-split-view")
+            .size_full()
+            .px_8()
+            .py_6()
+            .gap_5()
+            .child(calendar_left)
+            .child(calendar_right)
+            .into_any_element()
+    }
+
     /// 渲染我的计划库标签页。
     fn render_my_plans_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
@@ -2994,7 +3621,7 @@ impl PlannerApp {
             .into_any_element()
     }
 
-    /// 渲染飞书绑定弹窗（Neo-Brutalist 弹窗 + 醒目大字验证码）。
+    /// 渲染机器人绑定弹窗（Neo-Brutalist 弹窗 + 醒目大字验证码，支持飞书与 Telegram）。
     fn render_bind_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let code_str = self.cloud_bind_code.as_deref().unwrap_or("------");
@@ -3008,7 +3635,7 @@ impl PlannerApp {
             .justify_center()
             .child(
                 div()
-                    .w(px(460.))
+                    .w(px(480.))
                     .bg(theme.background)
                     .border_2()
                     .border_color(theme.foreground)
@@ -3026,7 +3653,7 @@ impl PlannerApp {
                                     .items_center()
                                     .gap_2()
                                     .child(Icon::empty().path("icons/tv.svg").size_5().text_color(theme.primary))
-                                    .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child("📱 绑定飞书学习打卡机器人")),
+                                    .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child("📱 绑定飞书 / Telegram 学习助手")),
                             )
                             .child(
                                 div()
@@ -3044,7 +3671,7 @@ impl PlannerApp {
                         div()
                             .text_size(px(13.))
                             .text_color(theme.muted_foreground)
-                            .child("在手机或电脑飞书上，打开您的「学习打卡助手」机器人聊天窗口，发送以下指令："),
+                            .child("在飞书机器人 或 Telegram 机器人聊天窗口中，发送以下指令完成绑定："),
                     )
                     .child(
                         div()
@@ -3062,7 +3689,7 @@ impl PlannerApp {
                                 div()
                                     .text_size(px(11.))
                                     .text_color(theme.muted_foreground)
-                                    .child("复制并在飞书发送："),
+                                    .child("复制并在 飞书/TG 中发送："),
                             )
                             .child(
                                 div()
@@ -3076,7 +3703,7 @@ impl PlannerApp {
                         div()
                             .text_size(px(12.))
                             .text_color(theme.muted_foreground)
-                            .child("• 验证码有效期 10 分钟\n• 绑定后机器人每日 08:30 推送早报、21:30 督促打卡\n• 支持在飞书卡片上直接点击完成打卡"),
+                            .child("• 验证码有效期 10 分钟\n• 绑定后两端均支持每日 08:30 计划早报与 21:30 督促提醒\n• 支持在消息卡片中直接点击按钮完成打卡并双向同步"),
                     )
                     .child(
                         h_flex()
@@ -3133,7 +3760,7 @@ impl PlannerApp {
             .justify_center()
             .child(
                 div()
-                    .w(px(460.))
+                    .w(px(480.))
                     .bg(theme.background)
                     .border_2()
                     .border_color(theme.foreground)
@@ -3160,7 +3787,7 @@ impl PlannerApp {
                             )
                             .child(
                                 div()
-                                    .id("close-sync-modal-x")
+                                    .id("close-sync-modal")
                                     .cursor_pointer()
                                     .p_1()
                                     .child(Icon::empty().path("icons/square.svg").size_4().text_color(theme.muted_foreground))
@@ -3172,11 +3799,12 @@ impl PlannerApp {
                     )
                     .child(
                         v_flex()
+                            .w_full()
                             .gap_2()
                             .p_3()
-                            .bg(if *is_success { theme.primary.opacity(0.12) } else { theme.danger.opacity(0.12) })
+                            .bg(theme.primary.opacity(0.06))
                             .border_1()
-                            .border_color(if *is_success { theme.primary.opacity(0.6) } else { theme.danger.opacity(0.6) })
+                            .border_color(theme.border)
                             .children(content_items),
                     )
                     .child(
@@ -3204,6 +3832,7 @@ impl Render for PlannerApp {
 
         let body: gpui::AnyElement = match self.active_tab {
             AppTab::TodayCheckIn => self.render_today_checkin_view(cx),
+            AppTab::Calendar => self.render_calendar_view(cx),
             AppTab::PlanGenerator => self.render_plan_generator_view(cx),
             AppTab::MyPlans => self.render_my_plans_view(cx),
         };

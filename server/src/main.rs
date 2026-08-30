@@ -3,6 +3,7 @@ mod feishu;
 mod models;
 mod scheduler;
 mod store;
+mod telegram;
 
 use axum::{
     extract::{Query, State},
@@ -24,6 +25,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use store::Store;
+use telegram::TelegramClient;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
@@ -67,8 +69,20 @@ async fn main() {
     let store = Store::new(&data_dir);
     let feishu = FeishuClient::new(app_id, app_secret);
 
+    // 检查并初始化 Telegram 机器人
+    let tg_token_opt = env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.trim().is_empty());
+    let telegram_client = if let Some(tg_token) = tg_token_opt {
+        info!("🤖 已检测到 TELEGRAM_BOT_TOKEN，正在启动 Telegram 机器人...");
+        let tg_client = TelegramClient::new(tg_token);
+        telegram::start_telegram_polling(store.clone(), tg_client.clone());
+        Some(tg_client)
+    } else {
+        info!("ℹ️ 未配置 TELEGRAM_BOT_TOKEN，Telegram 机器人未启用。");
+        None
+    };
+
     // 启动后台定时推送调度器
-    scheduler::start_scheduler(store.clone(), feishu.clone());
+    scheduler::start_scheduler(store.clone(), feishu.clone(), telegram_client);
 
     let state = AppState {
         store,
@@ -129,15 +143,20 @@ struct BindStatusQuery {
     device_token: String,
 }
 
-/// 客户端查询当前设备是否已被飞书绑定
+/// 客户端查询当前设备是否已被飞书或 Telegram 绑定
 async fn query_bind_status(
     State(state): State<AppState>,
     Query(query): Query<BindStatusQuery>,
 ) -> Json<BindStatusResponse> {
     let user = state.store.get_or_create_device(Some(&query.device_token)).await;
+    let feishu_bound = user.feishu_open_id.is_some();
+    let telegram_bound = user.telegram_chat_id.is_some();
     Json(BindStatusResponse {
-        bound: user.feishu_open_id.is_some(),
+        bound: feishu_bound || telegram_bound,
+        feishu_bound,
         feishu_user_name: user.feishu_user_name,
+        telegram_bound,
+        telegram_user_name: user.telegram_user_name,
     })
 }
 
@@ -146,7 +165,7 @@ async fn sync_plans(
     State(state): State<AppState>,
     Json(payload): Json<SyncPayload>,
 ) -> Json<SyncResponse> {
-    let (plans, bound, user_name) = state
+    let (plans, feishu_bound, feishu_user_name, telegram_bound, telegram_user_name) = state
         .store
         .sync_plans(&payload.device_token, payload.plans)
         .await;
@@ -154,8 +173,10 @@ async fn sync_plans(
     Json(SyncResponse {
         success: true,
         plans,
-        feishu_bound: bound,
-        feishu_user_name: user_name,
+        feishu_bound,
+        feishu_user_name,
+        telegram_bound,
+        telegram_user_name,
         message: "同步成功".to_string(),
     })
 }

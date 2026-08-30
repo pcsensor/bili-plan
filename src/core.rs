@@ -97,6 +97,8 @@ pub struct AppConfig {
     pub history: Vec<HistoryEntry>,
     #[serde(default)]
     pub plans: Vec<StudyPlan>,
+    #[serde(default)]
+    pub daily_notes: std::collections::HashMap<String, String>, // "YYYY-MM-DD" -> 备注内容
     #[serde(default = "default_sync_server_url")]
     pub sync_server_url: String,
     #[serde(default)]
@@ -105,6 +107,10 @@ pub struct AppConfig {
     pub feishu_bound: bool,
     #[serde(default)]
     pub feishu_user_name: Option<String>,
+    #[serde(default)]
+    pub telegram_bound: bool,
+    #[serde(default)]
+    pub telegram_user_name: Option<String>,
     #[serde(default = "default_auto_sync")]
     pub auto_sync: bool,
 }
@@ -116,10 +122,13 @@ impl Default for AppConfig {
             token: String::new(),
             history: Vec::new(),
             plans: Vec::new(),
+            daily_notes: std::collections::HashMap::new(),
             sync_server_url: default_sync_server_url(),
             sync_device_token: None,
             feishu_bound: false,
             feishu_user_name: None,
+            telegram_bound: false,
+            telegram_user_name: None,
             auto_sync: true,
         }
     }
@@ -612,9 +621,31 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
     if let Some(name) = data.get("feishu_user_name").and_then(|n| n.as_str()) {
         cfg.feishu_user_name = Some(name.to_string());
     }
+    if let Some(bound) = data.get("telegram_bound").and_then(|b| b.as_bool()) {
+        cfg.telegram_bound = bound;
+    }
+    if let Some(name) = data.get("telegram_user_name").and_then(|n| n.as_str()) {
+        cfg.telegram_user_name = Some(name.to_string());
+    }
 
     save_config(cfg);
     Ok("云端同步完成！".to_string())
+}
+
+/// 设置并持久化某日期的学习备注。若 note 为空则删除对应日期的备注。
+pub fn set_daily_note(cfg: &mut AppConfig, date_str: &str, note: &str) {
+    let t = note.trim();
+    if t.is_empty() {
+        cfg.daily_notes.remove(date_str);
+    } else {
+        cfg.daily_notes.insert(date_str.to_string(), t.to_string());
+    }
+    save_config(cfg);
+}
+
+/// 读取某日期的学习备注。
+pub fn get_daily_note<'a>(cfg: &'a AppConfig, date_str: &str) -> Option<&'a str> {
+    cfg.daily_notes.get(date_str).map(|s| s.as_str())
 }
 
 /// 把应用配置写到本机（原子写入 pretty JSON）。失败静默：不阻塞主流程。

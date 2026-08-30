@@ -595,6 +595,170 @@ pub fn compute_study_stats(plans: &[StudyPlan], today_str: &str) -> StudyStats {
     }
 }
 
+/// 单日日历视图聚合模型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonthCalendarDay {
+    pub date: String,
+    pub day_num: u32,
+    pub is_current_month: bool,
+    pub is_today: bool,
+    pub is_weekend: bool,
+    pub is_rest_day: bool,
+    pub total_duration: i64,
+    pub completed_duration: i64,
+    pub total_tasks: usize,
+    pub completed_tasks: usize,
+    pub plan_titles: Vec<String>,
+}
+
+/// 月度学习统计。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MonthStudyStats {
+    pub total_duration: i64,
+    pub completed_duration: i64,
+    pub total_tasks: usize,
+    pub completed_tasks: usize,
+    pub active_study_days: usize,
+}
+
+/// 获取某年某月的第一天和最后一天。
+pub fn get_month_range(year: i32, month: u32) -> (NaiveDate, NaiveDate) {
+    let first_day = NaiveDate::from_ymd_opt(year, month, 1)
+        .unwrap_or_else(|| Local::now().date_naive());
+    let next_month_first = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .unwrap_or_else(|| first_day + Duration::days(31));
+    let last_day = next_month_first - Duration::days(1);
+    (first_day, last_day)
+}
+
+/// 生成某月份完整的对齐日历网格（以周一为每周起始，7列，通常 5~6 行，共 35 或 42 格）。
+pub fn generate_month_calendar_matrix(
+    year: i32,
+    month: u32,
+    plans: &[StudyPlan],
+) -> Vec<MonthCalendarDay> {
+    let (first_day, last_day) = get_month_range(year, month);
+    let today_str = today_date_str();
+
+    // 确定网格开始日期（前移至当周周一）
+    let start_weekday = first_day.weekday().num_days_from_monday(); // 0=Mon, 6=Sun
+    let grid_start = first_day - Duration::days(start_weekday as i64);
+
+    // 确定网格结束日期（后移至当周周日）
+    let end_weekday = last_day.weekday().num_days_from_monday();
+    let days_to_sunday = 6 - end_weekday;
+    let grid_end = last_day + Duration::days(days_to_sunday as i64);
+
+    let mut matrix = Vec::new();
+    let mut cur = grid_start;
+
+    while cur <= grid_end {
+        let date_str = format_date(cur);
+        let is_current_month = cur.month() == month;
+        let is_today = date_str == today_str;
+        let is_wkend = is_weekend(cur);
+
+        let mut total_duration = 0;
+        let mut completed_duration = 0;
+        let mut total_tasks = 0;
+        let mut completed_tasks = 0;
+        let mut is_rest_day = false;
+        let mut plan_titles = Vec::new();
+
+        for plan in plans {
+            if plan.status != PlanStatus::Active {
+                continue;
+            }
+            if let Some(sch) = plan.schedules.iter().find(|s| s.date == date_str) {
+                if sch.is_rest_day {
+                    is_rest_day = true;
+                }
+                if !sch.tasks.is_empty() {
+                    if !plan_titles.contains(&plan.title) {
+                        plan_titles.push(plan.title.clone());
+                    }
+                    for task in &sch.tasks {
+                        total_tasks += 1;
+                        total_duration += task.portion;
+                        if task.completed {
+                            completed_tasks += 1;
+                            completed_duration += task.portion;
+                        }
+                    }
+                }
+            }
+        }
+
+        matrix.push(MonthCalendarDay {
+            date: date_str,
+            day_num: cur.day(),
+            is_current_month,
+            is_today,
+            is_weekend: is_wkend,
+            is_rest_day,
+            total_duration,
+            completed_duration,
+            total_tasks,
+            completed_tasks,
+            plan_titles,
+        });
+
+        cur += Duration::days(1);
+    }
+
+    matrix
+}
+
+/// 计算当月学习汇总统计。
+pub fn compute_month_study_stats(
+    year: i32,
+    month: u32,
+    plans: &[StudyPlan],
+) -> MonthStudyStats {
+    let (first_day, last_day) = get_month_range(year, month);
+    let mut total_dur = 0;
+    let mut done_dur = 0;
+    let mut total_t = 0;
+    let mut done_t = 0;
+    let mut active_days_set = std::collections::HashSet::new();
+
+    let mut cur = first_day;
+    while cur <= last_day {
+        let date_str = format_date(cur);
+        for plan in plans {
+            if plan.status != PlanStatus::Active {
+                continue;
+            }
+            if let Some(sch) = plan.schedules.iter().find(|s| s.date == date_str) {
+                if !sch.tasks.is_empty() {
+                    active_days_set.insert(date_str.clone());
+                    for t in &sch.tasks {
+                        total_t += 1;
+                        total_dur += t.portion;
+                        if t.completed {
+                            done_t += 1;
+                            done_dur += t.portion;
+                        }
+                    }
+                }
+            }
+        }
+        cur += Duration::days(1);
+    }
+
+    MonthStudyStats {
+        total_duration: total_dur,
+        completed_duration: done_dur,
+        total_tasks: total_t,
+        completed_tasks: done_t,
+        active_study_days: active_days_set.len(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 单元测试
 // ---------------------------------------------------------------------------
@@ -852,5 +1016,37 @@ mod tests {
         // 在周一 08-31（尚未打卡）查询 streak，应追溯到周五，连续打卡应当仍为 1
         let stats_monday = compute_study_stats(&plans, "2026-08-31");
         assert_eq!(stats_monday.current_streak, 1);
+    }
+
+    #[test]
+    fn calendar_matrix_and_month_stats_test() {
+        let plan_out = mock_plan_out();
+        let plan = create_study_plan(
+            "高数",
+            "bilibili",
+            "BV123",
+            "全集",
+            &plan_out,
+            "2026-08-15",
+            false,
+        );
+
+        let plans = vec![plan];
+        let matrix = generate_month_calendar_matrix(2026, 8, &plans);
+
+        // 2026年8月网格行数应为 5 或 6 周（35 或 42 格）
+        assert!(matrix.len() == 35 || matrix.len() == 42);
+
+        // 验证 8月15日 当天包含高数的任务
+        let day_15 = matrix.iter().find(|d| d.date == "2026-08-15").unwrap();
+        assert_eq!(day_15.total_tasks, 2);
+        assert_eq!(day_15.total_duration, 1000);
+        assert_eq!(day_15.plan_titles, vec!["高数"]);
+
+        // 月度统计
+        let month_stats = compute_month_study_stats(2026, 8, &plans);
+        assert_eq!(month_stats.total_tasks, 4);
+        assert_eq!(month_stats.total_duration, 2000);
+        assert_eq!(month_stats.active_study_days, 2);
     }
 }

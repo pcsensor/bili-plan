@@ -11,8 +11,8 @@ use gpui::{
 };
 use gpui_component::{Root, TitleBar};
 
-const WINDOW_SIZE: (f32, f32) = (1120.0, 820.0);
-const WINDOW_MIN_SIZE: (f32, f32) = (960.0, 660.0);
+const WINDOW_SIZE: (f32, f32) = (1480.0, 960.0);
+const WINDOW_MIN_SIZE: (f32, f32) = (1080.0, 720.0);
 
 actions!(
     bili_planner,

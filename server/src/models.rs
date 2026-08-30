@@ -74,6 +74,10 @@ pub struct DeviceUser {
     pub device_token: String,
     pub feishu_open_id: Option<String>,
     pub feishu_user_name: Option<String>,
+    #[serde(default)]
+    pub telegram_chat_id: Option<i64>,
+    #[serde(default)]
+    pub telegram_user_name: Option<String>,
     pub bind_code: Option<String>,
     pub bind_code_expires_at: i64,
     pub created_at: String,
@@ -91,7 +95,12 @@ pub struct BindRequestResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BindStatusResponse {
     pub bound: bool,
+    pub feishu_bound: bool,
     pub feishu_user_name: Option<String>,
+    #[serde(default)]
+    pub telegram_bound: bool,
+    #[serde(default)]
+    pub telegram_user_name: Option<String>,
 }
 
 /// 同步请求载荷。
@@ -108,6 +117,10 @@ pub struct SyncResponse {
     pub plans: Vec<StudyPlan>,
     pub feishu_bound: bool,
     pub feishu_user_name: Option<String>,
+    #[serde(default)]
+    pub telegram_bound: bool,
+    #[serde(default)]
+    pub telegram_user_name: Option<String>,
     pub message: String,
 }
 
