@@ -570,7 +570,39 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
 
     if let Some(plans_val) = data.get("plans") {
         if let Ok(merged_plans) = serde_json::from_value::<Vec<StudyPlan>>(plans_val.clone()) {
-            cfg.plans = merged_plans;
+            if cfg.plans.is_empty() {
+                cfg.plans = merged_plans;
+            } else {
+                let mut remote_map: std::collections::HashMap<String, StudyPlan> =
+                    std::collections::HashMap::new();
+                for rp in merged_plans {
+                    remote_map.insert(rp.id.clone(), rp);
+                }
+
+                for plan in &mut cfg.plans {
+                    if let Some(rp) = remote_map.get(&plan.id) {
+                        let mut remote_tasks: std::collections::HashMap<&str, &crate::study::TaskItem> =
+                            std::collections::HashMap::new();
+                        for sch in &rp.schedules {
+                            for t in &sch.tasks {
+                                remote_tasks.insert(t.id.as_str(), t);
+                            }
+                        }
+
+                        for sch in &mut plan.schedules {
+                            for t in &mut sch.tasks {
+                                if let Some(rt) = remote_tasks.get(t.id.as_str()) {
+                                    if rt.updated_at > t.updated_at {
+                                        t.completed = rt.completed;
+                                        t.completed_at = rt.completed_at;
+                                        t.updated_at = rt.updated_at;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

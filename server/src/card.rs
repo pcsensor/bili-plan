@@ -27,6 +27,27 @@ fn get_weekday_name(d: &NaiveDate) -> &'static str {
     }
 }
 
+fn clean_bili_link(source_url: &str, vid_no: i64) -> String {
+    let s = source_url.trim();
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    for i in 0..n.saturating_sub(11) {
+        if chars[i] == 'B'
+            && chars[i + 1] == 'V'
+            && chars[i + 2..i + 12].iter().all(|c| c.is_ascii_alphanumeric())
+        {
+            let bvid: String = chars[i..i + 12].iter().collect();
+            return format!("https://www.bilibili.com/video/{}?p={}", bvid, vid_no);
+        }
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        let base = s.split('?').next().unwrap_or(s);
+        format!("{}?p={}", base, vid_no)
+    } else {
+        format!("https://www.bilibili.com/video/{}?p={}", s, vid_no)
+    }
+}
+
 /// 构建飞书今日学习打卡交互卡片。
 pub fn build_today_study_card(plans: &[StudyPlan], target_date: &str) -> Value {
     let parsed_date = NaiveDate::parse_from_str(target_date, "%Y-%m-%d")
@@ -145,7 +166,7 @@ pub fn build_today_study_card(plans: &[StudyPlan], target_date: &str) -> Value {
 
                 // 播放链接构造
                 let video_link = if pt.plan.source_type == "bilibili" {
-                    format!("https://www.bilibili.com/video/{}?p={}", pt.plan.source_url, vno)
+                    clean_bili_link(&pt.plan.source_url, vno)
                 } else {
                     pt.plan.source_url.clone()
                 };

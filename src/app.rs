@@ -45,7 +45,7 @@ use crate::core::{
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
     compute_plan_progress, compute_study_stats, format_date, get_tasks_for_date,
-    parse_date_or_today, today_date_str, PlanStatus,
+    parse_date_or_today, today_date_str, PlanStatus, StudyPlan,
 };
 
 /// 顶部活动标签页。
@@ -61,16 +61,27 @@ pub enum AppTab {
 fn open_video_link(source_type: &str, source_url: &str, vid_no: i64) {
     let url = if source_type == "bilibili" {
         let trimmed = source_url.trim();
-        if trimmed.starts_with("http") {
-            if trimmed.contains('?') {
-                format!("{trimmed}&p={vid_no}")
-            } else {
-                format!("{trimmed}?p={vid_no}")
+        // 识别形如 BV... 的 12 位 ID
+        let chars: Vec<char> = trimmed.chars().collect();
+        let n = chars.len();
+        let mut found_bv = None;
+        for i in 0..n.saturating_sub(11) {
+            if chars[i] == 'B'
+                && chars[i + 1] == 'V'
+                && chars[i + 2..i + 12].iter().all(|c| c.is_ascii_alphanumeric())
+            {
+                found_bv = Some(chars[i..i + 12].iter().collect::<String>());
+                break;
             }
-        } else if trimmed.starts_with("BV") {
-            format!("https://www.bilibili.com/video/{trimmed}?p={vid_no}")
+        }
+
+        if let Some(bvid) = found_bv {
+            format!("https://www.bilibili.com/video/{bvid}?p={vid_no}")
+        } else if trimmed.starts_with("http") {
+            let base = trimmed.split('?').next().unwrap_or(trimmed);
+            format!("{base}?p={vid_no}")
         } else {
-            format!("https://www.bilibili.com/video/{trimmed}")
+            format!("https://www.bilibili.com/video/{trimmed}?p={vid_no}")
         }
     } else {
         source_url.to_string()
@@ -943,6 +954,44 @@ impl PlannerApp {
         cx.notify();
     }
 
+    /// 安全地将云端返回的最新打卡状态合并到本地正在编辑的计划中（防止覆盖本地尚未同步的最新修改）。
+    fn merge_synced_plans(&mut self, remote_plans: Vec<StudyPlan>) {
+        if self.config.plans.is_empty() {
+            self.config.plans = remote_plans;
+            return;
+        }
+
+        let mut remote_map: std::collections::HashMap<String, StudyPlan> = std::collections::HashMap::new();
+        for rp in remote_plans {
+            remote_map.insert(rp.id.clone(), rp);
+        }
+
+        for plan in &mut self.config.plans {
+            if let Some(rp) = remote_map.get(&plan.id) {
+                let mut remote_tasks: std::collections::HashMap<&str, &crate::study::TaskItem> =
+                    std::collections::HashMap::new();
+                for sch in &rp.schedules {
+                    for t in &sch.tasks {
+                        remote_tasks.insert(t.id.as_str(), t);
+                    }
+                }
+
+                for sch in &mut plan.schedules {
+                    for t in &mut sch.tasks {
+                        if let Some(rt) = remote_tasks.get(t.id.as_str()) {
+                            // 仅当远端打卡时间更新时才采纳（Last-Write-Wins）
+                            if rt.updated_at > t.updated_at {
+                                t.completed = rt.completed;
+                                t.completed_at = rt.completed_at;
+                                t.updated_at = rt.updated_at;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 触发与云服务双向增量同步（手动同步，弹窗呈现详情）。
     fn sync_cloud_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.cloud_syncing {
@@ -966,7 +1015,7 @@ impl PlannerApp {
                 let (res, synced_cfg) = result;
                 match res {
                     Ok(_) => {
-                        this.config.plans = synced_cfg.plans;
+                        this.merge_synced_plans(synced_cfg.plans);
                         this.config.feishu_bound = synced_cfg.feishu_bound;
                         this.config.feishu_user_name = synced_cfg.feishu_user_name;
                         if synced_cfg.sync_device_token.is_some() {
@@ -1049,7 +1098,7 @@ impl PlannerApp {
                 let (res, synced_cfg) = result;
                 match res {
                     Ok(_) => {
-                        this.config.plans = synced_cfg.plans;
+                        this.merge_synced_plans(synced_cfg.plans);
                         this.config.feishu_bound = synced_cfg.feishu_bound;
                         this.config.feishu_user_name = synced_cfg.feishu_user_name;
                         if synced_cfg.sync_device_token.is_some() {

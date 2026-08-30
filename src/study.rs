@@ -431,16 +431,6 @@ pub fn push_forward_plan(
     }
 
     // 2. 将未完成任务按原始天重新分批，并从 target_start 开始顺延排期
-    let mut cur_date = target_start;
-    // 确保 cur_date 不早于已保留日程中的最后一天
-    if let Some(last_done) = preserved_schedules.last() {
-        let last_date = parse_date_or_today(&last_done.date);
-        if cur_date <= last_date {
-            cur_date = last_date + Duration::days(1);
-        }
-    }
-
-    // 按原任务分组
     let mut day_chunks: Vec<Vec<TaskItem>> = Vec::new();
     for schedule in &plan.schedules {
         let uncompleted: Vec<TaskItem> = schedule
@@ -454,7 +444,44 @@ pub fn push_forward_plan(
         }
     }
 
-    for chunk in day_chunks {
+    if day_chunks.is_empty() {
+        return Ok(());
+    }
+
+    let has_target_start_in_preserved = preserved_schedules
+        .iter()
+        .any(|s| s.date == format_date(target_start));
+
+    let mut cur_date = target_start;
+    // 如果 target_start 早于已有打卡历史中的最晚日期，则至少从最晚日期的次日开始排
+    if let Some(last_done) = preserved_schedules.last() {
+        let last_date = parse_date_or_today(&last_done.date);
+        if target_start < last_date {
+            cur_date = last_date + Duration::days(1);
+        }
+    }
+
+    let mut chunks_iter = day_chunks.into_iter();
+
+    // 如果 target_start 当天已有打卡记录，且未完成任务需要从 target_start 开始，将第一批未完成任务合并进当天
+    if has_target_start_in_preserved && cur_date == target_start {
+        if let Some(first_chunk) = chunks_iter.next() {
+            if let Some(today_sch) = preserved_schedules
+                .iter_mut()
+                .find(|s| s.date == format_date(target_start))
+            {
+                let start_idx = today_sch.tasks.len();
+                let day_idx = today_sch.day_index;
+                for (i, mut t) in first_chunk.into_iter().enumerate() {
+                    t.id = format!("{}_{}_{}", plan.id, day_idx, start_idx + i);
+                    today_sch.tasks.push(t);
+                }
+            }
+        }
+        cur_date += Duration::days(1);
+    }
+
+    for chunk in chunks_iter {
         if plan.skip_weekends {
             while is_weekend(cur_date) {
                 preserved_schedules.push(DailySchedule {
@@ -526,14 +553,30 @@ pub fn compute_study_stats(plans: &[StudyPlan], today_str: &str) -> StudyStats {
     let mut streak = 0;
     let mut check_date = today;
 
-    // 如果今天还没打卡，允许从昨天算起
+    let skip_weekends = !plans.is_empty()
+        && plans
+            .iter()
+            .filter(|p| p.status == PlanStatus::Active)
+            .all(|p| p.skip_weekends);
+
+    // 如果今天还没打卡，允许从昨天算起（若昨天也是周末且跳过周末，则允许跳过周末追溯）
     if !checkin_dates.contains(&format_date(check_date)) {
         check_date -= Duration::days(1);
+        if skip_weekends {
+            while is_weekend(check_date) && !checkin_dates.contains(&format_date(check_date)) {
+                check_date -= Duration::days(1);
+            }
+        }
     }
 
     while checkin_dates.contains(&format_date(check_date)) {
         streak += 1;
         check_date -= Duration::days(1);
+        if skip_weekends {
+            while is_weekend(check_date) && !checkin_dates.contains(&format_date(check_date)) {
+                check_date -= Duration::days(1);
+            }
+        }
     }
 
     let active_plans = plans
@@ -753,5 +796,61 @@ mod tests {
         assert_eq!(stats.today_completed_tasks, 2);
         assert_eq!(stats.total_days_checked_in, 1);
         assert_eq!(stats.current_streak, 1);
+    }
+
+    #[test]
+    fn push_forward_to_today_with_partial_checkin() {
+        let plan_out = mock_plan_out();
+        let mut plan = create_study_plan(
+            "高数",
+            "bilibili",
+            "BV123",
+            "全集",
+            &plan_out,
+            "2026-08-30",
+            false,
+        );
+
+        // 8月30日当天完成任务0，但任务1未完成
+        plan.schedules[0].tasks[0].completed = true;
+
+        // 执行顺延至今日 (2026-08-30)
+        push_forward_plan(&mut plan, "2026-08-30").unwrap();
+
+        // 8月30日应当既包含已完成的任务0，也包含未完成的任务1
+        let sch_today = plan.schedules.iter().find(|s| s.date == "2026-08-30").unwrap();
+        assert_eq!(sch_today.tasks.len(), 2);
+        assert!(sch_today.tasks[0].completed);
+        assert!(!sch_today.tasks[1].completed);
+        // 后续批次应顺延至 08-31
+        assert!(plan.schedules.iter().any(|s| s.date == "2026-08-31"));
+    }
+
+    #[test]
+    fn streak_with_skip_weekends() {
+        let plan_out = mock_plan_out();
+        // 2026-08-28 是周五，08-29 周六，08-30 周日，08-31 周一
+        let mut plan = create_study_plan(
+            "高数",
+            "bilibili",
+            "BV123",
+            "全集",
+            &plan_out,
+            "2026-08-28",
+            true, // 跳过周末
+        );
+
+        // 周五 (08-28) 打卡
+        plan.schedules[0].tasks[0].completed = true;
+
+        let plans = vec![plan];
+
+        // 在周日 08-30 查询 streak（周五已打卡，周末休息），连续打卡应当为 1
+        let stats_sunday = compute_study_stats(&plans, "2026-08-30");
+        assert_eq!(stats_sunday.current_streak, 1);
+
+        // 在周一 08-31（尚未打卡）查询 streak，应追溯到周五，连续打卡应当仍为 1
+        let stats_monday = compute_study_stats(&plans, "2026-08-31");
+        assert_eq!(stats_monday.current_streak, 1);
     }
 }

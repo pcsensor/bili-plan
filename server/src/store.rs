@@ -180,42 +180,44 @@ impl Store {
         let bound = user.feishu_open_id.is_some();
         let user_name = user.feishu_user_name.clone();
 
-        let remote_plans = guard.plans.entry(device_token.to_string()).or_default();
-
-        // 合并策略：按科目 plan.id 对应合并，未修改的保留，两端冲突以 completed_at 更晚或 true 优先
-        let mut merged_map: HashMap<String, StudyPlan> = HashMap::new();
-        for p in remote_plans.drain(..) {
-            merged_map.insert(p.id.clone(), p);
+        let remote_plans: Vec<StudyPlan> = guard.plans.remove(device_token).unwrap_or_default();
+        let mut remote_map: HashMap<String, StudyPlan> = HashMap::new();
+        for p in remote_plans {
+            remote_map.insert(p.id.clone(), p);
         }
 
-        for incoming in incoming_plans {
-            if let Some(existing) = merged_map.get_mut(&incoming.id) {
-                // 逐日逐任务合并打卡状态（基于 TaskItem.updated_at 遵循 Last-Write-Wins 规则）
-                for in_sch in incoming.schedules {
-                    if let Some(ex_sch) = existing.schedules.iter_mut().find(|s| s.date == in_sch.date) {
-                        for in_t in in_sch.tasks {
-                            if let Some(ex_t) = ex_sch.tasks.iter_mut().find(|t| t.id == in_t.id) {
-                                if in_t.updated_at >= ex_t.updated_at {
-                                    // 客户端更新时间更新（或同时为 0 时以客户端本次上传状态为准）
-                                    ex_t.completed = in_t.completed;
-                                    ex_t.completed_at = in_t.completed_at;
-                                    ex_t.updated_at = in_t.updated_at;
-                                }
-                                // 若 ex_t.updated_at > in_t.updated_at，则保留服务端最新操作（如飞书端的打卡/取消打卡），
-                                // 并在随后将该计划返回给客户端覆盖本地状态。
+        // 合并策略：
+        // 1. 客户端为主控端（计划增删、排期与顺延以客户端结构为准）；
+        // 2. 服务端（如飞书打卡）若有更新的打卡记录 (ex_t.updated_at > in_t.updated_at)，则合并保留；
+        // 3. 已从客户端删除的计划不再保留。
+        let mut final_plans: Vec<StudyPlan> = Vec::new();
+
+        for mut incoming in incoming_plans {
+            if let Some(existing) = remote_map.get(&incoming.id) {
+                // 收集服务端中该计划的所有打卡状态
+                let mut server_tasks: HashMap<&str, &crate::models::TaskItem> = HashMap::new();
+                for ex_sch in &existing.schedules {
+                    for ex_t in &ex_sch.tasks {
+                        server_tasks.insert(ex_t.id.as_str(), ex_t);
+                    }
+                }
+
+                // 将服务端更新的打卡状态合并到客户端的新排期结构中
+                for in_sch in &mut incoming.schedules {
+                    for in_t in &mut in_sch.tasks {
+                        if let Some(ex_t) = server_tasks.get(in_t.id.as_str()) {
+                            if ex_t.updated_at > in_t.updated_at {
+                                in_t.completed = ex_t.completed;
+                                in_t.completed_at = ex_t.completed_at;
+                                in_t.updated_at = ex_t.updated_at;
                             }
                         }
                     }
                 }
-                existing.status = incoming.status;
-                existing.title = incoming.title;
-                existing.skip_weekends = incoming.skip_weekends;
-            } else {
-                merged_map.insert(incoming.id.clone(), incoming);
             }
+            final_plans.push(incoming);
         }
 
-        let mut final_plans: Vec<StudyPlan> = merged_map.into_values().collect();
         final_plans.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
         guard.plans.insert(device_token.to_string(), final_plans.clone());
@@ -274,7 +276,7 @@ impl Store {
         Err("未找到对应计划或任务")
     }
 
-    /// 记录最后一次推送日期。
+    /// 记录最后一次推送日期，并自动清理 14 天前的旧推送记录。
     pub async fn record_pushed_date(&self, open_id: &str, push_type: &str, date: &str) -> bool {
         let mut guard = self.inner.write().await;
         let key = format!("{}:{}:{}", open_id, push_type, date);
@@ -282,8 +284,83 @@ impl Store {
             return false; // 已推送过
         }
         guard.push_logs.insert(key, Local::now().to_rfc3339());
+
+        // 仅保留最多 500 条推送记录，防止文件无限膨胀
+        if guard.push_logs.len() > 500 {
+            let mut keys: Vec<String> = guard.push_logs.keys().cloned().collect();
+            keys.sort();
+            let remove_count = guard.push_logs.len().saturating_sub(400);
+            for k in keys.into_iter().take(remove_count) {
+                guard.push_logs.remove(&k);
+            }
+        }
+
         drop(guard);
         self.persist().await;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{DailySchedule, PlanStatus, StudyPlan, TaskItem};
+
+    fn make_test_plan(id: &str, dates: &[&str]) -> StudyPlan {
+        StudyPlan {
+            id: id.to_string(),
+            title: "测试计划".to_string(),
+            source_type: "bilibili".to_string(),
+            source_url: "BV123".to_string(),
+            scope_desc: "全集".to_string(),
+            total_duration: 1000,
+            planned_days: dates.len(),
+            start_date: dates.first().unwrap_or(&"2026-08-30").to_string(),
+            end_date: dates.last().unwrap_or(&"2026-08-30").to_string(),
+            skip_weekends: false,
+            status: PlanStatus::Active,
+            created_at: 100,
+            schedules: dates
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| DailySchedule {
+                    day_index: i,
+                    date: d.to_string(),
+                    tasks: vec![TaskItem {
+                        id: format!("{}_{}_0", id, i),
+                        vid_no: i as i64 + 1,
+                        title: format!("第{}讲", i + 1),
+                        portion: 500,
+                        remainder: 0,
+                        from_prev: false,
+                        completed: false,
+                        completed_at: None,
+                        updated_at: 0,
+                    }],
+                    is_rest_day: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_preserves_postponed_schedules() {
+        let temp_dir = std::env::temp_dir().join(format!("store_test_{}", rand::random::<u64>()));
+        let store = Store::new(&temp_dir);
+
+        let token = "dev_123";
+
+        // 1. 初始同步：08-25, 08-26
+        let initial_plan = make_test_plan("p1", &["2026-08-25", "2026-08-26"]);
+        let (plans1, _, _) = store.sync_plans(token, vec![initial_plan]).await;
+        assert_eq!(plans1[0].schedules[0].date, "2026-08-25");
+
+        // 2. 客户端在本地将未完成任务顺延至 08-30, 08-31，并再次同步
+        let postponed_plan = make_test_plan("p1", &["2026-08-30", "2026-08-31"]);
+        let (plans2, _, _) = store.sync_plans(token, vec![postponed_plan]).await;
+
+        // 服务端应当采纳顺延后的排期结构，而不是固守 08-25
+        assert_eq!(plans2[0].schedules[0].date, "2026-08-30");
+        assert_eq!(plans2[0].schedules[1].date, "2026-08-31");
     }
 }
