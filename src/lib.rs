@@ -21,7 +21,8 @@ pub use jellyfin::{
 pub use parse::{extract_bvid, extract_sid, parse_groups, Group, ParseResult};
 pub use plan::{build_plan, Mode, PlanEntry, PlanOut};
 pub use study::{
-    compute_plan_progress, compute_study_stats, create_study_plan, get_tasks_for_date,
-    push_forward_plan, today_date_str, toggle_task_checkin, DailySchedule, PlanStatus, StudyPlan,
-    StudyStats, TaskItem, TodayTaskView,
+    add_daily_note, compute_plan_progress, compute_study_stats, create_custom_study_plan,
+    create_study_plan, delete_daily_note, get_daily_notes, get_tasks_for_date, merge_daily_notes,
+    push_forward_plan, today_date_str, toggle_task_checkin, DailyNote, DailyNotes, DailySchedule,
+    PlanStatus, StudyPlan, StudyStats, TaskItem, TodayTaskView,
 };

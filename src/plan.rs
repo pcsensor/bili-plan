@@ -83,7 +83,9 @@ pub fn build_plan(items: &[EpisodeItem], days: i64, mode: Mode) -> Result<PlanOu
         let cap = capacities[day];
         let mut assigned: i64 = 0;
         let mut entries: Vec<PlanEntry> = Vec::new();
-        while assigned < cap {
+        // 整集模式的最后一天承接所有剩余视频：目标天数是“尽量均衡”的目标，
+        // 不能以丢弃未排视频为代价。最后一天允许超过目标时长。
+        while assigned < cap || (mode == Mode::Whole && day + 1 == days as usize) {
             if cur_dur <= 0 {
                 if idx >= items.len() {
                     break;
@@ -110,7 +112,25 @@ pub fn build_plan(items: &[EpisodeItem], days: i64, mode: Mode) -> Result<PlanOu
                 from_prev = false;
             } else {
                 if mode == Mode::Whole {
-                    break; // 不拆分，今日剩余时间留空，视频顺延
+                    // 整集模式优先保持视频完整。若当天尚未安排任何视频，
+                    // 允许该视频超过日均目标；否则它会在下一天开始。
+                    // 这样不会因为某个视频长于每一天的容量而永远无法排入计划。
+                    if entries.is_empty() || day + 1 == days as usize {
+                        entries.push(PlanEntry {
+                            vid_no: cur_no,
+                            title: cur_title.clone(),
+                            portion: cur_dur,
+                            from_prev,
+                            remainder: 0,
+                            cont_day: None,
+                        });
+                        cur_dur = 0;
+                        from_prev = false;
+                    }
+                    if day + 1 != days as usize {
+                        break; // 当日已有安排时，今日剩余时间留空，视频顺延
+                    }
+                    continue;
                 }
                 let mut cont_day: Option<i64> = None;
                 for (j, cap) in capacities.iter().enumerate().skip(day + 1) {

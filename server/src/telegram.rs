@@ -433,13 +433,11 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                     let code = parts[1].trim();
                                     match store.bind_telegram_by_code(code, chat_id, Some(user_name)).await {
                                         Ok(_) => {
-                                            let reply = format!(
-                                                "🎉 <b>绑定成功！</b>\n━━━━━━━━━━━━━━━━━━\n已与您的电脑端 <b>bili-planner</b> 建立双向连接。\n\n• 每日 <b>08:30</b> 自动推送今日学习早报\n• 每日 <b>21:30</b> 自动提醒晚间复盘\n• 发送 <code>/today</code> 随时呼出今日任务卡片并在 TG 内一键打卡\n• 发送 <code>/plans</code> 查看所有科目总体进度"
-                                            );
+                                            let reply = "🎉 <b>绑定成功！</b>\n━━━━━━━━━━━━━━━━━━\n已与您的电脑端 <b>bili-planner</b> 建立双向连接。\n\n• 每日 <b>08:30</b> 自动推送今日学习早报\n• 每日 <b>21:30</b> 自动提醒晚间复盘\n• 发送 <code>/today</code> 随时呼出今日任务卡片并在 TG 内一键打卡\n• 发送 <code>/plans</code> 查看所有科目总体进度".to_string();
                                             let _ = telegram.send_message(chat_id, &reply, None).await;
                                         }
                                         Err(e) => {
-                                            let reply = format!("❌ 绑定失败：{}\n请在电脑端重新生成绑定码。", escape_html(&e));
+                                            let reply = format!("❌ 绑定失败：{}\n请在电脑端重新生成绑定码。", escape_html(e));
                                             let _ = telegram.send_message(chat_id, &reply, None).await;
                                         }
                                     }
@@ -511,7 +509,7 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                             }
                                         }
                                         Err(e) => {
-                                            let _ = telegram.answer_callback_query(query_id, Some(&e), true).await;
+                                            let _ = telegram.answer_callback_query(query_id, Some(e), true).await;
                                         }
                                     }
                                 }

@@ -29,6 +29,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 pollster = "0.4"
 rust-embed = "8"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 gpui = { version = "0.2", features = ["test-support"] }

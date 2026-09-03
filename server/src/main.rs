@@ -35,6 +35,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct AppState {
     store: Store,
     feishu: FeishuClient,
+    feishu_verification_token: String,
 }
 
 #[tokio::main]
@@ -58,6 +59,13 @@ async fn main() {
         Ok(val) if !val.trim().is_empty() => val,
         _ => {
             error!("❌ 未配置 FEISHU_APP_SECRET 环境变量！请在 .env 或容器环境变量中配置。");
+            std::process::exit(1);
+        }
+    };
+    let feishu_verification_token = match env::var("FEISHU_VERIFICATION_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            error!("❌ 未配置 FEISHU_VERIFICATION_TOKEN；拒绝启动未校验回调的服务。");
             std::process::exit(1);
         }
     };
@@ -87,6 +95,7 @@ async fn main() {
     let state = AppState {
         store,
         feishu,
+        feishu_verification_token,
     };
 
     let app = Router::new()
@@ -165,14 +174,15 @@ async fn sync_plans(
     State(state): State<AppState>,
     Json(payload): Json<SyncPayload>,
 ) -> Json<SyncResponse> {
-    let (plans, feishu_bound, feishu_user_name, telegram_bound, telegram_user_name) = state
+    let (plans, daily_notes, feishu_bound, feishu_user_name, telegram_bound, telegram_user_name) = state
         .store
-        .sync_plans(&payload.device_token, payload.plans)
+        .sync_plans(&payload.device_token, payload.plans, payload.daily_notes)
         .await;
 
     Json(SyncResponse {
         success: true,
         plans,
+        daily_notes,
         feishu_bound,
         feishu_user_name,
         telegram_bound,
@@ -186,6 +196,22 @@ async fn feishu_callback(
     State(state): State<AppState>,
     Json(req): Json<FeishuCallbackRequest>,
 ) -> impl IntoResponse {
+    // 飞书事件与卡片回调必须携带在开放平台配置的 Verification Token。
+    // 未校验的公开回调会允许伪造打卡或绑定消息，因此在处理任何内容前拒绝它。
+    let received_token = req.token.as_deref().or_else(|| {
+        req.header
+            .as_ref()
+            .and_then(|header| header.token.as_deref())
+    });
+    if received_token != Some(state.feishu_verification_token.as_str()) {
+        error!("拒绝缺少或无效 Verification Token 的飞书回调");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "code": 401, "msg": "invalid verification token" })),
+        )
+            .into_response();
+    }
+
     // 1. 飞书首次配置事件回调时的 URL 校验挑战 (Challenge)
     if let Some(challenge) = req.challenge {
         info!("响应飞书 URL 校验 Challenge: {}", challenge);
@@ -297,9 +323,7 @@ async fn feishu_callback(
                     let code = parts[1].trim();
                     match state.store.bind_by_code(code, open_id, Some(user_name)).await {
                         Ok(_) => {
-                            let reply = format!(
-                                "🎉 **绑定成功！**\n\n已成功与您的电脑端 bili-planner 建立连接。\n• 每日早 08:30 将为您推送今日任务早报\n• 每日晚 21:30 将提醒您复盘打卡\n• 发送 `/today` 随时呼出今日打卡卡片\n• 发送 `/plans` 随时查看计划库科目总览！"
-                            );
+                            let reply = "🎉 **绑定成功！**\n\n已成功与您的电脑端 bili-planner 建立连接。\n• 每日早 08:30 将为您推送今日任务早报\n• 每日晚 21:30 将提醒您复盘打卡\n• 发送 `/today` 随时呼出今日打卡卡片\n• 发送 `/plans` 随时查看计划库科目总览！".to_string();
                             let _ = state.feishu.send_text_message(open_id, &reply).await;
                         }
                         Err(e) => {

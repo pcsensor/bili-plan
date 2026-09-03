@@ -3,7 +3,8 @@
 //! 提供计划实体、日历排期计算、多科目聚合今日任务、任务打卡与统计、一键顺延等功能。
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 
 use crate::plan::PlanOut;
 
@@ -100,6 +101,57 @@ pub struct StudyPlan {
     pub schedules: Vec<DailySchedule>,
 }
 
+/// 某天的一条学习备注。保留删除标记可让多端同步正确传播删除操作。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DailyNote {
+    pub id: String,
+    pub content: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// 日期 -> 多条备注。值内保留 tombstone，调用展示函数时会过滤已删除的条目。
+pub type DailyNotes = HashMap<String, Vec<DailyNote>>;
+
+/// 兼容旧版 `{"YYYY-MM-DD": "一条备注"}` 配置文件。
+pub fn deserialize_daily_notes<'de, D>(deserializer: D) -> Result<DailyNotes, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawNotes {
+        Modern(DailyNotes),
+        Legacy(HashMap<String, String>),
+    }
+
+    match RawNotes::deserialize(deserializer)? {
+        RawNotes::Modern(notes) => Ok(notes),
+        RawNotes::Legacy(notes) => Ok(notes
+            .into_iter()
+            .filter_map(|(date, content)| {
+                let content = content.trim().to_string();
+                (!content.is_empty()).then(|| {
+                    let id = format!("legacy_note_{date}");
+                    (
+                        date,
+                        vec![DailyNote {
+                            id,
+                            content,
+                            created_at: 0,
+                            updated_at: 0,
+                            deleted: false,
+                        }],
+                    )
+                })
+            })
+            .collect()),
+    }
+}
+
 /// 今日聚合任务视图项（用于今日打卡面板展示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodayTaskView {
@@ -141,8 +193,7 @@ pub fn today_date_str() -> String {
 
 /// 解析 "YYYY-MM-DD" 字符串为 NaiveDate，失败返回今天。
 pub fn parse_date_or_today(s: &str) -> NaiveDate {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .unwrap_or_else(|_| Local::now().date_naive())
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|_| Local::now().date_naive())
 }
 
 /// 格式化 NaiveDate 为 "YYYY-MM-DD"。
@@ -176,9 +227,7 @@ pub fn create_study_plan(
 
     let mut schedules: Vec<DailySchedule> = Vec::new();
     let mut cur_date = start_date;
-    let mut plan_day_idx = 0;
-
-    for entries in &plan_out.plan {
+    for (plan_day_idx, entries) in plan_out.plan.iter().enumerate() {
         // 若开启跳过周末，且当前日期是周末，则插入休息日日程
         if skip_weekends {
             while is_weekend(cur_date) {
@@ -215,7 +264,6 @@ pub fn create_study_plan(
             is_rest_day: false,
         });
 
-        plan_day_idx += 1;
         cur_date += Duration::days(1);
     }
 
@@ -254,6 +302,171 @@ fn fast_rand_suffix() -> u32 {
             .unwrap_or(0),
     );
     (hasher.finish() & 0xFFFF) as u32
+}
+
+fn now_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 建立一个不依赖视频来源的自定义学习任务。
+///
+/// 每个学习日创建一项固定时长的任务，因此它会自然出现在已有的今日看板、
+/// 月历、统计、机器人和顺延流程中。
+pub fn create_custom_study_plan(
+    title: &str,
+    start_date_str: &str,
+    days: i64,
+    daily_minutes: i64,
+    skip_weekends: bool,
+) -> Result<StudyPlan, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("请填写自定义任务名称。".to_string());
+    }
+    if days <= 0 {
+        return Err("自定义任务天数必须是正整数。".to_string());
+    }
+    if daily_minutes <= 0 {
+        return Err("每日时长必须是正整数分钟。".to_string());
+    }
+
+    let now = now_timestamp();
+    let plan_id = format!("custom_{}_{}", now, fast_rand_suffix());
+    let start_date = parse_date_or_today(start_date_str);
+    let portion = daily_minutes
+        .checked_mul(60)
+        .ok_or_else(|| "每日时长过大。".to_string())?;
+
+    let mut schedules = Vec::new();
+    let mut cur_date = start_date;
+    let mut day_index = 0usize;
+    while day_index < days as usize {
+        if skip_weekends {
+            while is_weekend(cur_date) {
+                schedules.push(DailySchedule {
+                    day_index,
+                    date: format_date(cur_date),
+                    tasks: Vec::new(),
+                    is_rest_day: true,
+                });
+                cur_date += Duration::days(1);
+            }
+        }
+
+        schedules.push(DailySchedule {
+            day_index,
+            date: format_date(cur_date),
+            tasks: vec![TaskItem {
+                id: format!("{}_{}_0", plan_id, day_index),
+                vid_no: day_index as i64 + 1,
+                title: title.to_string(),
+                portion,
+                from_prev: false,
+                remainder: 0,
+                completed: false,
+                completed_at: None,
+                updated_at: 0,
+            }],
+            is_rest_day: false,
+        });
+        day_index += 1;
+        cur_date += Duration::days(1);
+    }
+
+    let end_date = schedules
+        .iter()
+        .rfind(|schedule| !schedule.is_rest_day)
+        .map(|schedule| schedule.date.clone())
+        .unwrap_or_else(|| format_date(start_date));
+
+    Ok(StudyPlan {
+        id: plan_id,
+        title: title.to_string(),
+        source_type: "custom".to_string(),
+        source_url: String::new(),
+        scope_desc: format!("自定义任务 · 每日 {daily_minutes} 分钟"),
+        total_duration: portion * days,
+        planned_days: days as usize,
+        start_date: format_date(start_date),
+        end_date,
+        skip_weekends,
+        status: PlanStatus::Active,
+        created_at: now,
+        schedules,
+    })
+}
+
+/// 追加一条备注（同一天支持多条）。
+pub fn add_daily_note(
+    notes: &mut DailyNotes,
+    date: &str,
+    content: &str,
+) -> Result<DailyNote, String> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("备注内容不能为空。".to_string());
+    }
+    let now = now_timestamp();
+    let note = DailyNote {
+        id: format!("note_{}_{}", now, fast_rand_suffix()),
+        content: content.to_string(),
+        created_at: now,
+        updated_at: now,
+        deleted: false,
+    };
+    notes
+        .entry(date.to_string())
+        .or_default()
+        .push(note.clone());
+    Ok(note)
+}
+
+/// 标记删除一条备注，以便下一次同步将删除同步到其他设备。
+pub fn delete_daily_note(notes: &mut DailyNotes, date: &str, note_id: &str) -> bool {
+    let Some(items) = notes.get_mut(date) else {
+        return false;
+    };
+    let Some(note) = items
+        .iter_mut()
+        .find(|note| note.id == note_id && !note.deleted)
+    else {
+        return false;
+    };
+    note.deleted = true;
+    note.updated_at = now_timestamp();
+    true
+}
+
+/// 获取指定日期的可见备注，按添加顺序返回。
+pub fn get_daily_notes<'a>(notes: &'a DailyNotes, date: &str) -> Vec<&'a DailyNote> {
+    notes
+        .get(date)
+        .into_iter()
+        .flatten()
+        .filter(|note| !note.deleted)
+        .collect()
+}
+
+/// 合并远端备注；同一备注 ID 以 `updated_at` 较新的版本为准。
+pub fn merge_daily_notes(local: &mut DailyNotes, remote: DailyNotes) {
+    for (date, remote_items) in remote {
+        let local_items = local.entry(date).or_default();
+        for remote_note in remote_items {
+            match local_items
+                .iter()
+                .position(|note| note.id == remote_note.id)
+            {
+                Some(index) if remote_note.updated_at > local_items[index].updated_at => {
+                    local_items[index] = remote_note;
+                }
+                Some(_) => {}
+                None => local_items.push(remote_note),
+            }
+        }
+    }
 }
 
 /// 获取指定日期下所有活跃计划的任务（多科目聚合）。
@@ -301,7 +514,7 @@ pub fn toggle_task_checkin(
                         task.completed_at = if task.completed { Some(now) } else { None };
                         task.updated_at = now;
                         let new_state = task.completed;
-                        
+
                         // 检查计划是否全部完成
                         check_update_plan_completion(plan);
                         return Ok(new_state);
@@ -391,10 +604,7 @@ fn check_update_plan_completion(plan: &mut StudyPlan) {
 
 /// 一键顺延计划（落后补救）：
 /// 将所有未完成的任务从 `target_start_date` 开始重新连续排期（保留已打卡的历史记录不变）。
-pub fn push_forward_plan(
-    plan: &mut StudyPlan,
-    target_start_date_str: &str,
-) -> Result<(), String> {
+pub fn push_forward_plan(plan: &mut StudyPlan, target_start_date_str: &str) -> Result<(), String> {
     let target_start = parse_date_or_today(target_start_date_str);
 
     // 1. 收集已完成的任务（按原日期保留）与未完成的任务
@@ -623,8 +833,8 @@ pub struct MonthStudyStats {
 
 /// 获取某年某月的第一天和最后一天。
 pub fn get_month_range(year: i32, month: u32) -> (NaiveDate, NaiveDate) {
-    let first_day = NaiveDate::from_ymd_opt(year, month, 1)
-        .unwrap_or_else(|| Local::now().date_naive());
+    let first_day =
+        NaiveDate::from_ymd_opt(year, month, 1).unwrap_or_else(|| Local::now().date_naive());
     let next_month_first = if month == 12 {
         NaiveDate::from_ymd_opt(year + 1, 1, 1)
     } else {
@@ -714,11 +924,7 @@ pub fn generate_month_calendar_matrix(
 }
 
 /// 计算当月学习汇总统计。
-pub fn compute_month_study_stats(
-    year: i32,
-    month: u32,
-    plans: &[StudyPlan],
-) -> MonthStudyStats {
+pub fn compute_month_study_stats(year: i32, month: u32, plans: &[StudyPlan]) -> MonthStudyStats {
     let (first_day, last_day) = get_month_range(year, month);
     let mut total_dur = 0;
     let mut done_dur = 0;
@@ -833,6 +1039,27 @@ mod tests {
         assert_eq!(plan.schedules.len(), 2);
         assert_eq!(plan.schedules[0].tasks.len(), 2);
         assert_eq!(plan.schedules[1].tasks.len(), 2);
+    }
+
+    #[test]
+    fn custom_plan_uses_existing_daily_schedule_model() {
+        let plan = create_custom_study_plan("背单词", "2026-08-28", 2, 30, true).unwrap();
+        assert_eq!(plan.source_type, "custom");
+        assert_eq!(plan.total_duration, 3_600);
+        assert_eq!(plan.schedules.len(), 4); // 周六、周日作为休息日保留
+        assert_eq!(plan.schedules[0].date, "2026-08-28");
+        assert_eq!(plan.schedules[3].date, "2026-08-31");
+        assert_eq!(plan.schedules[3].tasks[0].portion, 1_800);
+    }
+
+    #[test]
+    fn daily_notes_support_multiple_items_and_tombstones() {
+        let mut notes = DailyNotes::new();
+        let first = add_daily_note(&mut notes, "2026-09-03", "完成练习").unwrap();
+        let _second = add_daily_note(&mut notes, "2026-09-03", "整理错题").unwrap();
+        assert_eq!(get_daily_notes(&notes, "2026-09-03").len(), 2);
+        assert!(delete_daily_note(&mut notes, "2026-09-03", &first.id));
+        assert_eq!(get_daily_notes(&notes, "2026-09-03").len(), 1);
     }
 
     #[test]
@@ -982,7 +1209,11 @@ mod tests {
         push_forward_plan(&mut plan, "2026-08-30").unwrap();
 
         // 8月30日应当既包含已完成的任务0，也包含未完成的任务1
-        let sch_today = plan.schedules.iter().find(|s| s.date == "2026-08-30").unwrap();
+        let sch_today = plan
+            .schedules
+            .iter()
+            .find(|s| s.date == "2026-08-30")
+            .unwrap();
         assert_eq!(sch_today.tasks.len(), 2);
         assert!(sch_today.tasks[0].completed);
         assert!(!sch_today.tasks[1].completed);

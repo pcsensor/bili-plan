@@ -5,7 +5,9 @@
 //! 计划算法在 `plan`/`export` 模块，本模块只做纯函数编排，供任意 UI 层
 //! （gpui-component）驱动。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::api;
 use crate::export;
@@ -73,7 +75,7 @@ pub struct HistoryEntry {
     pub at: i64,
 }
 
-use crate::study::{self, PlanStatus, StudyPlan};
+use crate::study::{self, DailyNote, DailyNotes, PlanStatus, StudyPlan};
 
 fn default_sync_server_url() -> String {
     "https://plan.pcsensor.cloud".to_string()
@@ -83,10 +85,26 @@ fn default_auto_sync() -> bool {
     true
 }
 
-/// 持久化到本机的应用配置（JSON 文件，家目录下）。
+/// 生成桌面端的稳定设备标识，避免自动同步在尚未绑定机器人时写入空 Token。
+fn new_sync_device_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut first = RandomState::new().build_hasher();
+    first.write_u128(now);
+    let mut second = RandomState::new().build_hasher();
+    second.write_u128(now.rotate_left(17));
+    format!("desktop_{:016x}{:016x}", first.finish(), second.finish())
+}
+
+/// 持久化到本机 SQLite 的应用配置。
 ///
-/// 字段保持扁平：旧版本文件只有 `server_url`/`token` 两个键，
-/// `history` 和 `plans` 缺省为空即可读入，避免升级丢数据。
+/// 字段保持兼容：旧版 JSON 文件只有 `server_url`/`token` 两个键时仍可导入，
+/// 缺省的历史、计划和备注会以空集合恢复，避免升级丢数据。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -97,8 +115,8 @@ pub struct AppConfig {
     pub history: Vec<HistoryEntry>,
     #[serde(default)]
     pub plans: Vec<StudyPlan>,
-    #[serde(default)]
-    pub daily_notes: std::collections::HashMap<String, String>, // "YYYY-MM-DD" -> 备注内容
+    #[serde(default, deserialize_with = "study::deserialize_daily_notes")]
+    pub daily_notes: DailyNotes, // "YYYY-MM-DD" -> 多条备注（含同步删除标记）
     #[serde(default = "default_sync_server_url")]
     pub sync_server_url: String,
     #[serde(default)]
@@ -122,7 +140,7 @@ impl Default for AppConfig {
             token: String::new(),
             history: Vec::new(),
             plans: Vec::new(),
-            daily_notes: std::collections::HashMap::new(),
+            daily_notes: DailyNotes::new(),
             sync_server_url: default_sync_server_url(),
             sync_device_token: None,
             feishu_bound: false,
@@ -367,24 +385,205 @@ pub fn sanitize(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Jellyfin 凭证持久化（0 新依赖：家目录 + serde_json）
+// 本地 SQLite 持久化
 // ---------------------------------------------------------------------------
 
-/// 配置文件路径：用户家目录下 `.bili-planner.json`（比工作目录稳定，
-/// 不同启动目录都能读到）。Windows 取 `%USERPROFILE%`，Unix 取 `$HOME`。
-fn config_path() -> Option<PathBuf> {
+/// 本机数据库路径：用户家目录下 `.bili-planner.sqlite3`。
+/// 旧版 JSON 路径仅用于一次性迁移，迁移后不再作为运行时数据源。
+fn config_db_path() -> Option<PathBuf> {
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var(key).ok()?;
+    Some(PathBuf::from(home).join(".bili-planner.sqlite3"))
+}
+
+fn legacy_config_path() -> Option<PathBuf> {
     let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let home = std::env::var(key).ok()?;
     Some(PathBuf::from(home).join(".bili-planner.json"))
 }
 
-/// 启动时尝试加载本机配置（Jellyfin 凭证 + 搜索历史）；
-/// 文件不存在或损坏时静默返回 `None`。
+/// 本地数据库表。配置标量、历史、计划、备注分表保存，计划和备注保留其
+/// serde JSON 数据契约，避免 UI 领域模型与存储模式耦合。
+struct LocalConfigStore;
+
+impl LocalConfigStore {
+    fn open(path: &Path) -> rusqlite::Result<Connection> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(3))?;
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS app_meta (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS history (
+                position INTEGER PRIMARY KEY,
+                input TEXT NOT NULL,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS plans (
+                plan_id TEXT PRIMARY KEY,
+                position INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS daily_notes (
+                date TEXT NOT NULL,
+                note_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY(date, note_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_daily_notes_date_position
+                ON daily_notes(date, position);
+            ",
+        )?;
+        Ok(conn)
+    }
+
+    fn metadata(cfg: &AppConfig) -> AppConfig {
+        let mut metadata = cfg.clone();
+        metadata.history.clear();
+        metadata.plans.clear();
+        metadata.daily_notes.clear();
+        metadata
+    }
+
+    fn write_history(tx: &Transaction<'_>, history: &[HistoryEntry]) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM history", [])?;
+        for (position, entry) in history.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO history(position, input, source, title, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![position as i64, entry.input, entry.source, entry.title, entry.at],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write_plans(tx: &Transaction<'_>, plans: &[StudyPlan]) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM plans", [])?;
+        for (position, plan) in plans.iter().enumerate() {
+            let payload = serde_json::to_string(plan).unwrap_or_else(|_| "{}".to_string());
+            tx.execute(
+                "INSERT INTO plans(plan_id, position, payload_json) VALUES (?1, ?2, ?3)",
+                params![plan.id, position as i64, payload],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write_notes(tx: &Transaction<'_>, notes: &DailyNotes) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM daily_notes", [])?;
+        for (date, entries) in notes {
+            for (position, note) in entries.iter().enumerate() {
+                let payload = serde_json::to_string(note).unwrap_or_else(|_| "{}".to_string());
+                tx.execute(
+                    "INSERT INTO daily_notes(date, note_id, position, payload_json) VALUES (?1, ?2, ?3, ?4)",
+                    params![date, note.id, position as i64, payload],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn save(path: &Path, cfg: &AppConfig) -> rusqlite::Result<()> {
+        let mut conn = Self::open(path)?;
+        let tx = conn.transaction()?;
+        let metadata =
+            serde_json::to_string(&Self::metadata(cfg)).unwrap_or_else(|_| "{}".to_string());
+        tx.execute(
+            "INSERT INTO app_meta(id, payload_json) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json",
+            [metadata],
+        )?;
+        Self::write_history(&tx, &cfg.history)?;
+        Self::write_plans(&tx, &cfg.plans)?;
+        Self::write_notes(&tx, &cfg.daily_notes)?;
+        tx.commit()
+    }
+
+    fn load(path: &Path) -> Option<AppConfig> {
+        let conn = Self::open(path).ok()?;
+        let metadata: String = conn
+            .query_row(
+                "SELECT payload_json FROM app_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()??;
+        let mut cfg: AppConfig = serde_json::from_str(&metadata).ok()?;
+
+        let mut history = Vec::new();
+        let mut history_statement = conn
+            .prepare("SELECT input, source, title, at FROM history ORDER BY position ASC")
+            .ok()?;
+        let rows = history_statement
+            .query_map([], |row| {
+                Ok(HistoryEntry {
+                    input: row.get(0)?,
+                    source: row.get(1)?,
+                    title: row.get(2)?,
+                    at: row.get(3)?,
+                })
+            })
+            .ok()?;
+        history.extend(rows.filter_map(Result::ok));
+        cfg.history = history;
+
+        let mut plans = Vec::new();
+        let mut plans_statement = conn
+            .prepare("SELECT payload_json FROM plans ORDER BY position ASC")
+            .ok()?;
+        let rows = plans_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .ok()?;
+        plans.extend(
+            rows.filter_map(Result::ok)
+                .filter_map(|payload| serde_json::from_str(&payload).ok()),
+        );
+        cfg.plans = plans;
+
+        let mut notes = DailyNotes::new();
+        let mut notes_statement = conn
+            .prepare("SELECT date, payload_json FROM daily_notes ORDER BY date ASC, position ASC")
+            .ok()?;
+        let rows = notes_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok()?;
+        for row in rows.filter_map(Result::ok) {
+            if let Ok(note) = serde_json::from_str::<DailyNote>(&row.1) {
+                notes.entry(row.0).or_default().push(note);
+            }
+        }
+        cfg.daily_notes = notes;
+        Some(cfg)
+    }
+}
+
+/// 加载给定路径的 SQLite；数据库不存在或尚未初始化时导入旧 JSON。
+fn load_config_at(db_path: &Path, legacy_path: &Path) -> Option<AppConfig> {
+    if db_path.exists() {
+        if let Some(config) = LocalConfigStore::load(db_path) {
+            return Some(config);
+        }
+    }
+
+    let legacy_data = std::fs::read_to_string(legacy_path).ok()?;
+    let config: AppConfig = serde_json::from_str(&legacy_data).ok()?;
+    LocalConfigStore::save(db_path, &config).ok()?;
+    Some(config)
+}
+
+/// 启动时加载 SQLite。本地尚未迁移时，导入旧 JSON 并保留原文件为备份。
 pub fn load_config() -> Option<AppConfig> {
-    let path = config_path()?;
-    let data = std::fs::read_to_string(&path).ok()?;
-    let cfg: AppConfig = serde_json::from_str(&data).ok()?;
-    Some(cfg)
+    let db_path = config_db_path()?;
+    let legacy_path = legacy_config_path()?;
+    load_config_at(&db_path, &legacy_path)
 }
 
 /// 把已生成的计划保存到打卡学习计划库。
@@ -418,6 +617,22 @@ pub fn enroll_study_plan(
     cfg.plans.insert(0, study_plan.clone());
     save_config(cfg);
     Ok(study_plan)
+}
+
+/// 新建一个自定义的每日学习任务并写入计划库。
+pub fn add_custom_study_plan(
+    cfg: &mut AppConfig,
+    title: &str,
+    start_date: &str,
+    days: i64,
+    daily_minutes: i64,
+    skip_weekends: bool,
+) -> Result<StudyPlan, String> {
+    let plan =
+        study::create_custom_study_plan(title, start_date, days, daily_minutes, skip_weekends)?;
+    cfg.plans.insert(0, plan.clone());
+    save_config(cfg);
+    Ok(plan)
 }
 
 /// 删除指定计划。
@@ -490,8 +705,8 @@ pub fn request_cloud_bind_code(cfg: &mut AppConfig) -> Result<(String, u64), Str
         .read_to_string()
         .map_err(|e| format!("读取云端响应失败: {}", e))?;
 
-    let data: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("解析云端响应失败: {}", e))?;
+    let data: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析云端响应失败: {}", e))?;
 
     let code = data["bind_code"]
         .as_str()
@@ -535,12 +750,14 @@ pub fn check_cloud_bind_status(cfg: &mut AppConfig) -> Result<bool, String> {
         .read_to_string()
         .map_err(|e| format!("读取响应失败: {}", e))?;
 
-    let data: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("解析响应失败: {}", e))?;
+    let data: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析响应失败: {}", e))?;
 
     let bound = data["bound"].as_bool().unwrap_or(false);
     cfg.feishu_bound = bound;
     cfg.feishu_user_name = data["feishu_user_name"].as_str().map(|s| s.to_string());
+    cfg.telegram_bound = data["telegram_bound"].as_bool().unwrap_or(false);
+    cfg.telegram_user_name = data["telegram_user_name"].as_str().map(|s| s.to_string());
     save_config(cfg);
 
     Ok(bound)
@@ -549,11 +766,20 @@ pub fn check_cloud_bind_status(cfg: &mut AppConfig) -> Result<bool, String> {
 /// 执行双向增量同步。
 pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
     let server = cfg.sync_server_url.trim_end_matches('/');
-    let token = cfg.sync_device_token.clone().unwrap_or_default();
+    let token = cfg
+        .sync_device_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+        .unwrap_or_else(|| {
+            let token = new_sync_device_token();
+            cfg.sync_device_token = Some(token.clone());
+            token
+        });
 
     let body = serde_json::json!({
         "device_token": token,
-        "plans": cfg.plans
+        "plans": cfg.plans,
+        "daily_notes": cfg.daily_notes
     });
     let url = format!("{}/api/sync", server);
     let payload = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
@@ -574,8 +800,8 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
         .read_to_string()
         .map_err(|e| format!("读取同步响应失败: {}", e))?;
 
-    let data: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("解析同步响应失败: {}", e))?;
+    let data: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析同步响应失败: {}", e))?;
 
     if let Some(plans_val) = data.get("plans") {
         if let Ok(merged_plans) = serde_json::from_value::<Vec<StudyPlan>>(plans_val.clone()) {
@@ -590,8 +816,10 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
 
                 for plan in &mut cfg.plans {
                     if let Some(rp) = remote_map.get(&plan.id) {
-                        let mut remote_tasks: std::collections::HashMap<&str, &crate::study::TaskItem> =
-                            std::collections::HashMap::new();
+                        let mut remote_tasks: std::collections::HashMap<
+                            &str,
+                            &crate::study::TaskItem,
+                        > = std::collections::HashMap::new();
                         for sch in &rp.schedules {
                             for t in &sch.tasks {
                                 remote_tasks.insert(t.id.as_str(), t);
@@ -615,6 +843,12 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
         }
     }
 
+    if let Some(notes_val) = data.get("daily_notes") {
+        if let Ok(remote_notes) = serde_json::from_value::<DailyNotes>(notes_val.clone()) {
+            study::merge_daily_notes(&mut cfg.daily_notes, remote_notes);
+        }
+    }
+
     if let Some(bound) = data.get("feishu_bound").and_then(|b| b.as_bool()) {
         cfg.feishu_bound = bound;
     }
@@ -632,31 +866,35 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
     Ok("云端同步完成！".to_string())
 }
 
-/// 设置并持久化某日期的学习备注。若 note 为空则删除对应日期的备注。
-pub fn set_daily_note(cfg: &mut AppConfig, date_str: &str, note: &str) {
-    let t = note.trim();
-    if t.is_empty() {
-        cfg.daily_notes.remove(date_str);
-    } else {
-        cfg.daily_notes.insert(date_str.to_string(), t.to_string());
-    }
+/// 追加并持久化某日期的一条学习备注。
+pub fn add_daily_note(
+    cfg: &mut AppConfig,
+    date_str: &str,
+    note: &str,
+) -> Result<DailyNote, String> {
+    let item = study::add_daily_note(&mut cfg.daily_notes, date_str, note)?;
     save_config(cfg);
+    Ok(item)
 }
 
-/// 读取某日期的学习备注。
-pub fn get_daily_note<'a>(cfg: &'a AppConfig, date_str: &str) -> Option<&'a str> {
-    cfg.daily_notes.get(date_str).map(|s| s.as_str())
-}
-
-/// 把应用配置写到本机（原子写入 pretty JSON）。失败静默：不阻塞主流程。
-pub fn save_config(cfg: &AppConfig) {
-    let Some(path) = config_path() else { return };
-    if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        let tmp_path = path.with_extension("tmp");
-        if std::fs::write(&tmp_path, json).is_ok() {
-            let _ = std::fs::rename(&tmp_path, &path);
-        }
+/// 删除一条学习备注并保留同步删除标记。
+pub fn delete_daily_note(cfg: &mut AppConfig, date_str: &str, note_id: &str) -> bool {
+    let deleted = study::delete_daily_note(&mut cfg.daily_notes, date_str, note_id);
+    if deleted {
+        save_config(cfg);
     }
+    deleted
+}
+
+/// 读取某日期可见的全部学习备注。
+pub fn get_daily_notes<'a>(cfg: &'a AppConfig, date_str: &str) -> Vec<&'a DailyNote> {
+    study::get_daily_notes(&cfg.daily_notes, date_str)
+}
+
+/// 把应用配置原子写入本地 SQLite。失败静默：不阻塞主流程。
+pub fn save_config(cfg: &AppConfig) {
+    let Some(path) = config_db_path() else { return };
+    let _ = LocalConfigStore::save(&path, cfg);
 }
 
 #[cfg(test)]
@@ -759,5 +997,63 @@ mod tests {
 
         let parsed_false: AppConfig = serde_json::from_str(r#"{"auto_sync": false}"#).unwrap();
         assert!(!parsed_false.auto_sync);
+    }
+
+    #[test]
+    fn daily_notes_migrate_from_legacy_single_string_format() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"daily_notes":{"2026-09-03":"旧版单条备注"}}"#).unwrap();
+        let notes = get_daily_notes(&cfg, "2026-09-03");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content, "旧版单条备注");
+    }
+
+    #[test]
+    fn local_sqlite_roundtrip_keeps_all_desktop_data() {
+        let dir = std::env::temp_dir().join(format!("bili_planner_local_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("config.sqlite3");
+        let mut cfg = AppConfig {
+            server_url: "https://media.example.com".to_string(),
+            token: "jf-token".to_string(),
+            ..Default::default()
+        };
+        record_history(&mut cfg, SourceMode::Bilibili, "BV1test", "测试合集");
+        cfg.plans
+            .push(study::create_custom_study_plan("背单词", "2026-09-03", 2, 30, false).unwrap());
+        study::add_daily_note(&mut cfg.daily_notes, "2026-09-03", "完成第一组单词").unwrap();
+
+        LocalConfigStore::save(&db_path, &cfg).unwrap();
+        let loaded = LocalConfigStore::load(&db_path).unwrap();
+        assert_eq!(loaded.server_url, cfg.server_url);
+        assert_eq!(loaded.history, cfg.history);
+        assert_eq!(loaded.plans, cfg.plans);
+        assert_eq!(
+            study::get_daily_notes(&loaded.daily_notes, "2026-09-03").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn local_json_is_imported_to_sqlite_and_kept_as_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("bili_planner_migration_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("config.sqlite3");
+        let json_path = dir.join("legacy.json");
+        let cfg = AppConfig {
+            sync_device_token: Some("device-token".to_string()),
+            ..Default::default()
+        };
+        std::fs::write(&json_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+
+        let imported = load_config_at(&db_path, &json_path).unwrap();
+        assert_eq!(imported.sync_device_token, cfg.sync_device_token);
+        assert!(db_path.exists());
+        assert!(json_path.exists());
+        assert_eq!(
+            LocalConfigStore::load(&db_path).unwrap().sync_device_token,
+            cfg.sync_device_token
+        );
     }
 }

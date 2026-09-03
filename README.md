@@ -60,7 +60,7 @@
 ### 1. 准备工作：创建飞书自建应用
 
 1. 登录 [飞书开放平台开发者后台](https://open.feishu.cn/app) 并创建“企业自建应用”。
-2. **获取凭据**：在 **“凭证与基础信息”** 页面获取 `App ID` 和 `App Secret`。
+2. **获取凭据**：在 **“凭证与基础信息”** 页面获取 `App ID` 和 `App Secret`；在 **“事件订阅”** 中设置并保存 `Verification Token`，作为服务器的 `FEISHU_VERIFICATION_TOKEN`。服务会校验它以拒绝伪造回调。
 3. **添加机器人能力**：在 **“添加应用能力”** 中开启 **“机器人”**。
 4. **配置权限**：在 **“权限管理”** 中开通以下权限：
    - `im:message`（获取与发送单聊/群聊消息）
@@ -87,6 +87,7 @@ cd /opt/bili-plan-server
 PORT=3005
 FEISHU_APP_ID=cli_xxxxxxxxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+FEISHU_VERIFICATION_TOKEN=xxxxxxxxxxxxxxxx
 DATA_DIR=/app/data
 ```
 
@@ -100,6 +101,8 @@ docker compose up -d --build
 # 查看运行日志与健康状态
 docker compose logs -f
 ```
+
+服务端会在 `DATA_DIR` 创建 SQLite 数据库 `store.sqlite3`（启用 WAL）。升级前若该目录中存在旧版 `store.json`，首次启动会自动导入，原文件保留为备份。
 
 ---
 
@@ -185,11 +188,15 @@ cargo run --release
 ### 2. 绑定云端服务与飞书机器人
 1. 打开桌面端应用，在左侧导航栏点击 **“云端同步” / “飞书机器人”**。
 2. 填入您的云服务地址（如 `https://plan.yourdomain.com`）。
-3. 点击 **“生成绑定码”**，界面将显示一个 6 位数字绑定码（5 分钟有效）。
-4. 在飞书中打开自建机器人单聊，发送这 6 位数字。
+3. 点击 **“生成绑定码”**，界面将显示一个 6 位数字绑定码（10 分钟有效）。
+4. 在飞书中打开自建机器人单聊，发送 `/bind <这 6 位数字>`。
 5. 桌面端自动提示绑定成功，之后每次本地排期或打卡均会自动同步到飞书！
 
-### 3. 应用打包
+### 3. 本地数据存储
+
+桌面端在用户家目录保存 SQLite 数据库：`~/.bili-planner.sqlite3`。其中包含 Jellyfin 凭证、搜索历史、学习计划、自定义任务、日历备注与云同步设备标识。旧版本的 `~/.bili-planner.json` 会在首次启动新版时自动导入，且原文件保留为备份。
+
+### 4. 应用打包
 
 #### macOS (.app / .dmg)
 项目提供了一键原生 DMG 打包脚本：

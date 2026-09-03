@@ -171,10 +171,15 @@ pub fn build_today_study_card(plans: &[StudyPlan], target_date: &str) -> Value {
                     pt.plan.source_url.clone()
                 };
 
-                let item_md = if is_done {
-                    format!("✅ ~~(P{}) {} (已学 {})~~ [🔗直达]({})", vno, task.title, dur_str, video_link)
+                let link_suffix = if !video_link.trim().is_empty() {
+                    format!(" [🔗直达]({})", video_link)
                 } else {
-                    format!("⬜ **(P{}) {}** (⏱️ {}) [🔗直达]({})", vno, task.title, dur_str, video_link)
+                    String::new()
+                };
+                let item_md = if is_done {
+                    format!("✅ ~~(P{}) {} (已学 {})~~{}", vno, task.title, dur_str, link_suffix)
+                } else {
+                    format!("⬜ **(P{}) {}** (⏱️ {}){}", vno, task.title, dur_str, link_suffix)
                 };
 
                 let btn_text = if is_done { "已打卡" } else { "打卡" };

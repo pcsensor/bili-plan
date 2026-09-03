@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// 计划状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -10,6 +11,7 @@ pub enum PlanStatus {
     Archived,
 }
 
+#[allow(dead_code)]
 impl PlanStatus {
     pub fn label(&self) -> &'static str {
         match self {
@@ -68,6 +70,20 @@ pub struct StudyPlan {
     pub schedules: Vec<DailySchedule>,
 }
 
+/// 可跨端同步的单条日历备注。`deleted` 是删除同步用的 tombstone。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DailyNote {
+    pub id: String,
+    pub content: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+pub type DailyNotes = HashMap<String, Vec<DailyNote>>;
+
 /// 绑定的设备用户。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeviceUser {
@@ -108,6 +124,8 @@ pub struct BindStatusResponse {
 pub struct SyncPayload {
     pub device_token: String,
     pub plans: Vec<StudyPlan>,
+    #[serde(default)]
+    pub daily_notes: DailyNotes,
 }
 
 /// 同步响应载荷。
@@ -115,6 +133,8 @@ pub struct SyncPayload {
 pub struct SyncResponse {
     pub success: bool,
     pub plans: Vec<StudyPlan>,
+    #[serde(default)]
+    pub daily_notes: DailyNotes,
     pub feishu_bound: bool,
     pub feishu_user_name: Option<String>,
     #[serde(default)]
