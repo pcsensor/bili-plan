@@ -635,6 +635,89 @@ pub fn add_custom_study_plan(
     Ok(plan)
 }
 
+/// 从日历添加一次性任务：参与当天打卡和统计，但不展示在“我的计划库”。
+pub fn add_one_off_calendar_task(
+    cfg: &mut AppConfig,
+    task_title: &str,
+    date: &str,
+    minutes: i64,
+) -> Result<StudyPlan, String> {
+    let plan = study::create_one_off_calendar_task(task_title, date, minutes)?;
+    cfg.plans.insert(0, plan.clone());
+    save_config(cfg);
+    Ok(plan)
+}
+
+/// 从日历创建可持续追加每日任务的系列计划。系列计划显示在“我的计划库”。
+pub fn create_calendar_series_plan(
+    cfg: &mut AppConfig,
+    series_name: &str,
+    task_title: &str,
+    date: &str,
+    minutes: i64,
+) -> Result<StudyPlan, String> {
+    let plan = study::create_calendar_series(series_name, task_title, date, minutes)?;
+    cfg.plans.insert(0, plan.clone());
+    save_config(cfg);
+    Ok(plan)
+}
+
+/// 向已有系列计划追加一个指定日期的日任务，并自动更新其起止日期与汇总。
+pub fn append_calendar_series_task(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    task_title: &str,
+    date: &str,
+    minutes: i64,
+) -> Result<(), String> {
+    let plan = cfg
+        .plans
+        .iter_mut()
+        .find(|plan| plan.id == plan_id)
+        .ok_or_else(|| "未找到指定的系列计划。".to_string())?;
+    study::append_calendar_series_task(plan, task_title, date, minutes)?;
+    save_config(cfg);
+    Ok(())
+}
+
+/// 编辑右键日历创建的任务。
+pub fn update_calendar_task(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    task_id: &str,
+    task_title: &str,
+    date: &str,
+    minutes: i64,
+) -> Result<(), String> {
+    let plan = cfg
+        .plans
+        .iter_mut()
+        .find(|plan| plan.id == plan_id)
+        .ok_or_else(|| "未找到指定任务所属计划。".to_string())?;
+    study::update_calendar_task(plan, task_id, task_title, date, minutes)?;
+    save_config(cfg);
+    Ok(())
+}
+
+/// 删除右键日历创建的任务；删除系列的最后一项时会同时移除空系列计划。
+pub fn delete_calendar_task(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<(), String> {
+    let plan_index = cfg
+        .plans
+        .iter()
+        .position(|plan| plan.id == plan_id)
+        .ok_or_else(|| "未找到指定任务所属计划。".to_string())?;
+    let remove_plan = study::delete_calendar_task(&mut cfg.plans[plan_index], task_id)?;
+    if remove_plan {
+        cfg.plans.remove(plan_index);
+    }
+    save_config(cfg);
+    Ok(())
+}
+
 /// 删除指定计划。
 pub fn remove_study_plan(cfg: &mut AppConfig, plan_id: &str) {
     cfg.plans.retain(|p| p.id != plan_id);
@@ -668,16 +751,37 @@ pub fn checkin_study_task(
 pub fn push_forward_study_plan(
     cfg: &mut AppConfig,
     plan_id: &str,
-    target_start_date: &str,
-) -> Result<(), String> {
+    destination_date: &str,
+) -> Result<bool, String> {
     let plan = cfg
         .plans
         .iter_mut()
         .find(|p| p.id == plan_id)
         .ok_or_else(|| "未找到指定计划".to_string())?;
-    study::push_forward_plan(plan, target_start_date)?;
-    save_config(cfg);
-    Ok(())
+    let changed = study::push_forward_plan(plan, destination_date)?;
+    if changed {
+        save_config(cfg);
+    }
+    Ok(changed)
+}
+
+/// 将某个未来日期已经打卡的任务划归今天，并按整日/部分完成规则更新后续排期。
+pub fn advance_completed_study_tasks(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    future_date: &str,
+    today: &str,
+) -> Result<usize, String> {
+    let plan = cfg
+        .plans
+        .iter_mut()
+        .find(|plan| plan.id == plan_id)
+        .ok_or_else(|| "未找到指定计划".to_string())?;
+    let moved = study::advance_completed_tasks(plan, future_date, today)?;
+    if moved > 0 {
+        save_config(cfg);
+    }
+    Ok(moved)
 }
 
 /// 请求云端 6 位绑定验证码。
@@ -833,6 +937,7 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
                                         t.completed = rt.completed;
                                         t.completed_at = rt.completed_at;
                                         t.updated_at = rt.updated_at;
+                                        t.advanced_from_date = rt.advanced_from_date.clone();
                                     }
                                 }
                             }
@@ -848,6 +953,8 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
             study::merge_daily_notes(&mut cfg.daily_notes, remote_notes);
         }
     }
+
+    study::restore_cancelled_advanced_tasks(&mut cfg.plans);
 
     if let Some(bound) = data.get("feishu_bound").and_then(|b| b.as_bool()) {
         cfg.feishu_bound = bound;

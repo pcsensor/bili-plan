@@ -21,7 +21,8 @@ use std::path::PathBuf;
 
 use gpui::{
     canvas, div, fill, hsla, point, prelude::*, px, size, AnimationExt, App, BoxShadow, Context,
-    Entity, Focusable, FontWeight, InteractiveElement, IntoElement, Render, Styled, Window,
+    Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, Render, Styled,
+    Window,
 };
 use gpui_component::{
     alert::Alert,
@@ -37,11 +38,14 @@ use gpui_component::{
 };
 
 use crate::core::{
-    add_custom_study_plan, add_daily_note, check_cloud_bind_status, checkin_study_task,
-    clear_history, delete_daily_note, enroll_study_plan, export_payload, generate_plan,
-    get_daily_notes, load_config, parse_days, push_forward_study_plan, record_history,
-    remove_history, remove_study_plan, request_cloud_bind_code, save_config, sync_with_cloud,
-    toggle_study_plan_status, AppConfig, FetchSource, ReadyState, Selection, SourceMode,
+    add_custom_study_plan, add_daily_note, add_one_off_calendar_task,
+    advance_completed_study_tasks, append_calendar_series_task, check_cloud_bind_status,
+    checkin_study_task, clear_history, create_calendar_series_plan, delete_calendar_task,
+    delete_daily_note, enroll_study_plan, export_payload, generate_plan, get_daily_notes,
+    load_config, parse_days, push_forward_study_plan, record_history, remove_history,
+    remove_study_plan, request_cloud_bind_code, save_config, sync_with_cloud,
+    toggle_study_plan_status, update_calendar_task, AppConfig, FetchSource, ReadyState, Selection,
+    SourceMode,
 };
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
@@ -58,6 +62,24 @@ pub enum AppTab {
     Calendar,
     PlanGenerator,
     MyPlans,
+}
+
+/// 从日历新增任务的归属。系列计划会在计划库中显示并可持续追加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CalendarTaskTarget {
+    #[default]
+    OneOff,
+    NewSeries,
+    ExistingSeries,
+}
+
+/// 从右侧任务列表传入编辑弹窗的不可变初始值。
+struct CalendarTaskEditSeed {
+    plan_id: String,
+    task_id: String,
+    title: String,
+    date: String,
+    portion: i64,
 }
 
 /// 打开外部视频链接。
@@ -136,7 +158,10 @@ fn shift_date_str(date_str: &str, delta_days: i64) -> String {
 /// 右侧计划面板宽度（生成计划后窗口向右扩展的空间）。
 const PLAN_PANEL_WIDTH: gpui::Pixels = px(640.);
 
-const CALENDAR_CELL_HEIGHT: f32 = 132.;
+// 6 行摘要（含“还有 N 项”提示）需要完整行高；148px 可避免底行被裁切。
+const CALENDAR_CELL_HEIGHT: f32 = 148.;
+/// 日期格内容区最多显示的行数；超出时最后一行改为省略提示。
+const CALENDAR_CELL_MAX_SUMMARY_LINES: usize = 6;
 /// 背景点阵的间距与点径。
 const BACKDROP_GRID_STEP: f32 = 24.;
 const BACKDROP_DOT: f32 = 2.;
@@ -428,6 +453,22 @@ pub struct PlannerApp {
     /// 学习日历面板中对选中日期的备注输入框
     calendar_note_input: Entity<InputState>,
 
+    /// 日历格右键新增任务的弹窗与表单状态。
+    calendar_task_modal_open: bool,
+    calendar_task_date: String,
+    calendar_task_title_input: Entity<InputState>,
+    calendar_task_duration_input: Entity<InputState>,
+    calendar_task_date_input: Entity<InputState>,
+    calendar_series_name_input: Entity<InputState>,
+    calendar_task_target: CalendarTaskTarget,
+    calendar_existing_series_id: Option<String>,
+    calendar_task_edit_modal_open: bool,
+    calendar_task_edit_plan_id: Option<String>,
+    calendar_task_edit_task_id: Option<String>,
+    calendar_task_edit_title_input: Entity<InputState>,
+    calendar_task_edit_duration_input: Entity<InputState>,
+    calendar_task_edit_date_input: Entity<InputState>,
+
     /// 飞书云同步相关状态
     cloud_bind_modal_open: bool,
     cloud_bind_code: Option<String>,
@@ -489,6 +530,27 @@ impl PlannerApp {
         let calendar_selected_date = today_date_str();
         let calendar_note_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("写下当天的学习总结、心得体会或重要备忘...")
+        });
+        let calendar_task_title_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("例如：完成第 3 章练习、背 50 个单词")
+        });
+        let calendar_task_duration_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("例如 45（分钟）"));
+        let calendar_task_date_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(today_date_str(), window, cx);
+            state.placeholder("YYYY-MM-DD")
+        });
+        let calendar_series_name_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("例如：英语词汇冲刺、考研数学二轮"));
+        let calendar_task_edit_title_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("任务名称"));
+        let calendar_task_edit_duration_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("分钟数"));
+        let calendar_task_edit_date_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(today_date_str(), window, cx);
+            state.placeholder("YYYY-MM-DD")
         });
 
         // 链接变化即清除上一次的错误横幅。
@@ -553,6 +615,20 @@ impl PlannerApp {
             calendar_month,
             calendar_selected_date,
             calendar_note_input,
+            calendar_task_modal_open: false,
+            calendar_task_date: today_date_str(),
+            calendar_task_title_input,
+            calendar_task_duration_input,
+            calendar_task_date_input,
+            calendar_series_name_input,
+            calendar_task_target: CalendarTaskTarget::OneOff,
+            calendar_existing_series_id: None,
+            calendar_task_edit_modal_open: false,
+            calendar_task_edit_plan_id: None,
+            calendar_task_edit_task_id: None,
+            calendar_task_edit_title_input,
+            calendar_task_edit_duration_input,
+            calendar_task_edit_date_input,
             source: SourceMode::Bilibili,
             mode: Mode::Split,
             phase: Phase::Input,
@@ -1102,31 +1178,80 @@ impl PlannerApp {
         cx.notify();
     }
 
-    /// 针对所有进行中的计划执行一键落后顺延。
+    /// 将所有进行中计划在上一个学习日未完成的任务分别顺延到今天。
     fn push_forward_all_behind_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let today = today_date_str();
         let plan_ids: Vec<String> = self
             .config
             .plans
             .iter()
-            .filter(|p| p.status == PlanStatus::Active)
+            // 一次性日历任务固定在用户指定日期，不应被“落后顺延”自动改期。
+            .filter(|p| p.status == PlanStatus::Active && p.show_in_library)
             .map(|p| p.id.clone())
             .collect();
 
         let mut count = 0;
         for id in plan_ids {
-            if push_forward_study_plan(&mut self.config, &id, &today).is_ok() {
+            if push_forward_study_plan(&mut self.config, &id, &today).unwrap_or(false) {
                 count += 1;
             }
         }
         if count > 0 {
             window.push_notification(
-                Notification::success(format!("已成功为 {count} 门科目的未完成任务顺延至今日！")),
+                Notification::success(format!(
+                    "已将 {count} 门科目上个学习日未完成的任务顺延到今天！"
+                )),
                 cx,
             );
             self.trigger_auto_sync(window, cx);
         } else {
-            window.push_notification(Notification::info("暂无需要顺延的落后计划"), cx);
+            window.push_notification(Notification::info("暂无需要顺延到今天的未完成计划"), cx);
+        }
+        cx.notify();
+    }
+
+    /// 将当前选中的未来日期里已打卡的条目划归今天。
+    fn advance_completed_tasks_action(
+        &mut self,
+        future_date: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let today = today_date_str();
+        if future_date <= today.as_str() {
+            window.push_notification(Notification::info("请选择今天之后的日期。"), cx);
+            return;
+        }
+        let plan_ids: Vec<String> = self
+            .config
+            .plans
+            .iter()
+            .filter(|plan| matches!(plan.status, PlanStatus::Active | PlanStatus::Completed))
+            .map(|plan| plan.id.clone())
+            .collect();
+        let mut moved_tasks = 0usize;
+        let mut affected_plans = 0usize;
+        for plan_id in plan_ids {
+            let moved =
+                advance_completed_study_tasks(&mut self.config, &plan_id, future_date, &today)
+                    .unwrap_or(0);
+            if moved > 0 {
+                moved_tasks += moved;
+                affected_plans += 1;
+            }
+        }
+        if moved_tasks > 0 {
+            window.push_notification(
+                Notification::success(format!(
+                    "已将 {affected_plans} 个计划中的 {moved_tasks} 项已完成任务提前到今天。"
+                )),
+                cx,
+            );
+            self.selected_date = today.clone();
+            self.calendar_selected_date = today;
+            self.trigger_auto_sync(window, cx);
+        } else {
+            window.push_notification(Notification::info("所选未来日期没有已打卡任务。"), cx);
         }
         cx.notify();
     }
@@ -1160,11 +1285,17 @@ impl PlannerApp {
     ) {
         let today = today_date_str();
         match push_forward_study_plan(&mut self.config, plan_id, &today) {
-            Ok(()) => {
-                window
-                    .push_notification(Notification::success("已顺延本科目未完成任务至今日！"), cx);
+            Ok(true) => {
+                window.push_notification(
+                    Notification::success("已将本科目上个学习日未完成任务顺延到今天。"),
+                    cx,
+                );
                 self.trigger_auto_sync(window, cx);
             }
+            Ok(false) => window.push_notification(
+                Notification::info("本科目上个学习日没有需要顺延的未完成任务。"),
+                cx,
+            ),
             Err(e) => {
                 window.push_notification(Notification::error(e), cx);
             }
@@ -1270,10 +1401,164 @@ impl PlannerApp {
         cx.notify();
     }
 
+    /// 打开指定日期的右键新增学习计划弹窗。
+    fn open_calendar_task_modal_action(
+        &mut self,
+        date: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.calendar_selected_date = date.to_string();
+        self.calendar_task_date = date.to_string();
+        let date_for_input = date.to_string();
+        self.calendar_task_target = CalendarTaskTarget::OneOff;
+        self.calendar_existing_series_id = None;
+        self.calendar_task_title_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.calendar_task_duration_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.calendar_task_date_input
+            .update(cx, |state, cx| state.set_value(date_for_input, window, cx));
+        self.calendar_series_name_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.calendar_task_modal_open = true;
+        cx.notify();
+    }
+
+    /// 按选中的归属创建或追加日历任务。
+    fn save_calendar_task_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.input_value(&self.calendar_task_title_input, cx);
+        let minutes_text = self.input_value(&self.calendar_task_duration_input, cx);
+        let minutes = match minutes_text.trim().parse::<i64>() {
+            Ok(minutes) if minutes > 0 => minutes,
+            _ => {
+                window.push_notification(Notification::warning("任务时长必须是正整数分钟。"), cx);
+                return;
+            }
+        };
+        let date = self.input_value(&self.calendar_task_date_input, cx);
+        let date = date.trim().to_string();
+        if chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+            window.push_notification(Notification::warning("计划日期格式应为 YYYY-MM-DD。"), cx);
+            return;
+        }
+        self.calendar_task_date = date.clone();
+        let result = match self.calendar_task_target {
+            CalendarTaskTarget::OneOff => {
+                add_one_off_calendar_task(&mut self.config, &title, &date, minutes)
+                    .map(|plan| format!("已添加 {date} 的单日任务《{}》", plan.title))
+            }
+            CalendarTaskTarget::NewSeries => {
+                let series_name = self.input_value(&self.calendar_series_name_input, cx);
+                create_calendar_series_plan(&mut self.config, &series_name, &title, &date, minutes)
+                    .map(|plan| format!("已创建系列计划《{}》并加入计划库", plan.title))
+            }
+            CalendarTaskTarget::ExistingSeries => {
+                let Some(plan_id) = self.calendar_existing_series_id.clone() else {
+                    window.push_notification(Notification::warning("请选择一个已有系列计划。"), cx);
+                    return;
+                };
+                let series_name = self
+                    .config
+                    .plans
+                    .iter()
+                    .find(|plan| plan.id == plan_id)
+                    .map(|plan| plan.title.clone())
+                    .unwrap_or_else(|| "系列计划".to_string());
+                append_calendar_series_task(&mut self.config, &plan_id, &title, &date, minutes)
+                    .map(|_| format!("已将任务追加到系列计划《{series_name}》"))
+            }
+        };
+
+        match result {
+            Ok(message) => {
+                self.calendar_task_modal_open = false;
+                window.push_notification(Notification::success(message), cx);
+                self.trigger_auto_sync(window, cx);
+            }
+            Err(error) => window.push_notification(Notification::error(error), cx),
+        }
+        cx.notify();
+    }
+
+    /// 打开右侧日任务的编辑弹窗（仅日历创建的任务可编辑）。
+    fn open_calendar_task_edit_modal_action(
+        &mut self,
+        seed: CalendarTaskEditSeed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.calendar_task_edit_plan_id = Some(seed.plan_id);
+        self.calendar_task_edit_task_id = Some(seed.task_id);
+        self.calendar_task_edit_title_input
+            .update(cx, |state, cx| state.set_value(seed.title, window, cx));
+        self.calendar_task_edit_duration_input
+            .update(cx, |state, cx| {
+                state.set_value((seed.portion / 60).to_string(), window, cx)
+            });
+        self.calendar_task_edit_date_input
+            .update(cx, |state, cx| state.set_value(seed.date, window, cx));
+        self.calendar_task_edit_modal_open = true;
+        cx.notify();
+    }
+
+    /// 保存已编辑的日历任务。
+    fn save_calendar_task_edit_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan_id) = self.calendar_task_edit_plan_id.clone() else {
+            return;
+        };
+        let Some(task_id) = self.calendar_task_edit_task_id.clone() else {
+            return;
+        };
+        let title = self.input_value(&self.calendar_task_edit_title_input, cx);
+        let minutes_text = self.input_value(&self.calendar_task_edit_duration_input, cx);
+        let date = self.input_value(&self.calendar_task_edit_date_input, cx);
+        let date = date.trim().to_string();
+        let minutes = match minutes_text.trim().parse::<i64>() {
+            Ok(minutes) if minutes > 0 => minutes,
+            _ => {
+                window.push_notification(Notification::warning("任务时长必须是正整数分钟。"), cx);
+                return;
+            }
+        };
+        if chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+            window.push_notification(Notification::warning("计划日期格式应为 YYYY-MM-DD。"), cx);
+            return;
+        }
+        match update_calendar_task(&mut self.config, &plan_id, &task_id, &title, &date, minutes) {
+            Ok(()) => {
+                self.calendar_task_edit_modal_open = false;
+                window.push_notification(Notification::success("已更新日历任务"), cx);
+                self.trigger_auto_sync(window, cx);
+            }
+            Err(error) => window.push_notification(Notification::error(error), cx),
+        }
+        cx.notify();
+    }
+
+    /// 删除右侧的一项日历任务。若该任务是计划最后一项，空计划会一并移除。
+    fn delete_calendar_task_action(
+        &mut self,
+        plan_id: &str,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match delete_calendar_task(&mut self.config, plan_id, task_id) {
+            Ok(()) => {
+                window.push_notification(Notification::info("已删除日历任务"), cx);
+                self.trigger_auto_sync(window, cx);
+            }
+            Err(error) => window.push_notification(Notification::error(error), cx),
+        }
+        cx.notify();
+    }
+
     /// 安全地将云端返回的最新打卡状态合并到本地正在编辑的计划中（防止覆盖本地尚未同步的最新修改）。
     fn merge_synced_plans(&mut self, remote_plans: Vec<StudyPlan>) {
         if self.config.plans.is_empty() {
             self.config.plans = remote_plans;
+            crate::study::restore_cancelled_advanced_tasks(&mut self.config.plans);
             return;
         }
 
@@ -1301,12 +1586,14 @@ impl PlannerApp {
                                 t.completed = rt.completed;
                                 t.completed_at = rt.completed_at;
                                 t.updated_at = rt.updated_at;
+                                t.advanced_from_date = rt.advanced_from_date.clone();
                             }
                         }
                     }
                 }
             }
         }
+        crate::study::restore_cancelled_advanced_tasks(&mut self.config.plans);
     }
 
     /// 触发与云服务双向增量同步（手动同步，弹窗呈现详情）。
@@ -2488,7 +2775,7 @@ impl PlannerApp {
         };
         match (&self.plan_table, &rd.plan) {
             (Some(table), _) => table_card(
-                div()
+                v_flex()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
@@ -2847,7 +3134,10 @@ impl PlannerApp {
             );
 
         // 2. 日期选择导航条
-        let is_today = self.selected_date == today_date_str();
+        let today = today_date_str();
+        let is_today = self.selected_date == today;
+        let is_future = self.selected_date > today;
+        let future_date_for_advance = self.selected_date.clone();
         let date_nav =
             bcard(cx).child(
                 h_flex()
@@ -2885,10 +3175,22 @@ impl PlannerApp {
                     .child(
                         h_flex()
                             .gap_2()
+                            .children(is_future.then(|| {
+                                Button::new("advance-completed-tasks")
+                                    .icon(Icon::empty().path("icons/clock.svg"))
+                                    .label("一键提前已完成任务")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.advance_completed_tasks_action(
+                                            &future_date_for_advance,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                            }))
                             .child(
                                 Button::new("push-forward-all")
                                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
-                                    .label("一键顺延落后计划")
+                                    .label("一键顺延上日未完成")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.push_forward_all_behind_action(window, cx);
                                     })),
@@ -3409,16 +3711,33 @@ impl PlannerApp {
                 }
 
                 let d_date = day.date.clone();
+                let right_click_date = d_date.clone();
                 let is_sel = d_date == selected_date;
                 let is_today = day.is_today;
                 let notes = get_daily_notes(&self.config, &d_date);
                 let note_count = notes.len();
                 let has_note = note_count > 0;
-                let note_previews: Vec<String> = notes
+                // 课程与备注按可用容量一起排布：尽可能展示，超过格子容量时
+                // 留一行明确告诉用户还有多少项可通过右侧详情查看。
+                let mut summary_lines: Vec<(String, bool)> = day
+                    .plan_titles
                     .iter()
-                    .take(1)
-                    .map(|note| note.content.chars().take(12).collect())
+                    .map(|title| (format!("• {title}"), false))
                     .collect();
+                summary_lines.extend(notes.iter().map(|note| {
+                    let preview: String = note.content.chars().take(18).collect();
+                    (format!("📝 {preview}"), true)
+                }));
+                let display_count = if summary_lines.len() > CALENDAR_CELL_MAX_SUMMARY_LINES {
+                    CALENDAR_CELL_MAX_SUMMARY_LINES - 1
+                } else {
+                    summary_lines.len()
+                };
+                let hidden_count = summary_lines.len().saturating_sub(display_count);
+                summary_lines.truncate(display_count);
+                if hidden_count > 0 {
+                    summary_lines.push((format!("… 还有 {hidden_count} 项"), true));
+                }
 
                 let bg_color = if is_sel {
                     theme.primary.opacity(0.18)
@@ -3457,8 +3776,8 @@ impl PlannerApp {
                     .h(px(CALENDAR_CELL_HEIGHT))
                     .p_1p5()
                     .gap_1()
-                    .flex()
-                    .flex_col()
+                    // 内容不足时摘要区贴底；新增计划或备注会追加在底部列表末尾，
+                    // 内容较多时再自然向上占用可用空间。
                     .justify_between()
                     .cursor_pointer()
                     .bg(bg_color)
@@ -3468,6 +3787,12 @@ impl PlannerApp {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_calendar_date_action(&d_date, window, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_calendar_task_modal_action(&right_click_date, window, cx);
+                        }),
+                    )
                     .child(
                         // 顶部行：左侧[日期数字 + 今日 + 备忘图标]；右上角[学习时间 + 完成进度]
                         h_flex()
@@ -3546,33 +3871,23 @@ impl PlannerApp {
                             }),
                     )
                     .child(
-                        // 底部课程和备注区：两类信息都直接在日期格中可见。
+                        // 课程和备注区：按格子容量展示多行，超出时显示省略提示。
                         v_flex().w_full().gap_0p5().children({
                             let mut items = Vec::new();
-                            // 同日两门课程都应可见；此前错误地只渲染了第一项。
-                            for t in day.plan_titles.iter().take(2) {
+                            for (line, is_meta) in &summary_lines {
                                 items.push(
                                     div()
                                         .w_full()
                                         .text_size(px(9.5))
-                                        .text_color(theme.muted_foreground)
+                                        .text_color(if *is_meta {
+                                            theme.primary
+                                        } else {
+                                            theme.muted_foreground
+                                        })
                                         .whitespace_nowrap()
                                         .overflow_hidden()
                                         .text_ellipsis()
-                                        .child(format!("• {t}"))
-                                        .into_any_element(),
-                                );
-                            }
-                            for preview in &note_previews {
-                                items.push(
-                                    div()
-                                        .w_full()
-                                        .text_size(px(9.5))
-                                        .text_color(theme.muted_foreground)
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(format!("📝 {preview}"))
+                                        .child(line.clone())
                                         .into_any_element(),
                                 );
                             }
@@ -3617,6 +3932,8 @@ impl PlannerApp {
             .sum();
         let total_day_tasks = selected_tasks.len();
         let done_day_tasks = selected_tasks.iter().filter(|t| t.task.completed).count();
+        let calendar_is_future = selected_date > today_date_str();
+        let calendar_advance_date = selected_date.clone();
 
         let day_detail_card = bcard(cx)
             .gap_2()
@@ -3630,16 +3947,33 @@ impl PlannerApp {
                             .font_weight(FontWeight::BOLD)
                             .child(format_date_with_weekday(&selected_date)),
                     )
-                    .children((selected_date == today_date_str()).then(|| {
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .bg(theme.primary)
-                            .text_color(hsla(0.0, 0.0, 0.04, 1.0))
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("🔥 今日")
-                    })),
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .children((selected_date == today_date_str()).then(|| {
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .bg(theme.primary)
+                                    .text_color(hsla(0.0, 0.0, 0.04, 1.0))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("🔥 今日")
+                            }))
+                            .children(calendar_is_future.then(|| {
+                                Button::new("calendar-advance-completed")
+                                    .small()
+                                    .primary()
+                                    .label("提前已完成任务")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.advance_completed_tasks_action(
+                                            &calendar_advance_date,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                            })),
+                    ),
             )
             .child(
                 h_flex()
@@ -3809,7 +4143,15 @@ impl PlannerApp {
                     let st = t_item.source_type.clone();
                     let su = t_item.source_url.clone();
                     let has_source_url = !su.trim().is_empty();
+                    let is_calendar_task = st == "calendar";
                     let vno = t_item.task.vid_no;
+                    let edit_pid = pid.clone();
+                    let edit_tid = tid.clone();
+                    let delete_pid = pid.clone();
+                    let delete_tid = tid.clone();
+                    let edit_title = t_item.task.title.clone();
+                    let edit_portion = t_item.task.portion;
+                    let edit_date = selected_date.clone();
 
                     task_items.push(
                         div()
@@ -3871,6 +4213,39 @@ impl PlannerApp {
                                                 open_video_link(&st, &su, vno);
                                             })
                                     }))
+                                    .children(is_calendar_task.then(|| {
+                                        Button::new(("edit-calendar-task", i))
+                                            .small()
+                                            .ghost()
+                                            .label("编辑")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_calendar_task_edit_modal_action(
+                                                    CalendarTaskEditSeed {
+                                                        plan_id: edit_pid.clone(),
+                                                        task_id: edit_tid.clone(),
+                                                        title: edit_title.clone(),
+                                                        date: edit_date.clone(),
+                                                        portion: edit_portion,
+                                                    },
+                                                    window,
+                                                    cx,
+                                                );
+                                            }))
+                                    }))
+                                    .children(is_calendar_task.then(|| {
+                                        Button::new(("delete-calendar-task", i))
+                                            .small()
+                                            .ghost()
+                                            .label("删除")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.delete_calendar_task_action(
+                                                    &delete_pid,
+                                                    &delete_tid,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }))
+                                    }))
                                     .child(
                                         Button::new(("cal-chk", i))
                                             .small()
@@ -3924,12 +4299,16 @@ impl PlannerApp {
     /// 渲染我的计划库标签页。
     fn render_my_plans_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
-        let total_plans = self.config.plans.len();
-        let active_plans = self
+        let library_plans: Vec<&StudyPlan> = self
             .config
             .plans
             .iter()
-            .filter(|p| p.status == PlanStatus::Active)
+            .filter(|plan| plan.show_in_library)
+            .collect();
+        let total_plans = library_plans.len();
+        let active_plans = library_plans
+            .iter()
+            .filter(|plan| plan.status == PlanStatus::Active)
             .count();
 
         let header = bcard(cx).child(
@@ -4076,7 +4455,7 @@ impl PlannerApp {
                 .into_any_element()
         });
 
-        let plan_cards: gpui::Div = if self.config.plans.is_empty() {
+        let plan_cards: gpui::Div = if library_plans.is_empty() {
             bcard(cx)
                 .items_center()
                 .py_12()
@@ -4110,7 +4489,7 @@ impl PlannerApp {
                 )
         } else {
             let mut cards = Vec::new();
-            for (p_idx, plan) in self.config.plans.iter().enumerate() {
+            for (p_idx, plan) in library_plans.iter().enumerate() {
                 let (done_cnt, total_cnt, done_dur, total_dur, ratio) = compute_plan_progress(plan);
                 let pid = plan.id.clone();
                 let pid_del = plan.id.clone();
@@ -4154,6 +4533,15 @@ impl PlannerApp {
                                             .bg(theme.muted)
                                             .child(plan.source_type.to_uppercase()),
                                     )
+                                    .children(plan.is_series.then(|| {
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .bg(theme.primary.opacity(0.2))
+                                            .child("系列计划")
+                                    }))
                                     .child(
                                         div()
                                             .text_size(px(11.))
@@ -4183,7 +4571,7 @@ impl PlannerApp {
                                     .child(
                                         Button::new(("push-single", p_idx))
                                             .small()
-                                            .label("🔄 顺延至今日")
+                                            .label("🔄 顺延上日未完成")
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.push_forward_single_plan_action(
                                                     &pid_push, window, cx,
@@ -4268,6 +4656,435 @@ impl PlannerApp {
             .child(entrance("anim-myplans-head", 0.0, header))
             .children(custom_task_form)
             .child(entrance("anim-myplans-cards", 0.1, plan_cards))
+            .into_any_element()
+    }
+
+    /// 编辑右侧日历任务的弹窗。
+    fn render_calendar_task_edit_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let plan_title = self
+            .calendar_task_edit_plan_id
+            .as_deref()
+            .and_then(|plan_id| self.config.plans.iter().find(|plan| plan.id == plan_id))
+            .map(|plan| plan.title.clone())
+            .unwrap_or_else(|| "日历任务".to_string());
+
+        div()
+            .id("calendar-task-edit-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(hsla(0.0, 0.0, 0.0, 0.6))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .child(
+                v_flex()
+                    .id("calendar-task-edit-modal")
+                    .w(px(560.))
+                    .bg(theme.background)
+                    .border_2()
+                    .border_color(theme.foreground)
+                    .shadow_lg()
+                    .p_6()
+                    .gap_4()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::empty()
+                                            .path("icons/scissors.svg")
+                                            .size_5()
+                                            .text_color(theme.primary),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(format!("编辑《{plan_title}》中的日历任务")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("close-calendar-task-edit")
+                                    .cursor_pointer()
+                                    .p_1()
+                                    .child(
+                                        Icon::empty()
+                                            .path("icons/square.svg")
+                                            .size_4()
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.calendar_task_edit_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(Self::field_label("任务名称", "", cx))
+                                    .child(Input::new(&self.calendar_task_edit_title_input)),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .gap_1()
+                                            .child(Self::field_label("计划日期", "YYYY-MM-DD", cx))
+                                            .child(Input::new(&self.calendar_task_edit_date_input)),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .gap_1()
+                                            .child(Self::field_label("时长（分钟）", "正整数", cx))
+                                            .child(Input::new(
+                                                &self.calendar_task_edit_duration_input,
+                                            )),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-calendar-task-edit")
+                                    .label("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.calendar_task_edit_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("save-calendar-task-edit")
+                                    .primary()
+                                    .label("保存修改")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.save_calendar_task_edit_action(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 日历格右键新增任务的弹窗。系列计划与普通视频计划使用同一计划库实体。
+    fn render_calendar_task_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let target = self.calendar_task_target;
+        let existing_series: Vec<&StudyPlan> = self
+            .config
+            .plans
+            .iter()
+            .filter(|plan| plan.is_series && plan.show_in_library)
+            .collect();
+
+        let one_off_button = if target == CalendarTaskTarget::OneOff {
+            Button::new("calendar-target-one-off")
+                .small()
+                .primary()
+                .label("单日任务")
+        } else {
+            Button::new("calendar-target-one-off")
+                .small()
+                .ghost()
+                .label("单日任务")
+        }
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.calendar_task_target = CalendarTaskTarget::OneOff;
+            this.calendar_existing_series_id = None;
+            cx.notify();
+        }));
+        let new_series_button = if target == CalendarTaskTarget::NewSeries {
+            Button::new("calendar-target-new-series")
+                .small()
+                .primary()
+                .label("新系列计划")
+        } else {
+            Button::new("calendar-target-new-series")
+                .small()
+                .ghost()
+                .label("新系列计划")
+        }
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.calendar_task_target = CalendarTaskTarget::NewSeries;
+            this.calendar_existing_series_id = None;
+            cx.notify();
+        }));
+        let existing_series_button = if target == CalendarTaskTarget::ExistingSeries {
+            Button::new("calendar-target-existing-series")
+                .small()
+                .primary()
+                .label("加入已有系列")
+        } else {
+            Button::new("calendar-target-existing-series")
+                .small()
+                .ghost()
+                .label("加入已有系列")
+        }
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.calendar_task_target = CalendarTaskTarget::ExistingSeries;
+            cx.notify();
+        }));
+
+        div()
+            .id("calendar-task-modal-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(hsla(0.0, 0.0, 0.0, 0.6))
+            .flex()
+            .items_center()
+            .justify_center()
+            // 遮罩层必须吞掉事件；否则关闭弹窗的鼠标抬起会点击到下方日历格。
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .child(
+                v_flex()
+                    .id("calendar-task-modal-scroll")
+                    .w(px(640.))
+                    .max_h(px(720.))
+                    .overflow_y_scroll()
+                    .bg(theme.background)
+                    .border_2()
+                    .border_color(theme.foreground)
+                    .shadow_lg()
+                    .p_6()
+                    .gap_4()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::empty()
+                                            .path("icons/calendar-days.svg")
+                                            .size_5()
+                                            .text_color(theme.primary),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(format!(
+                                                "为 {} 添加学习计划",
+                                                format_date_with_weekday(&self.calendar_task_date)
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("close-calendar-task-modal")
+                                    .cursor_pointer()
+                                    .p_1()
+                                    .child(
+                                        Icon::empty()
+                                            .path("icons/square.svg")
+                                            .size_4()
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.calendar_task_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(Self::field_label(
+                                        "当天任务名称",
+                                        "会显示在日历与打卡面板中",
+                                        cx,
+                                    ))
+                                    .child(Input::new(&self.calendar_task_title_input)),
+                            )
+                            .child(
+                                v_flex()
+                                    .w(px(150.))
+                                    .gap_1()
+                                    .child(Self::field_label(
+                                        "计划日期",
+                                        "可手动修改",
+                                        cx,
+                                    ))
+                                    .child(Input::new(&self.calendar_task_date_input)),
+                            )
+                            .child(
+                                v_flex()
+                                    .w(px(150.))
+                                    .gap_1()
+                                    .child(Self::field_label("时长（分钟）", "正整数", cx))
+                                    .child(Input::new(&self.calendar_task_duration_input)),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(Self::field_label(
+                                "计划归属",
+                                "系列计划会显示在“我的计划库”，后续可从任意日期继续追加任务",
+                                cx,
+                            ))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(one_off_button)
+                                    .child(new_series_button)
+                                    .child(existing_series_button),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(theme.muted_foreground)
+                                    .child(match target {
+                                        CalendarTaskTarget::OneOff => {
+                                            "单日任务只参与指定日期的学习与打卡，不显示在计划库。"
+                                        }
+                                        CalendarTaskTarget::NewSeries => {
+                                            "创建系列后，当前日期成为首个日程；以后添加的日期会自动延展计划时间范围。"
+                                        }
+                                        CalendarTaskTarget::ExistingSeries => {
+                                            "任务将追加到选择的系列；可手动指定任意日期，系列起止时间会自动更新。"
+                                        }
+                                    }),
+                            ),
+                    )
+                    .children((target == CalendarTaskTarget::NewSeries).then(|| {
+                        v_flex()
+                            .gap_1()
+                            .child(Self::field_label(
+                                "系列计划名称",
+                                "例如：英语词汇冲刺",
+                                cx,
+                            ))
+                            .child(Input::new(&self.calendar_series_name_input))
+                    }))
+                    .children((target == CalendarTaskTarget::ExistingSeries).then(|| {
+                        if existing_series.is_empty() {
+                            div()
+                                .p_3()
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_foreground)
+                                .child("还没有日历系列计划，请先选择“新系列计划”。")
+                                .into_any_element()
+                        } else {
+                            let mut series_buttons = Vec::new();
+                            for (index, plan) in existing_series.iter().enumerate() {
+                                let plan_id = plan.id.clone();
+                                let is_selected = self.calendar_existing_series_id.as_deref()
+                                    == Some(plan_id.as_str());
+                                let button = if is_selected {
+                                    Button::new(("choose-calendar-series", index))
+                                        .small()
+                                        .primary()
+                                        .label(format!("《{}》 · {} 至 {}", plan.title, plan.start_date, plan.end_date))
+                                } else {
+                                    Button::new(("choose-calendar-series", index))
+                                        .small()
+                                        .ghost()
+                                        .label(format!("《{}》 · {} 至 {}", plan.title, plan.start_date, plan.end_date))
+                                }
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.calendar_existing_series_id = Some(plan_id.clone());
+                                    cx.notify();
+                                }));
+                                series_buttons.push(button.into_any_element());
+                            }
+                            v_flex()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("选择已有系列"),
+                                )
+                                .children(series_buttons)
+                                .into_any_element()
+                        }
+                    }))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-calendar-task")
+                                    .label("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.calendar_task_modal_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("save-calendar-task")
+                                    .primary()
+                                    .label("添加任务")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.save_calendar_task_action(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -4646,6 +5463,12 @@ impl Render for PlannerApp {
         let cloud_settings_modal = self
             .cloud_settings_modal_open
             .then(|| self.render_cloud_settings_modal(cx));
+        let calendar_task_modal = self
+            .calendar_task_modal_open
+            .then(|| self.render_calendar_task_modal(cx));
+        let calendar_task_edit_modal = self
+            .calendar_task_edit_modal_open
+            .then(|| self.render_calendar_task_edit_modal(cx));
         let sheet_layer = Root::render_sheet_layer(window, cx);
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
@@ -4664,6 +5487,8 @@ impl Render for PlannerApp {
             .children(bind_modal)
             .children(sync_modal)
             .children(cloud_settings_modal)
+            .children(calendar_task_modal)
+            .children(calendar_task_edit_modal)
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)

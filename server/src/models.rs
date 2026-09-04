@@ -38,6 +38,8 @@ pub struct TaskItem {
     pub completed_at: Option<i64>,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(default)]
+    pub advanced_from_date: Option<String>,
 }
 
 /// 每日排期。
@@ -68,6 +70,14 @@ pub struct StudyPlan {
     #[serde(default)]
     pub created_at: i64,
     pub schedules: Vec<DailySchedule>,
+    #[serde(default)]
+    pub is_series: bool,
+    #[serde(default = "default_show_in_library")]
+    pub show_in_library: bool,
+}
+
+fn default_show_in_library() -> bool {
+    true
 }
 
 /// 可跨端同步的单条日历备注。`deleted` 是删除同步用的 tombstone。
