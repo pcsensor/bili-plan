@@ -220,6 +220,34 @@ fn is_weekend(d: NaiveDate) -> bool {
     weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun
 }
 
+/// 根据“指定日期是计划第几天”反推出计划起始日期。
+///
+/// `day_number` 从 1 开始；开启跳过周末时，周六和周日不计入计划天数。
+pub fn infer_plan_start_date(
+    date_str: &str,
+    day_number: usize,
+    skip_weekends: bool,
+) -> Result<String, String> {
+    if day_number == 0 {
+        return Err("今天是第几天必须是正整数。".to_string());
+    }
+
+    let mut date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .map_err(|_| "日期格式应为 YYYY-MM-DD。".to_string())?;
+    if skip_weekends && is_weekend(date) {
+        return Err("今天是周末，开启“跳过周末”后不能作为计划学习日。".to_string());
+    }
+
+    let mut days_to_rewind = day_number - 1;
+    while days_to_rewind > 0 {
+        date -= Duration::days(1);
+        if !skip_weekends || !is_weekend(date) {
+            days_to_rewind -= 1;
+        }
+    }
+    Ok(format_date(date))
+}
+
 /// 建立新学习计划并生成每日日历日程。
 pub fn create_study_plan(
     title: &str,
@@ -1574,6 +1602,29 @@ mod tests {
         assert_eq!(plan.schedules.len(), 2);
         assert_eq!(plan.schedules[0].tasks.len(), 2);
         assert_eq!(plan.schedules[1].tasks.len(), 2);
+    }
+
+    #[test]
+    fn infer_start_date_from_current_plan_day() {
+        assert_eq!(
+            infer_plan_start_date("2026-09-10", 1, false).unwrap(),
+            "2026-09-10"
+        );
+        assert_eq!(
+            infer_plan_start_date("2026-09-10", 4, false).unwrap(),
+            "2026-09-07"
+        );
+    }
+
+    #[test]
+    fn infer_start_date_counts_only_study_days_when_skipping_weekends() {
+        // 2026-09-07 是周一，向前数 2 个学习日后，第 3 天为周一。
+        assert_eq!(
+            infer_plan_start_date("2026-09-07", 3, true).unwrap(),
+            "2026-09-03"
+        );
+        assert!(infer_plan_start_date("2026-09-06", 2, true).is_err());
+        assert!(infer_plan_start_date("2026-09-07", 0, false).is_err());
     }
 
     #[test]

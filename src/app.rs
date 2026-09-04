@@ -50,8 +50,8 @@ use crate::core::{
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
     compute_month_study_stats, compute_plan_progress, compute_study_stats, format_date,
-    generate_month_calendar_matrix, get_tasks_for_date, parse_date_or_today, today_date_str,
-    PlanStatus, StudyPlan,
+    generate_month_calendar_matrix, get_tasks_for_date, infer_plan_start_date, parse_date_or_today,
+    today_date_str, PlanStatus, StudyPlan,
 };
 
 /// 顶部活动标签页。
@@ -410,6 +410,8 @@ pub struct PlannerApp {
     filter_plan_id: Option<String>,
     /// 加入打卡时的起始日期输入框
     start_date_input: Entity<InputState>,
+    /// 可选：将今天视为计划第 N 天，并据此自动倒推起始日期
+    today_plan_day_input: Entity<InputState>,
     /// 加入打卡时是否跳过周末
     skip_weekends_toggle: bool,
 
@@ -509,6 +511,8 @@ impl PlannerApp {
             state.set_value(today_date_str(), window, cx);
             state
         });
+        let today_plan_day_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("例如 7（可选）"));
         let custom_title_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("例如：刷题、背单词、阅读论文"));
         let custom_start_date_input = cx.new(|cx| {
@@ -598,6 +602,7 @@ impl PlannerApp {
             selected_date: today_date_str(),
             filter_plan_id: None,
             start_date_input,
+            today_plan_day_input,
             skip_weekends_toggle: false,
             custom_task_form_open: false,
             custom_title_input,
@@ -1042,11 +1047,42 @@ impl PlannerApp {
             return;
         };
         let input = self.input_value(&self.link_input, cx);
-        let start_date = self.input_value(&self.start_date_input, cx);
-        let start_date = if start_date.trim().is_empty() {
-            today_date_str()
+        let manual_start_date = self.input_value(&self.start_date_input, cx);
+        let today_plan_day = self.input_value(&self.today_plan_day_input, cx);
+        let start_date = if today_plan_day.trim().is_empty() {
+            if manual_start_date.trim().is_empty() {
+                today_date_str()
+            } else {
+                manual_start_date.trim().to_string()
+            }
         } else {
-            start_date.trim().to_string()
+            let day_number = match today_plan_day.trim().parse::<usize>() {
+                Ok(day_number) if day_number > 0 => day_number,
+                _ => {
+                    window.push_notification(
+                        Notification::warning("“今天是第几天”必须是正整数。"),
+                        cx,
+                    );
+                    return;
+                }
+            };
+            let planned_days = rd.plan.as_ref().map(|plan| plan.plan.len()).unwrap_or(0);
+            if day_number > planned_days {
+                window.push_notification(
+                    Notification::warning(format!(
+                        "“今天是第几天”不能超过计划总天数（{planned_days} 天）。"
+                    )),
+                    cx,
+                );
+                return;
+            }
+            match infer_plan_start_date(&today_date_str(), day_number, self.skip_weekends_toggle) {
+                Ok(date) => date,
+                Err(error) => {
+                    window.push_notification(Notification::warning(error), cx);
+                    return;
+                }
+            }
         };
         let source_tag = match self.source {
             SourceMode::Bilibili => "bilibili",
@@ -2729,6 +2765,17 @@ impl PlannerApp {
                                                     cx,
                                                 ))
                                                 .child(Input::new(&self.start_date_input)),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .flex_1()
+                                                .child(Self::field_label(
+                                                    "今天是第几天（可选）",
+                                                    "填写后自动倒推，并优先于起始日期",
+                                                    cx,
+                                                ))
+                                                .child(Input::new(&self.today_plan_day_input)),
                                         )
                                         .child(
                                             Button::new("toggle-weekend")
