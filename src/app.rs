@@ -3853,9 +3853,18 @@ impl PlannerApp {
                     .border_2()
                     .border_color(border_color)
                     .overflow_hidden()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_calendar_date_action(&d_date, window, cx);
-                    }))
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            this.select_calendar_date_action(&d_date, window, cx);
+                            if event.click_count() == 2 {
+                                this.selected_date = d_date.clone();
+                                // 日历展示全部科目，跳转后同样展示该日期的全部任务。
+                                this.filter_plan_id = None;
+                                this.active_tab = AppTab::TodayCheckIn;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, _, window, cx| {
