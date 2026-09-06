@@ -74,6 +74,7 @@ enum CalendarTaskTarget {
 }
 
 /// 从右侧任务列表传入编辑弹窗的不可变初始值。
+#[derive(Clone)]
 struct CalendarTaskEditSeed {
     plan_id: String,
     task_id: String,
@@ -465,6 +466,7 @@ pub struct PlannerApp {
     calendar_task_target: CalendarTaskTarget,
     calendar_existing_series_id: Option<String>,
     calendar_task_edit_modal_open: bool,
+    task_date_only: bool,
     calendar_task_edit_plan_id: Option<String>,
     calendar_task_edit_task_id: Option<String>,
     calendar_task_edit_title_input: Entity<InputState>,
@@ -629,6 +631,7 @@ impl PlannerApp {
             calendar_task_target: CalendarTaskTarget::OneOff,
             calendar_existing_series_id: None,
             calendar_task_edit_modal_open: false,
+            task_date_only: false,
             calendar_task_edit_plan_id: None,
             calendar_task_edit_task_id: None,
             calendar_task_edit_title_input,
@@ -1214,7 +1217,7 @@ impl PlannerApp {
         cx.notify();
     }
 
-    /// 将所有进行中计划在上一个学习日未完成的任务分别顺延到今天。
+    /// 将所有进行中计划在过去未完成的任务分批顺延到今天起的学习日。
     fn push_forward_all_behind_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let today = today_date_str();
         let plan_ids: Vec<String> = self
@@ -1235,7 +1238,7 @@ impl PlannerApp {
         if count > 0 {
             window.push_notification(
                 Notification::success(format!(
-                    "已将 {count} 门科目上个学习日未完成的任务顺延到今天！"
+                    "已将 {count} 门科目过去未完成的任务分批顺延到今天起的学习日！"
                 )),
                 cx,
             );
@@ -1250,6 +1253,7 @@ impl PlannerApp {
     fn advance_completed_tasks_action(
         &mut self,
         future_date: &str,
+        only_plan_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1263,6 +1267,7 @@ impl PlannerApp {
             .plans
             .iter()
             .filter(|plan| matches!(plan.status, PlanStatus::Active | PlanStatus::Completed))
+            .filter(|plan| only_plan_id.is_none_or(|id| plan.id == id))
             .map(|plan| plan.id.clone())
             .collect();
         let mut moved_tasks = 0usize;
@@ -1323,13 +1328,13 @@ impl PlannerApp {
         match push_forward_study_plan(&mut self.config, plan_id, &today) {
             Ok(true) => {
                 window.push_notification(
-                    Notification::success("已将本科目上个学习日未完成任务顺延到今天。"),
+                    Notification::success("已将本科目过去未完成任务分批顺延到今天起的学习日。"),
                     cx,
                 );
                 self.trigger_auto_sync(window, cx);
             }
             Ok(false) => window.push_notification(
-                Notification::info("本科目上个学习日没有需要顺延的未完成任务。"),
+                Notification::info("本科目没有需要顺延的过去未完成任务。"),
                 cx,
             ),
             Err(e) => {
@@ -1524,6 +1529,7 @@ impl PlannerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.task_date_only = false;
         self.calendar_task_edit_plan_id = Some(seed.plan_id);
         self.calendar_task_edit_task_id = Some(seed.task_id);
         self.calendar_task_edit_title_input
@@ -1546,6 +1552,20 @@ impl PlannerApp {
         let Some(task_id) = self.calendar_task_edit_task_id.clone() else {
             return;
         };
+        if self.task_date_only {
+            let date = self.input_value(&self.calendar_task_edit_date_input, cx);
+            match crate::core::move_study_task_to_date(&mut self.config, &plan_id, &task_id, &date)
+            {
+                Ok(()) => {
+                    self.calendar_task_edit_modal_open = false;
+                    window.push_notification(Notification::success("已调整任务日期"), cx);
+                    self.trigger_auto_sync(window, cx);
+                }
+                Err(error) => window.push_notification(Notification::error(error), cx),
+            }
+            cx.notify();
+            return;
+        }
         let title = self.input_value(&self.calendar_task_edit_title_input, cx);
         let minutes_text = self.input_value(&self.calendar_task_edit_duration_input, cx);
         let date = self.input_value(&self.calendar_task_edit_date_input, cx);
@@ -1592,12 +1612,7 @@ impl PlannerApp {
 
     /// 安全地将云端返回的最新打卡状态合并到本地正在编辑的计划中（防止覆盖本地尚未同步的最新修改）。
     fn merge_synced_plans(&mut self, remote_plans: Vec<StudyPlan>) {
-        if self.config.plans.is_empty() {
-            self.config.plans = remote_plans;
-            crate::study::restore_cancelled_advanced_tasks(&mut self.config.plans);
-            return;
-        }
-
+        // 只合并仍存在的计划；同步期间删除最后一项后，旧响应不能把它复活。
         let mut remote_map: std::collections::HashMap<String, StudyPlan> =
             std::collections::HashMap::new();
         for rp in remote_plans {
@@ -1606,27 +1621,7 @@ impl PlannerApp {
 
         for plan in &mut self.config.plans {
             if let Some(rp) = remote_map.get(&plan.id) {
-                let mut remote_tasks: std::collections::HashMap<&str, &crate::study::TaskItem> =
-                    std::collections::HashMap::new();
-                for sch in &rp.schedules {
-                    for t in &sch.tasks {
-                        remote_tasks.insert(t.id.as_str(), t);
-                    }
-                }
-
-                for sch in &mut plan.schedules {
-                    for t in &mut sch.tasks {
-                        if let Some(rt) = remote_tasks.get(t.id.as_str()) {
-                            // 仅当远端打卡时间更新时才采纳（Last-Write-Wins）
-                            if rt.updated_at > t.updated_at {
-                                t.completed = rt.completed;
-                                t.completed_at = rt.completed_at;
-                                t.updated_at = rt.updated_at;
-                                t.advanced_from_date = rt.advanced_from_date.clone();
-                            }
-                        }
-                    }
-                }
+                crate::schedule_recovery::merge_checkins(plan, rp, false);
             }
         }
         crate::study::restore_cancelled_advanced_tasks(&mut self.config.plans);
@@ -3225,10 +3220,16 @@ impl PlannerApp {
                             .children(is_future.then(|| {
                                 Button::new("advance-completed-tasks")
                                     .icon(Icon::empty().path("icons/clock.svg"))
-                                    .label("一键提前已完成任务")
+                                    .label(if self.filter_plan_id.is_some() {
+                                        "提前本科目已完成任务"
+                                    } else {
+                                        "提前全部科目已完成任务"
+                                    })
                                     .on_click(cx.listener(move |this, _, window, cx| {
+                                        let selected_plan = this.filter_plan_id.clone();
                                         this.advance_completed_tasks_action(
                                             &future_date_for_advance,
+                                            selected_plan.as_deref(),
                                             window,
                                             cx,
                                         );
@@ -3237,7 +3238,7 @@ impl PlannerApp {
                             .child(
                                 Button::new("push-forward-all")
                                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
-                                    .label("一键顺延上日未完成")
+                                    .label("顺延全部科目积压任务")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.push_forward_all_behind_action(window, cx);
                                     })),
@@ -3407,6 +3408,13 @@ impl PlannerApp {
                     let pid_click2 = plan_id.clone();
                     let tid_click1 = tid.clone();
                     let tid_click2 = tid.clone();
+                    let move_seed = CalendarTaskEditSeed {
+                        plan_id: plan_id.clone(),
+                        task_id: tid.clone(),
+                        title: task.title.clone(),
+                        date: self.selected_date.clone(),
+                        portion: task.portion,
+                    };
 
                     task_rows.push(
                         h_flex()
@@ -3527,6 +3535,20 @@ impl PlannerApp {
                                 h_flex()
                                     .items_center()
                                     .gap_2()
+                                    .child(
+                                        Button::new(("move-task", grp_idx * 1000 + item_idx))
+                                            .small()
+                                            .ghost()
+                                            .label("调整日期")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_calendar_task_edit_modal_action(
+                                                    move_seed.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                                this.task_date_only = true;
+                                            })),
+                                    )
                                     .children(has_source_url.then(|| {
                                         Button::new(btn_play_id)
                                             .icon(Icon::empty().path("icons/play.svg"))
@@ -4015,6 +4037,7 @@ impl PlannerApp {
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.advance_completed_tasks_action(
                                             &calendar_advance_date,
+                                            None,
                                             window,
                                             cx,
                                         );
@@ -4199,6 +4222,13 @@ impl PlannerApp {
                     let edit_title = t_item.task.title.clone();
                     let edit_portion = t_item.task.portion;
                     let edit_date = selected_date.clone();
+                    let move_seed = CalendarTaskEditSeed {
+                        plan_id: pid.clone(),
+                        task_id: tid.clone(),
+                        title: edit_title.clone(),
+                        date: selected_date.clone(),
+                        portion: edit_portion,
+                    };
 
                     task_items.push(
                         div()
@@ -4260,6 +4290,20 @@ impl PlannerApp {
                                                 open_video_link(&st, &su, vno);
                                             })
                                     }))
+                                    .child(
+                                        Button::new(("move-calendar-task", i))
+                                            .small()
+                                            .ghost()
+                                            .label("调整日期")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_calendar_task_edit_modal_action(
+                                                    move_seed.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                                this.task_date_only = true;
+                                            })),
+                                    )
                                     .children(is_calendar_task.then(|| {
                                         Button::new(("edit-calendar-task", i))
                                             .small()
@@ -4773,7 +4817,7 @@ impl PlannerApp {
                                         div()
                                             .text_size(px(16.))
                                             .font_weight(FontWeight::BOLD)
-                                            .child(format!("编辑《{plan_title}》中的日历任务")),
+                                            .child(if self.task_date_only { format!("调整《{plan_title}》中的任务日期") } else { format!("编辑《{plan_title}》中的日历任务") }),
                                     ),
                             )
                             .child(
@@ -4801,7 +4845,7 @@ impl PlannerApp {
                                 v_flex()
                                     .gap_1()
                                     .child(Self::field_label("任务名称", "", cx))
-                                    .child(Input::new(&self.calendar_task_edit_title_input)),
+                                    .child(Input::new(&self.calendar_task_edit_title_input).disabled(self.task_date_only)),
                             )
                             .child(
                                 h_flex()
@@ -4820,10 +4864,13 @@ impl PlannerApp {
                                             .child(Self::field_label("时长（分钟）", "正整数", cx))
                                             .child(Input::new(
                                                 &self.calendar_task_edit_duration_input,
-                                            )),
+                                            ).disabled(self.task_date_only)),
                                     ),
                             ),
                     )
+                    .children(self.task_date_only.then(|| div().text_sm().child(
+                        "保留打卡与切片信息。向前移空原日期后，后续任务依次补位。允许指定周末；后续手动指定的日期优先于旧操作的撤销。"
+                    )))
                     .child(
                         h_flex()
                             .justify_end()

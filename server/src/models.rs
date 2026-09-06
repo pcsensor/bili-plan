@@ -40,6 +40,9 @@ pub struct TaskItem {
     pub updated_at: i64,
     #[serde(default)]
     pub advanced_from_date: Option<String>,
+    /// 机器人撤销提前后保留至客户端确认的归位信号。
+    #[serde(default)]
+    pub advance_restored: bool,
 }
 
 /// 每日排期。
@@ -70,6 +73,9 @@ pub struct StudyPlan {
     #[serde(default)]
     pub created_at: i64,
     pub schedules: Vec<DailySchedule>,
+    /// 整日提前引起的补位历史；取消其中任一任务打卡时只撤销一次。
+    #[serde(default)]
+    pub advance_shifts: Vec<crate::schedule_recovery::ScheduleShift>,
     #[serde(default)]
     pub is_series: bool,
     #[serde(default = "default_show_in_library")]

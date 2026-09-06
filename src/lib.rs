@@ -25,6 +25,11 @@ pub use study::{
     compute_study_stats, create_calendar_series, create_custom_study_plan,
     create_one_off_calendar_task, create_study_plan, delete_calendar_task, delete_daily_note,
     get_daily_notes, get_tasks_for_date, infer_plan_start_date, merge_daily_notes,
-    push_forward_plan, today_date_str, toggle_task_checkin, update_calendar_task, DailyNote,
-    DailyNotes, DailySchedule, PlanStatus, StudyPlan, StudyStats, TaskItem, TodayTaskView,
+    move_task_to_date, push_forward_plan, today_date_str, toggle_task_checkin,
+    update_calendar_task, DailyNote, DailyNotes, DailySchedule, PlanStatus, StudyPlan, StudyStats,
+    TaskItem, TodayTaskView,
 };
+
+pub(crate) use study as schedule_model;
+#[path = "../server/src/schedule_recovery.rs"]
+pub mod schedule_recovery;

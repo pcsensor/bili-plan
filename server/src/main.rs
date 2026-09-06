@@ -1,3 +1,5 @@
+mod schedule_recovery;
+use models as schedule_model;
 mod card;
 mod feishu;
 mod models;

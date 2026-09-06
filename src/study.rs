@@ -58,6 +58,9 @@ pub struct TaskItem {
     /// 任务通过“一键提前”划归今天前所在的日期；取消打卡时用于自动归位。
     #[serde(default)]
     pub advanced_from_date: Option<String>,
+    /// 机器人撤销提前后保留至客户端确认的归位信号。
+    #[serde(default)]
+    pub advance_restored: bool,
 }
 
 /// 某一天的学习排期。
@@ -102,6 +105,9 @@ pub struct StudyPlan {
     pub created_at: i64,
     /// 每日日程表
     pub schedules: Vec<DailySchedule>,
+    /// 整日提前引起的补位历史；取消其中任一任务打卡时只撤销一次。
+    #[serde(default)]
+    pub advance_shifts: Vec<crate::schedule_recovery::ScheduleShift>,
     /// 是否为通过日历创建、可持续追加每日任务的系列计划。
     #[serde(default)]
     pub is_series: bool,
@@ -209,6 +215,11 @@ pub fn parse_date_or_today(s: &str) -> NaiveDate {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|_| Local::now().date_naive())
 }
 
+fn validate_date(value: &str) -> Result<NaiveDate, String> {
+    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
+        .map_err(|_| "日期格式应为 YYYY-MM-DD。".to_string())
+}
+
 /// 格式化 NaiveDate 为 "YYYY-MM-DD"。
 pub fn format_date(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
@@ -296,6 +307,7 @@ pub fn create_study_plan(
                 completed_at: None,
                 updated_at: 0,
                 advanced_from_date: None,
+                advance_restored: false,
             })
             .collect();
 
@@ -329,6 +341,7 @@ pub fn create_study_plan(
         status: PlanStatus::Active,
         created_at: now,
         schedules,
+        advance_shifts: Vec::new(),
         is_series: false,
         show_in_library: true,
     }
@@ -379,7 +392,7 @@ pub fn create_custom_study_plan(
 
     let now = now_timestamp();
     let plan_id = format!("custom_{}_{}", now, fast_rand_suffix());
-    let start_date = parse_date_or_today(start_date_str);
+    let start_date = validate_date(start_date_str)?;
     let portion = daily_minutes
         .checked_mul(60)
         .ok_or_else(|| "每日时长过大。".to_string())?;
@@ -414,6 +427,7 @@ pub fn create_custom_study_plan(
                 completed_at: None,
                 updated_at: 0,
                 advanced_from_date: None,
+                advance_restored: false,
             }],
             is_rest_day: false,
         });
@@ -441,6 +455,7 @@ pub fn create_custom_study_plan(
         status: PlanStatus::Active,
         created_at: now,
         schedules,
+        advance_shifts: Vec::new(),
         is_series: false,
         show_in_library: true,
     })
@@ -455,7 +470,15 @@ fn calendar_task_item(
     portion: i64,
 ) -> TaskItem {
     TaskItem {
-        id: format!("{plan_id}_{day_index}_{item_index}"),
+        id: {
+            static NEXT_TASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT_TASK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            format!("{plan_id}_{day_index}_{item_index}_{nanos}_{sequence}")
+        },
         vid_no,
         title: title.to_string(),
         portion,
@@ -465,6 +488,7 @@ fn calendar_task_item(
         completed_at: None,
         updated_at: 0,
         advanced_from_date: None,
+        advance_restored: false,
     }
 }
 
@@ -483,23 +507,7 @@ fn validate_calendar_task(title: &str, minutes: i64) -> Result<(String, i64), St
 }
 
 fn refresh_calendar_series_summary(plan: &mut StudyPlan) {
-    let task_schedules: Vec<_> = plan
-        .schedules
-        .iter()
-        .filter(|schedule| !schedule.is_rest_day && !schedule.tasks.is_empty())
-        .collect();
-    plan.planned_days = task_schedules.len();
-    plan.total_duration = task_schedules
-        .iter()
-        .flat_map(|schedule| schedule.tasks.iter())
-        .map(|task| task.portion)
-        .sum();
-    if let Some(first) = task_schedules.iter().map(|schedule| &schedule.date).min() {
-        plan.start_date = first.clone();
-    }
-    if let Some(last) = task_schedules.iter().map(|schedule| &schedule.date).max() {
-        plan.end_date = last.clone();
-    }
+    crate::schedule_recovery::refresh(plan);
 }
 
 /// 从日历创建一个一次性任务。它会参与当日打卡和统计，但不显示在计划库中。
@@ -509,7 +517,7 @@ pub fn create_one_off_calendar_task(
     minutes: i64,
 ) -> Result<StudyPlan, String> {
     let (task_title, portion) = validate_calendar_task(task_title, minutes)?;
-    let date = format_date(parse_date_or_today(date_str));
+    let date = format_date(validate_date(date_str)?);
     let now = now_timestamp();
     let plan_id = format!("calendar_{}_{}", now, fast_rand_suffix());
     Ok(StudyPlan {
@@ -531,6 +539,7 @@ pub fn create_one_off_calendar_task(
             tasks: vec![calendar_task_item(&plan_id, 0, 0, 1, &task_title, portion)],
             is_rest_day: false,
         }],
+        advance_shifts: Vec::new(),
         is_series: false,
         show_in_library: false,
     })
@@ -548,7 +557,7 @@ pub fn create_calendar_series(
         return Err("请填写系列计划名称。".to_string());
     }
     let (task_title, portion) = validate_calendar_task(task_title, minutes)?;
-    let date = format_date(parse_date_or_today(date_str));
+    let date = format_date(validate_date(date_str)?);
     let now = now_timestamp();
     let plan_id = format!("series_{}_{}", now, fast_rand_suffix());
     Ok(StudyPlan {
@@ -570,6 +579,7 @@ pub fn create_calendar_series(
             tasks: vec![calendar_task_item(&plan_id, 0, 0, 1, &task_title, portion)],
             is_rest_day: false,
         }],
+        advance_shifts: Vec::new(),
         is_series: true,
         show_in_library: true,
     })
@@ -586,13 +596,15 @@ pub fn append_calendar_series_task(
         return Err("只能向日历系列计划追加任务。".to_string());
     }
     let (task_title, portion) = validate_calendar_task(task_title, minutes)?;
-    let date = format_date(parse_date_or_today(date_str));
+    let date = format_date(validate_date(date_str)?);
     let vid_no = plan
         .schedules
         .iter()
         .flat_map(|schedule| schedule.tasks.iter())
-        .count() as i64
-        + 1;
+        .map(|task| task.vid_no)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
 
     if let Some(schedule) = plan
         .schedules
@@ -636,6 +648,57 @@ pub fn append_calendar_series_task(
     Ok(())
 }
 
+/// 手动向前改期清空原日后，后续任务依次补位；允许周末作为手动例外。
+/// 新日期取代提前归位日期，打卡状态和视频切片信息保持不变。
+pub fn move_task_to_date(
+    plan: &mut StudyPlan,
+    task_id: &str,
+    date_str: &str,
+) -> Result<(), String> {
+    let date = NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d")
+        .map_err(|_| "日期格式应为 YYYY-MM-DD。".to_string())?;
+    let target_date = format_date(date);
+    let (source_index, task_index) = plan
+        .schedules
+        .iter()
+        .enumerate()
+        .find_map(|(index, schedule)| {
+            schedule
+                .tasks
+                .iter()
+                .position(|task| task.id == task_id)
+                .map(|task_index| (index, task_index))
+        })
+        .ok_or_else(|| "未找到指定任务。".to_string())?;
+    if plan.schedules[source_index].date == target_date {
+        return Ok(());
+    }
+    let source_date = plan.schedules[source_index].date.clone();
+    crate::schedule_recovery::detach_task(plan, task_id);
+    let mut task = plan.schedules[source_index].tasks.remove(task_index);
+    task.advanced_from_date = None;
+    task.advance_restored = false;
+    if target_date < source_date && plan.schedules[source_index].tasks.is_empty() {
+        crate::schedule_recovery::compact_day(plan, &source_date, Vec::new());
+    }
+    task.updated_at = now_timestamp().max(task.updated_at.saturating_add(1));
+    if let Some(schedule) = plan.schedules.iter_mut().find(|s| s.date == target_date) {
+        schedule.is_rest_day = false;
+        schedule.tasks.push(task);
+    } else {
+        plan.schedules.push(DailySchedule {
+            day_index: 0,
+            date: target_date,
+            tasks: vec![task],
+            is_rest_day: false,
+        });
+    }
+    plan.schedules
+        .retain(|s| !s.tasks.is_empty() || s.is_rest_day);
+    refresh_plan_schedule_summary(plan);
+    Ok(())
+}
+
 /// 编辑日历创建的任务。可修改名称、时长与日期，编辑后自动刷新计划汇总日期。
 pub fn update_calendar_task(
     plan: &mut StudyPlan,
@@ -649,56 +712,16 @@ pub fn update_calendar_task(
     }
     let (task_title, portion) = validate_calendar_task(task_title, minutes)?;
     let one_off_title = task_title.clone();
-    let target_date = format_date(parse_date_or_today(date_str));
-    let source_index = plan
+    move_task_to_date(plan, task_id, date_str)?;
+    let task = plan
         .schedules
-        .iter()
-        .position(|schedule| schedule.tasks.iter().any(|task| task.id == task_id))
-        .ok_or_else(|| "未找到指定任务。".to_string())?;
-    let task_index = plan.schedules[source_index]
-        .tasks
-        .iter()
-        .position(|task| task.id == task_id)
-        .ok_or_else(|| "未找到指定任务。".to_string())?;
-    let source_date = plan.schedules[source_index].date.clone();
-
-    if source_date == target_date {
-        let task = &mut plan.schedules[source_index].tasks[task_index];
-        task.title = task_title;
-        task.portion = portion;
-        task.updated_at = now_timestamp();
-        task.advanced_from_date = None;
-    } else {
-        let mut task = plan.schedules[source_index].tasks.remove(task_index);
-        task.title = task_title;
-        task.portion = portion;
-        task.updated_at = now_timestamp();
-        task.advanced_from_date = None;
-        if plan.schedules[source_index].tasks.is_empty() {
-            plan.schedules.remove(source_index);
-        }
-
-        if let Some(schedule) = plan
-            .schedules
-            .iter_mut()
-            .find(|schedule| schedule.date == target_date && !schedule.is_rest_day)
-        {
-            schedule.tasks.push(task);
-        } else {
-            let day_index = plan
-                .schedules
-                .iter()
-                .map(|schedule| schedule.day_index)
-                .max()
-                .map_or(0, |index| index + 1);
-            plan.schedules.push(DailySchedule {
-                day_index,
-                date: target_date,
-                tasks: vec![task],
-                is_rest_day: false,
-            });
-        }
-    }
+        .iter_mut()
+        .flat_map(|s| &mut s.tasks)
+        .find(|t| t.id == task_id)
+        .expect("validated task");
+    task.title = task_title;
+    task.portion = portion;
+    task.updated_at = now_timestamp().max(task.updated_at.saturating_add(1));
     if !plan.is_series {
         plan.title = one_off_title;
     }
@@ -721,6 +744,7 @@ pub fn delete_calendar_task(plan: &mut StudyPlan, task_id: &str) -> Result<bool,
         .iter()
         .position(|task| task.id == task_id)
         .ok_or_else(|| "未找到指定任务。".to_string())?;
+    crate::schedule_recovery::detach_task(plan, task_id);
     plan.schedules[source_index].tasks.remove(task_index);
     if plan.schedules[source_index].tasks.is_empty() {
         plan.schedules.remove(source_index);
@@ -837,139 +861,18 @@ pub fn toggle_task_checkin(
     plan_id: &str,
     task_id: &str,
 ) -> Result<bool, String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    for plan in plans.iter_mut().filter(|plan| plan.id == plan_id) {
-        let location = plan
-            .schedules
-            .iter()
-            .enumerate()
-            .find_map(|(schedule_index, schedule)| {
-                schedule
-                    .tasks
-                    .iter()
-                    .position(|task| task.id == task_id)
-                    .map(|task_index| (schedule_index, task_index))
-            });
-        let Some((schedule_index, task_index)) = location else {
-            continue;
-        };
-
-        let restore_date = plan.schedules[schedule_index].tasks[task_index]
-            .completed
-            .then(|| {
-                plan.schedules[schedule_index].tasks[task_index]
-                    .advanced_from_date
-                    .clone()
-            })
-            .flatten();
-        if let Some(restore_date) = restore_date {
-            let mut task = plan.schedules[schedule_index].tasks.remove(task_index);
-            task.completed = false;
-            task.completed_at = None;
-            task.updated_at = now;
-            task.advanced_from_date = None;
-            if plan.schedules[schedule_index].tasks.is_empty()
-                && !plan.schedules[schedule_index].is_rest_day
-            {
-                plan.schedules.remove(schedule_index);
-            }
-            if let Some(schedule) = plan
-                .schedules
-                .iter_mut()
-                .find(|schedule| schedule.date == restore_date && !schedule.is_rest_day)
-            {
-                schedule.tasks.push(task);
-                schedule.tasks.sort_by_key(|task| task.vid_no);
-            } else {
-                plan.schedules.push(DailySchedule {
-                    day_index: 0,
-                    date: restore_date,
-                    tasks: vec![task],
-                    is_rest_day: false,
-                });
-            }
-            rebuild_rest_days(plan);
-            refresh_plan_schedule_summary(plan);
-            check_update_plan_completion(plan);
-            return Ok(false);
-        }
-
-        let task = &mut plan.schedules[schedule_index].tasks[task_index];
-        task.completed = !task.completed;
-        task.completed_at = if task.completed { Some(now) } else { None };
-        task.updated_at = now;
-        let new_state = task.completed;
-        check_update_plan_completion(plan);
-        return Ok(new_state);
-    }
-    Err("未找到对应的任务".to_string())
+    let plan = plans
+        .iter_mut()
+        .find(|p| p.id == plan_id)
+        .ok_or_else(|| "未找到对应计划".to_string())?;
+    crate::schedule_recovery::toggle(plan, task_id, now_timestamp(), false)
+        .ok_or_else(|| "未找到对应的任务".to_string())
 }
 
-/// 应用云端取消打卡后的归位信号。任务若已在原日期，仅清除临时来源标记。
+/// 应用云端归位信号，同时恢复该次整日提前引起的后续补位。
 pub fn restore_cancelled_advanced_tasks(plans: &mut [StudyPlan]) {
     for plan in plans {
-        let mut changed = false;
-        loop {
-            let location =
-                plan.schedules
-                    .iter()
-                    .enumerate()
-                    .find_map(|(schedule_index, schedule)| {
-                        schedule
-                            .tasks
-                            .iter()
-                            .enumerate()
-                            .find(|(_, task)| !task.completed && task.advanced_from_date.is_some())
-                            .map(|(task_index, task)| {
-                                (
-                                    schedule_index,
-                                    task_index,
-                                    schedule.date.clone(),
-                                    task.advanced_from_date.clone().unwrap_or_default(),
-                                )
-                            })
-                    });
-            let Some((schedule_index, task_index, current_date, restore_date)) = location else {
-                break;
-            };
-            if current_date == restore_date {
-                plan.schedules[schedule_index].tasks[task_index].advanced_from_date = None;
-                changed = true;
-                continue;
-            }
-            let mut task = plan.schedules[schedule_index].tasks.remove(task_index);
-            task.advanced_from_date = None;
-            if plan.schedules[schedule_index].tasks.is_empty()
-                && !plan.schedules[schedule_index].is_rest_day
-            {
-                plan.schedules.remove(schedule_index);
-            }
-            if let Some(schedule) = plan
-                .schedules
-                .iter_mut()
-                .find(|schedule| schedule.date == restore_date && !schedule.is_rest_day)
-            {
-                schedule.tasks.push(task);
-                schedule.tasks.sort_by_key(|task| task.vid_no);
-            } else {
-                plan.schedules.push(DailySchedule {
-                    day_index: 0,
-                    date: restore_date,
-                    tasks: vec![task],
-                    is_rest_day: false,
-                });
-            }
-            changed = true;
-        }
-        if changed {
-            rebuild_rest_days(plan);
-            refresh_plan_schedule_summary(plan);
-            check_update_plan_completion(plan);
-        }
+        crate::schedule_recovery::restore(plan, false);
     }
 }
 
@@ -989,9 +892,11 @@ pub fn checkin_entire_day(
             for schedule in plan.schedules.iter_mut() {
                 if schedule.date == target_date {
                     for task in schedule.tasks.iter_mut() {
-                        task.completed = true;
-                        task.completed_at = Some(now);
-                        task.updated_at = now;
+                        if !task.completed {
+                            task.completed = true;
+                            task.completed_at = Some(now);
+                            task.updated_at = now.max(task.updated_at.saturating_add(1));
+                        }
                     }
                 }
             }
@@ -1059,182 +964,135 @@ fn next_learning_date(mut date: NaiveDate, skip_weekends: bool) -> NaiveDate {
     date
 }
 
-fn previous_learning_date(mut date: NaiveDate, skip_weekends: bool) -> NaiveDate {
-    date -= Duration::days(1);
-    if skip_weekends {
-        while is_weekend(date) {
-            date -= Duration::days(1);
-        }
-    }
-    date
+fn refresh_plan_schedule_summary(plan: &mut StudyPlan) {
+    crate::schedule_recovery::refresh(plan);
 }
 
-fn normalize_schedule_indices(plan: &mut StudyPlan) {
-    plan.schedules
-        .sort_by(|left, right| left.date.cmp(&right.date));
-    let mut learning_day = 0usize;
-    for schedule in &mut plan.schedules {
-        schedule.day_index = learning_day;
-        if !schedule.is_rest_day {
-            learning_day += 1;
+/// 所有过去未完成任务按原日期分批排到今天起的学习日，已完成记录留在原处。
+/// 后续日程为积压批次让位；周末手动任务也会被收集，重复执行不会再次移动。
+pub fn push_forward_plan(plan: &mut StudyPlan, destination_date_str: &str) -> Result<bool, String> {
+    let destination = validate_date(destination_date_str)?;
+    let target = format_date(destination);
+    let mut backlog: Vec<_> = plan
+        .schedules
+        .iter()
+        .filter(|s| s.date < target && s.tasks.iter().any(|t| !t.completed))
+        .cloned()
+        .collect();
+    if backlog.is_empty() {
+        return Ok(false);
+    }
+    backlog.sort_by(|a, b| a.date.cmp(&b.date));
+    let count = backlog.len();
+    let skip_weekends = plan.skip_weekends;
+    // 将历史中的空位也纳入日期映射，防止周末例外在顺延后映射到同一天。
+    let mut future_dates = std::collections::BTreeSet::new();
+    for schedule in &plan.schedules {
+        if !schedule.tasks.is_empty() {
+            future_dates.insert(schedule.date.clone());
         }
-    }
-}
-
-fn rebuild_rest_days(plan: &mut StudyPlan) {
-    if !plan.skip_weekends {
-        return;
-    }
-    let Some(first) = plan
-        .schedules
-        .iter()
-        .filter(|schedule| !schedule.is_rest_day && !schedule.tasks.is_empty())
-        .map(|schedule| parse_date_or_today(&schedule.date))
-        .min()
-    else {
-        return;
-    };
-    let Some(last) = plan
-        .schedules
-        .iter()
-        .filter(|schedule| !schedule.is_rest_day && !schedule.tasks.is_empty())
-        .map(|schedule| parse_date_or_today(&schedule.date))
-        .max()
-    else {
-        return;
-    };
-    plan.schedules.retain(|schedule| !schedule.is_rest_day);
-    let mut date = first;
-    while date <= last {
-        if is_weekend(date) {
-            let date_text = format_date(date);
-            if !plan
-                .schedules
-                .iter()
-                .any(|schedule| schedule.date == date_text)
-            {
-                plan.schedules.push(DailySchedule {
-                    day_index: 0,
-                    date: date_text,
-                    tasks: Vec::new(),
-                    is_rest_day: true,
-                });
+        for task in &schedule.tasks {
+            if let Some(origin) = &task.advanced_from_date {
+                future_dates.insert(origin.clone());
             }
         }
-        date += Duration::days(1);
     }
-}
-
-fn refresh_plan_schedule_summary(plan: &mut StudyPlan) {
-    let task_schedules: Vec<_> = plan
-        .schedules
-        .iter()
-        .filter(|schedule| !schedule.is_rest_day && !schedule.tasks.is_empty())
-        .collect();
-    plan.planned_days = task_schedules.len();
-    plan.total_duration = task_schedules
-        .iter()
-        .flat_map(|schedule| schedule.tasks.iter())
-        .map(|task| task.portion)
-        .sum();
-    if let Some(first) = task_schedules.iter().map(|schedule| &schedule.date).min() {
-        plan.start_date = first.clone();
+    for movement in plan.advance_shifts.iter().flat_map(|s| &s.moves) {
+        future_dates.insert(movement.from.clone());
+        future_dates.insert(movement.to.clone());
     }
-    if let Some(last) = task_schedules.iter().map(|schedule| &schedule.date).max() {
-        plan.end_date = last.clone();
+    for (from, to) in plan.advance_shifts.iter().flat_map(|s| &s.date_slots) {
+        future_dates.insert(from.clone());
+        future_dates.insert(to.clone());
     }
-    normalize_schedule_indices(plan);
-}
-
-/// 在新的学习日开始时，顺延上一个学习日未完成的整个任务条目。
-///
-/// 已完成条目保留在原日期；未完成条目进入新日期；同一计划原本的所有
-/// 后续日程整体后移一个学习日，因此新日期只新增该计划上一日的剩余条目。
-/// 其他计划不会被修改。返回值表示是否实际发生顺延。
-pub fn push_forward_plan(plan: &mut StudyPlan, destination_date_str: &str) -> Result<bool, String> {
-    let destination_date = parse_date_or_today(destination_date_str);
-    let target_date = previous_learning_date(destination_date, plan.skip_weekends);
-    let target_text = format_date(target_date);
-    let target_schedule = plan
-        .schedules
-        .iter()
-        .find(|schedule| schedule.date == target_text && !schedule.is_rest_day)
-        .cloned();
-    let Some(target_schedule) = target_schedule else {
-        return Ok(false);
+    let mut date_map = HashMap::new();
+    let mut previous = None;
+    for value in future_dates.into_iter().filter(|d| d >= &target) {
+        let mut d = validate_date(&value)?;
+        for _ in 0..count {
+            d = next_learning_date(d, skip_weekends);
+        }
+        if let Some(previous) = previous {
+            d = d.max(next_learning_date(previous, skip_weekends));
+        }
+        previous = Some(d);
+        date_map.insert(value, format_date(d));
+    }
+    let shift_date = |value: &str| {
+        date_map
+            .get(value)
+            .cloned()
+            .unwrap_or_else(|| value.to_string())
     };
-    let completed: Vec<TaskItem> = target_schedule
-        .tasks
-        .iter()
-        .filter(|task| task.completed)
-        .cloned()
-        .collect();
-    let unfinished: Vec<TaskItem> = target_schedule
-        .tasks
-        .iter()
-        .filter(|task| !task.completed)
-        .cloned()
-        .collect();
-    if unfinished.is_empty() {
-        return Ok(false);
+    // 顺延是新操作，旧提前记录的归位位置也必须相应后移。
+    for shift in &mut plan.advance_shifts {
+        for (from, to) in &mut shift.date_slots {
+            *from = shift_date(from);
+            *to = shift_date(to);
+        }
+        for movement in &mut shift.moves {
+            movement.from = shift_date(&movement.from);
+            movement.to = shift_date(&movement.to);
+        }
     }
-
-    let mut rebuilt: Vec<DailySchedule> = plan
+    for task in plan.schedules.iter_mut().flat_map(|s| &mut s.tasks) {
+        if let Some(origin) = &mut task.advanced_from_date {
+            *origin = shift_date(origin);
+        }
+    }
+    let mut rebuilt: Vec<_> = plan
         .schedules
         .iter()
-        .filter(|schedule| schedule.date < target_text && !schedule.is_rest_day)
+        .filter(|s| s.date < target)
         .cloned()
-        .collect();
-    if !completed.is_empty() {
-        rebuilt.push(DailySchedule {
-            day_index: target_schedule.day_index,
-            date: target_text.clone(),
-            tasks: completed,
-            is_rest_day: false,
-        });
-    }
-    rebuilt.push(DailySchedule {
-        day_index: 0,
-        date: format_date(next_learning_date(target_date, plan.skip_weekends)),
-        tasks: unfinished,
-        is_rest_day: false,
-    });
-
-    let mut future: Vec<DailySchedule> = plan
-        .schedules
-        .iter()
-        .filter(|schedule| {
-            schedule.date > target_text && !schedule.is_rest_day && !schedule.tasks.is_empty()
+        .map(|mut s| {
+            s.tasks.retain(|t| t.completed);
+            s
         })
+        .collect();
+    let mut cursor = destination;
+    if skip_weekends {
+        while is_weekend(cursor) {
+            cursor += Duration::days(1);
+        }
+    }
+    for mut schedule in backlog {
+        schedule.tasks.retain(|t| !t.completed);
+        schedule.date = format_date(cursor);
+        schedule.is_rest_day = false;
+        rebuilt.push(schedule);
+        cursor = next_learning_date(cursor, skip_weekends);
+    }
+    let mut future: Vec<_> = plan
+        .schedules
+        .iter()
+        .filter(|s| s.date >= target && !s.tasks.is_empty())
         .cloned()
         .collect();
-    future.sort_by(|left, right| left.date.cmp(&right.date));
+    future.sort_by(|a, b| a.date.cmp(&b.date));
     for mut schedule in future {
-        let original = parse_date_or_today(&schedule.date);
-        schedule.date = format_date(next_learning_date(original, plan.skip_weekends));
+        let shifted = parse_date_or_today(&shift_date(&schedule.date));
+        let actual = shifted.max(cursor);
+        schedule.date = format_date(actual);
         rebuilt.push(schedule);
+        cursor = next_learning_date(actual, skip_weekends);
     }
-
     plan.schedules = rebuilt;
-    rebuild_rest_days(plan);
     refresh_plan_schedule_summary(plan);
-    if plan.status == PlanStatus::Completed {
-        plan.status = PlanStatus::Active;
-    }
     Ok(true)
 }
 
 /// 将指定未来日期中已打卡的任务条目移动到今天。
 ///
 /// 若该计划在指定未来日期的全部任务均已完成，则移除该日并把更晚的日程
-/// 整体提前一个学习日；若只完成部分，则指定日期保留未完成条目，后续日程不动。
+/// 按实际日期依次补位；若只完成部分，则指定日期保留未完成条目，后续日程不动。
 pub fn advance_completed_tasks(
     plan: &mut StudyPlan,
     future_date_str: &str,
     today_str: &str,
 ) -> Result<usize, String> {
-    let today = format_date(parse_date_or_today(today_str));
-    let future_date = format_date(parse_date_or_today(future_date_str));
+    let today = format_date(validate_date(today_str)?);
+    let future_date = format_date(validate_date(future_date_str)?);
     if future_date <= today {
         return Ok(0);
     }
@@ -1253,6 +1111,8 @@ pub fn advance_completed_tasks(
     for mut task in original_tasks {
         if task.completed {
             task.advanced_from_date = Some(future_date.clone());
+            task.advance_restored = false;
+            task.updated_at = now_timestamp().max(task.updated_at.saturating_add(1));
             moved.push(task);
         } else {
             retained.push(task);
@@ -1266,13 +1126,15 @@ pub fn advance_completed_tasks(
     plan.schedules[source_index].tasks = retained;
 
     if full_day_completed {
-        // 该日整批完成：后续每个日程仅向前移动一个学习日。
-        for schedule in plan.schedules.iter_mut().filter(|schedule| {
-            schedule.date > future_date && !schedule.is_rest_day && !schedule.tasks.is_empty()
-        }) {
-            let original = parse_date_or_today(&schedule.date);
-            schedule.date = format_date(previous_learning_date(original, plan.skip_weekends));
-        }
+        let triggers = plan
+            .schedules
+            .iter()
+            .flat_map(|s| &s.tasks)
+            .filter(|t| t.advanced_from_date.as_deref() == Some(&future_date))
+            .map(|t| t.id.clone())
+            .chain(moved.iter().map(|t| t.id.clone()))
+            .collect();
+        crate::schedule_recovery::compact_day(plan, &future_date, triggers);
     }
 
     plan.schedules.retain(|schedule| {
@@ -1293,7 +1155,6 @@ pub fn advance_completed_tasks(
             is_rest_day: false,
         });
     }
-    rebuild_rest_days(plan);
     refresh_plan_schedule_summary(plan);
     Ok(moved_count)
 }
@@ -1580,6 +1441,114 @@ mod tests {
             capacities: vec![1000, 1000],
             total: 2000,
         }
+    }
+
+    #[test]
+    fn manual_move_preserves_task_and_other_schedules() {
+        let mut plan = create_study_plan(
+            "课程",
+            "bilibili",
+            "BV1",
+            "全集",
+            &mock_plan_out(),
+            "2026-09-01",
+            false,
+        );
+        let original = plan.clone();
+        let task = original.schedules[0].tasks[1].clone();
+        move_task_to_date(&mut plan, &task.id, "2026-09-05").unwrap();
+        assert_eq!(
+            plan.schedules[0].tasks,
+            vec![original.schedules[0].tasks[0].clone()]
+        );
+        assert_eq!(plan.schedules[1], original.schedules[1]);
+        let mut expected = task;
+        expected.updated_at = plan.schedules[2].tasks[0].updated_at;
+        assert_eq!(plan.schedules[2].tasks, vec![expected]);
+        assert_eq!(plan.total_duration, original.total_duration);
+        assert_eq!(plan.end_date, "2026-09-05");
+        let roundtrip: StudyPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(roundtrip, plan);
+    }
+
+    #[test]
+    fn manual_move_validates_before_mutation_and_same_day_is_noop() {
+        let mut plan = create_custom_study_plan("任务", "2026-09-01", 2, 30, false).unwrap();
+        let id = plan.schedules[0].tasks[0].id.clone();
+        let before = plan.clone();
+        assert!(move_task_to_date(&mut plan, &id, "2026-02-30").is_err());
+        assert!(move_task_to_date(&mut plan, "missing", "2026-09-02").is_err());
+        move_task_to_date(&mut plan, &id, "2026-09-01").unwrap();
+        assert_eq!(plan, before);
+    }
+
+    #[test]
+    fn manual_move_to_rest_day_merges_without_duplicate_dates() {
+        let mut plan = create_custom_study_plan("任务", "2026-09-04", 2, 30, true).unwrap();
+        let first = plan.schedules[0].tasks[0].id.clone();
+        let last = plan.schedules[3].tasks[0].id.clone();
+        move_task_to_date(&mut plan, &first, "2026-09-05").unwrap();
+        move_task_to_date(&mut plan, &last, "2026-09-05").unwrap();
+        assert_eq!(plan.schedules.len(), 1);
+        assert!(!plan.schedules[0].is_rest_day);
+        assert_eq!(plan.schedules[0].tasks.len(), 2);
+        assert_eq!(plan.planned_days, 1);
+        assert_eq!(plan.start_date, "2026-09-05");
+    }
+
+    #[test]
+    fn manual_move_composes_with_postpone_and_advance() {
+        let mut plan = create_custom_study_plan("任务", "2026-09-01", 3, 30, false).unwrap();
+        let id = plan.schedules[2].tasks[0].id.clone();
+        move_task_to_date(&mut plan, &id, "2026-09-02").unwrap();
+        push_forward_plan(&mut plan, "2026-09-02").unwrap();
+        assert!(plan
+            .schedules
+            .iter()
+            .find(|s| s.date == "2026-09-03")
+            .unwrap()
+            .tasks
+            .iter()
+            .any(|t| t.id == id));
+        let pid = plan.id.clone();
+        let mut plans = vec![plan];
+        toggle_task_checkin(&mut plans, &pid, &id).unwrap();
+        advance_completed_tasks(&mut plans[0], "2026-09-03", "2026-09-01").unwrap();
+        toggle_task_checkin(&mut plans, &pid, &id).unwrap();
+        assert!(plans[0]
+            .schedules
+            .iter()
+            .find(|s| s.date == "2026-09-03")
+            .unwrap()
+            .tasks
+            .iter()
+            .any(|t| t.id == id && !t.completed));
+    }
+
+    #[test]
+    fn manual_move_replaces_advanced_return_date_without_losing_checkin() {
+        let mut plan = create_custom_study_plan("任务", "2026-09-01", 3, 30, false).unwrap();
+        let id = plan.schedules[1].tasks[0].id.clone();
+        let pid = plan.id.clone();
+        let mut plans = vec![plan.clone()];
+        toggle_task_checkin(&mut plans, &pid, &id).unwrap();
+        plan = plans.remove(0);
+        advance_completed_tasks(&mut plan, "2026-09-02", "2026-09-01").unwrap();
+        let completed_at = plan.schedules[0]
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap()
+            .completed_at;
+        move_task_to_date(&mut plan, &id, "2026-09-06").unwrap();
+        let moved = &plan.schedules.last().unwrap().tasks[0];
+        assert!(moved.completed);
+        assert_eq!(moved.completed_at, completed_at);
+        assert_eq!(moved.advanced_from_date, None);
+        let mut plans = vec![plan];
+        toggle_task_checkin(&mut plans, &pid, &id).unwrap();
+        assert_eq!(plans[0].schedules.last().unwrap().date, "2026-09-06");
     }
 
     #[test]

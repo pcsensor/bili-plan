@@ -1,4 +1,4 @@
-use crate::models::{DailyNotes, DeviceUser, PlanStatus, StudyPlan};
+use crate::models::{DailyNotes, DeviceUser, StudyPlan};
 use chrono::{Local, Utc};
 use rand::Rng;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
@@ -293,92 +293,6 @@ impl Store {
         }
     }
 
-    fn refresh_plan_summary(plan: &mut StudyPlan) {
-        plan.schedules.sort_by(|left, right| left.date.cmp(&right.date));
-        let mut learning_day = 0usize;
-        for schedule in &mut plan.schedules {
-            schedule.day_index = learning_day;
-            if !schedule.is_rest_day {
-                learning_day += 1;
-            }
-        }
-        let task_schedules: Vec<_> = plan
-            .schedules
-            .iter()
-            .filter(|schedule| !schedule.is_rest_day && !schedule.tasks.is_empty())
-            .collect();
-        plan.planned_days = task_schedules.len();
-        plan.total_duration = task_schedules
-            .iter()
-            .flat_map(|schedule| schedule.tasks.iter())
-            .map(|task| task.portion)
-            .sum();
-        if let Some(first) = task_schedules.iter().map(|schedule| &schedule.date).min() {
-            plan.start_date = first.clone();
-        }
-        if let Some(last) = task_schedules.iter().map(|schedule| &schedule.date).max() {
-            plan.end_date = last.clone();
-        }
-    }
-
-    /// 把来自机器人取消打卡的任务放回来源日期。来源标记保留到客户端确认同步。
-    fn restore_cancelled_advanced_tasks(plan: &mut StudyPlan) {
-        let mut changed = false;
-        loop {
-            let location = plan.schedules.iter().enumerate().find_map(
-                |(schedule_index, schedule)| {
-                    schedule
-                        .tasks
-                        .iter()
-                        .enumerate()
-                        .find(|(_, task)| {
-                            !task.completed
-                                && task
-                                    .advanced_from_date
-                                    .as_deref()
-                                    .is_some_and(|date| date != schedule.date)
-                        })
-                        .map(|(task_index, task)| {
-                            (
-                                schedule_index,
-                                task_index,
-                                schedule.date.clone(),
-                                task.advanced_from_date.clone().unwrap_or_default(),
-                            )
-                        })
-                },
-            );
-            let Some((schedule_index, task_index, _current_date, restore_date)) = location else {
-                break;
-            };
-            let task = plan.schedules[schedule_index].tasks.remove(task_index);
-            if plan.schedules[schedule_index].tasks.is_empty()
-                && !plan.schedules[schedule_index].is_rest_day
-            {
-                plan.schedules.remove(schedule_index);
-            }
-            if let Some(schedule) = plan
-                .schedules
-                .iter_mut()
-                .find(|schedule| schedule.date == restore_date && !schedule.is_rest_day)
-            {
-                schedule.tasks.push(task);
-                schedule.tasks.sort_by_key(|task| task.vid_no);
-            } else {
-                plan.schedules.push(crate::models::DailySchedule {
-                    day_index: 0,
-                    date: restore_date,
-                    tasks: vec![task],
-                    is_rest_day: false,
-                });
-            }
-            changed = true;
-        }
-        if changed {
-            Self::refresh_plan_summary(plan);
-        }
-    }
-
     pub async fn get_or_create_device(&self, device_token: Option<&str>) -> DeviceUser {
         let mut conn = self.conn.lock().expect("SQLite mutex poisoned");
         if let Some(token) = device_token {
@@ -515,25 +429,7 @@ impl Store {
         let mut final_plans = Vec::new();
         for mut incoming in incoming_plans {
             if let Some(existing) = remote_map.remove(&incoming.id) {
-                let server_tasks = existing
-                    .schedules
-                    .iter()
-                    .flat_map(|schedule| schedule.tasks.iter())
-                    .map(|task| (task.id.as_str(), task))
-                    .collect::<HashMap<_, _>>();
-                for schedule in &mut incoming.schedules {
-                    for task in &mut schedule.tasks {
-                        if let Some(server_task) = server_tasks.get(task.id.as_str()) {
-                            if server_task.updated_at > task.updated_at {
-                                task.completed = server_task.completed;
-                                task.completed_at = server_task.completed_at;
-                                task.updated_at = server_task.updated_at;
-                                task.advanced_from_date = server_task.advanced_from_date.clone();
-                            }
-                        }
-                    }
-                }
-                Self::restore_cancelled_advanced_tasks(&mut incoming);
+                crate::schedule_recovery::merge_checkins(&mut incoming, &existing, true);
             }
             final_plans.push(incoming);
         }
@@ -557,71 +453,9 @@ impl Store {
         let mut plans = Self::load_plans(conn, token);
         let now = Utc::now().timestamp();
         for plan in plans.iter_mut().filter(|plan| plan.id == plan_id) {
-            let location = plan.schedules.iter().enumerate().find_map(
-                |(schedule_index, schedule)| {
-                    schedule
-                        .tasks
-                        .iter()
-                        .position(|task| task.id == task_id)
-                        .map(|task_index| (schedule_index, task_index))
-                },
-            );
-            let Some((schedule_index, task_index)) = location else {
+            let Some(is_completed) = crate::schedule_recovery::toggle(plan, task_id, now, true) else {
                 continue;
             };
-            let restore_date = plan.schedules[schedule_index].tasks[task_index]
-                .completed
-                .then(|| {
-                    plan.schedules[schedule_index].tasks[task_index]
-                        .advanced_from_date
-                        .clone()
-                })
-                .flatten();
-            if let Some(restore_date) = restore_date {
-                let mut task = plan.schedules[schedule_index].tasks.remove(task_index);
-                task.completed = false;
-                task.completed_at = None;
-                task.updated_at = now;
-                // 暂留来源标记，让客户端在增量同步时也能执行相同的结构归位。
-                task.advanced_from_date = Some(restore_date.clone());
-                if plan.schedules[schedule_index].tasks.is_empty()
-                    && !plan.schedules[schedule_index].is_rest_day
-                {
-                    plan.schedules.remove(schedule_index);
-                }
-                if let Some(schedule) = plan
-                    .schedules
-                    .iter_mut()
-                    .find(|schedule| schedule.date == restore_date && !schedule.is_rest_day)
-                {
-                    schedule.tasks.push(task);
-                    schedule.tasks.sort_by_key(|task| task.vid_no);
-                } else {
-                    plan.schedules.push(crate::models::DailySchedule {
-                        day_index: 0,
-                        date: restore_date,
-                        tasks: vec![task],
-                        is_rest_day: false,
-                    });
-                }
-                if plan.status == PlanStatus::Completed {
-                    plan.status = PlanStatus::Active;
-                }
-                Self::refresh_plan_summary(plan);
-                let tx = conn.transaction().map_err(|_| "数据库写入失败")?;
-                Self::save_plans_tx(&tx, token, &plans).map_err(|_| "数据库写入失败")?;
-                tx.commit().map_err(|_| "数据库写入失败")?;
-                return Ok(false);
-            }
-
-            let task = &mut plan.schedules[schedule_index].tasks[task_index];
-            task.completed = !task.completed;
-            task.completed_at = task.completed.then_some(now);
-            task.updated_at = now;
-            if task.completed {
-                task.advanced_from_date = None;
-            }
-            let is_completed = task.completed;
             let tx = conn.transaction().map_err(|_| "数据库写入失败")?;
             Self::save_plans_tx(&tx, token, &plans).map_err(|_| "数据库写入失败")?;
             tx.commit().map_err(|_| "数据库写入失败")?;
@@ -698,10 +532,11 @@ mod tests {
                     id: format!("{id}_{i}_0"), vid_no: i as i64 + 1,
                     title: format!("第{}讲", i + 1), portion: 500, remainder: 0,
                     from_prev: false, completed: false, completed_at: None, updated_at: 0,
-                    advanced_from_date: None,
+                    advanced_from_date: None, advance_restored: false,
                 }],
                 is_rest_day: false,
             }).collect(),
+            advance_shifts: Vec::new(),
             is_series: false,
             show_in_library: true,
         }
@@ -781,6 +616,45 @@ mod tests {
             .unwrap();
         assert!(!restored.completed);
         assert_eq!(restored.advanced_from_date.as_deref(), Some("2026-09-02"));
+    }
+
+    #[tokio::test]
+    async fn robot_cancel_full_day_restores_followers_after_stale_sync_and_restart() {
+        let dir = std::env::temp_dir().join(format!("store_full_restore_{}", rand::random::<u64>()));
+        let store = Store::new(&dir);
+        let user = store.get_or_create_device(None).await;
+        let token = user.device_token;
+        let code = store.generate_bind_code(&token).await.unwrap();
+        store.bind_telegram_by_code(&code, 987123, Some("learner")).await.unwrap();
+        let mut client = make_test_plan("p", &["2026-09-01", "2026-09-02", "2026-09-03"]);
+        let mut task = client.schedules[1].tasks.remove(0);
+        task.completed = true;
+        task.completed_at = Some(1);
+        task.updated_at = 1;
+        task.advanced_from_date = Some("2026-09-02".into());
+        crate::schedule_recovery::compact_day(&mut client, "2026-09-02", vec![task.id.clone()]);
+        client.schedules[0].tasks.push(task);
+        crate::schedule_recovery::refresh(&mut client);
+        store.sync_plans(&token, vec![client.clone()], DailyNotes::new()).await;
+        assert!(!store.toggle_task_by_telegram_chat_id(987123, "p", "p_1_0").await.unwrap());
+        // 同步前再次打卡：仍要把之前补位的日程还原到客户端。
+        assert!(store.toggle_task_by_telegram_chat_id(987123, "p", "p_1_0").await.unwrap());
+        drop(store);
+        let store = Store::new(&dir);
+        let (merged, _, _, _, _, _) = store.sync_plans(&token, vec![client.clone()], DailyNotes::new()).await;
+        crate::schedule_recovery::merge_checkins(&mut client, &merged[0], false);
+        assert_eq!(client.schedules[1].date, "2026-09-02");
+        assert_eq!(client.schedules[1].tasks[0].id, "p_1_0");
+        assert!(client.schedules[1].tasks[0].completed);
+        assert_eq!(client.schedules[2].date, "2026-09-03");
+        assert_eq!(client.schedules[2].tasks[0].id, "p_2_0");
+        assert!(client.advance_shifts.is_empty());
+        for _ in 0..3 {
+            let (merged, _, _, _, _, _) = store.sync_plans(&token, vec![client.clone()], DailyNotes::new()).await;
+            assert_eq!(merged[0].schedules, client.schedules);
+        }
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

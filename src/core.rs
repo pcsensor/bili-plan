@@ -680,6 +680,23 @@ pub fn append_calendar_series_task(
     Ok(())
 }
 
+/// 手动调整任意来源任务的日期，并沿用本地持久化流程。
+pub fn move_study_task_to_date(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    task_id: &str,
+    date: &str,
+) -> Result<(), String> {
+    let plan = cfg
+        .plans
+        .iter_mut()
+        .find(|plan| plan.id == plan_id)
+        .ok_or_else(|| "未找到指定任务所属计划。".to_string())?;
+    study::move_task_to_date(plan, task_id, date)?;
+    save_config(cfg);
+    Ok(())
+}
+
 /// 编辑右键日历创建的任务。
 pub fn update_calendar_task(
     cfg: &mut AppConfig,
@@ -920,28 +937,7 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
 
                 for plan in &mut cfg.plans {
                     if let Some(rp) = remote_map.get(&plan.id) {
-                        let mut remote_tasks: std::collections::HashMap<
-                            &str,
-                            &crate::study::TaskItem,
-                        > = std::collections::HashMap::new();
-                        for sch in &rp.schedules {
-                            for t in &sch.tasks {
-                                remote_tasks.insert(t.id.as_str(), t);
-                            }
-                        }
-
-                        for sch in &mut plan.schedules {
-                            for t in &mut sch.tasks {
-                                if let Some(rt) = remote_tasks.get(t.id.as_str()) {
-                                    if rt.updated_at > t.updated_at {
-                                        t.completed = rt.completed;
-                                        t.completed_at = rt.completed_at;
-                                        t.updated_at = rt.updated_at;
-                                        t.advanced_from_date = rt.advanced_from_date.clone();
-                                    }
-                                }
-                            }
-                        }
+                        crate::schedule_recovery::merge_checkins(plan, rp, true);
                     }
                 }
             }
@@ -954,7 +950,10 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
         }
     }
 
-    study::restore_cancelled_advanced_tasks(&mut cfg.plans);
+    // 保留归位信号给 GUI 合并：后台副本的排期不会直接覆盖正在操作的界面。
+    for plan in &mut cfg.plans {
+        crate::schedule_recovery::restore(plan, true);
+    }
 
     if let Some(bound) = data.get("feishu_bound").and_then(|b| b.as_bool()) {
         cfg.feishu_bound = bound;
@@ -1127,7 +1126,11 @@ mod tests {
         };
         record_history(&mut cfg, SourceMode::Bilibili, "BV1test", "测试合集");
         cfg.plans
-            .push(study::create_custom_study_plan("背单词", "2026-09-03", 2, 30, false).unwrap());
+            .push(study::create_custom_study_plan("背单词", "2026-09-03", 3, 30, false).unwrap());
+        let plan_id = cfg.plans[0].id.clone();
+        study::checkin_entire_day(&mut cfg.plans, &plan_id, "2026-09-04").unwrap();
+        study::advance_completed_tasks(&mut cfg.plans[0], "2026-09-04", "2026-09-03").unwrap();
+        assert!(!cfg.plans[0].advance_shifts.is_empty());
         study::add_daily_note(&mut cfg.daily_notes, "2026-09-03", "完成第一组单词").unwrap();
 
         LocalConfigStore::save(&db_path, &cfg).unwrap();
