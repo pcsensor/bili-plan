@@ -3040,6 +3040,10 @@ impl PlannerApp {
     fn render_today_checkin_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let stats = compute_study_stats(&self.config.plans, &self.selected_date);
+        let remaining_duration = stats
+            .today_total_duration
+            .saturating_sub(stats.today_completed_duration)
+            .max(0);
 
         // 1. 统计概览卡片 (Neo-Brutalist 三列硬阴影卡片)
         let stats_row = h_flex()
@@ -3134,6 +3138,15 @@ impl PlannerApp {
                                         fmt_seconds(stats.today_completed_duration as f64, true)
                                     )),
                             ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.primary)
+                            .child(format!(
+                                "今日剩余学习时长：{}",
+                                fmt_seconds(remaining_duration as f64, true)
+                            )),
                     ),
             )
             .child(
@@ -3381,6 +3394,11 @@ impl PlannerApp {
                 let source_url = items[0].source_url.clone();
                 let total_in_group = items.len();
                 let total_group_duration: i64 = items.iter().map(|t| t.task.portion).sum();
+                let remaining_group_duration: i64 = items
+                    .iter()
+                    .filter(|t| !t.task.completed)
+                    .map(|t| t.task.portion)
+                    .sum();
                 let done_in_group = items.iter().filter(|t| t.task.completed).count();
                 let is_all_group_done = total_in_group > 0 && done_in_group == total_in_group;
 
@@ -3630,12 +3648,28 @@ impl PlannerApp {
                                         .gap_3()
                                         .flex_shrink_0()
                                         .child(
-                                            div()
+                                            v_flex()
+                                                .gap_0p5()
                                                 .text_size(px(12.5))
-                                                .text_color(theme.muted_foreground)
-                                                .child(format!(
-                                                    "⏱️ 当日总时长：{}",
-                                                    fmt_seconds(total_group_duration as f64, true)
+                                                .child(
+                                                    div().text_color(theme.muted_foreground).child(
+                                                        format!(
+                                                            "⏱️ 当日总时长：{}",
+                                                            fmt_seconds(
+                                                                total_group_duration as f64,
+                                                                true
+                                                            )
+                                                        ),
+                                                    ),
+                                                )
+                                                .child(div().text_color(theme.primary).child(
+                                                    format!(
+                                                        "当日剩余时长：{}",
+                                                        fmt_seconds(
+                                                            remaining_group_duration as f64,
+                                                            true
+                                                        )
+                                                    ),
                                                 )),
                                         )
                                         .children((!is_all_group_done).then(|| {
