@@ -3380,6 +3380,7 @@ impl PlannerApp {
                 let source_type = items[0].source_type.clone();
                 let source_url = items[0].source_url.clone();
                 let total_in_group = items.len();
+                let total_group_duration: i64 = items.iter().map(|t| t.task.portion).sum();
                 let done_in_group = items.iter().filter(|t| t.task.completed).count();
                 let is_all_group_done = total_in_group > 0 && done_in_group == total_in_group;
 
@@ -3623,19 +3624,36 @@ impl PlannerApp {
                                                 )),
                                         ),
                                 )
-                                .children((!is_all_group_done).then(|| {
-                                    Button::new(("check-all-grp", grp_idx))
-                                        .small()
-                                        .label("一键打卡本科目今日")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.checkin_entire_day_action(
-                                                &pid_clone,
-                                                &sel_date_clone,
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                })),
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .flex_shrink_0()
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!(
+                                                    "⏱️ 当日总时长：{}",
+                                                    fmt_seconds(total_group_duration as f64, true)
+                                                )),
+                                        )
+                                        .children((!is_all_group_done).then(|| {
+                                            Button::new(("check-all-grp", grp_idx))
+                                                .small()
+                                                .label("一键打卡本科目今日")
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.checkin_entire_day_action(
+                                                            &pid_clone,
+                                                            &sel_date_clone,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                        })),
+                                ),
                         )
                         .child(v_flex().w_full().gap_2().children(task_rows))
                         .into_any_element(),
