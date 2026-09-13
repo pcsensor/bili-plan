@@ -69,10 +69,31 @@ impl Store {
         )
         .expect("无法初始化 SQLite 表结构");
         Self::migrate_legacy_json(&mut conn, &dir);
+        Self::ensure_unique_feishu_binding(&mut conn)
+            .expect("无法迁移飞书唯一绑定约束");
         Self {
             data_path,
             conn: Arc::new(Mutex::new(conn)),
         }
+    }
+
+    /// 兼容旧库的重复绑定：保留创建时间最新的设备，计划与其他平台绑定不变。
+    fn ensure_unique_feishu_binding(conn: &mut Connection) -> rusqlite::Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "UPDATE devices SET feishu_open_id = NULL, feishu_user_name = NULL
+             WHERE device_token IN (
+                 SELECT device_token FROM (
+                     SELECT device_token, ROW_NUMBER() OVER (
+                         PARTITION BY feishu_open_id ORDER BY created_at DESC, rowid DESC
+                     ) AS binding_rank
+                     FROM devices WHERE feishu_open_id IS NOT NULL
+                 ) WHERE binding_rank > 1
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_feishu_unique
+                 ON devices(feishu_open_id) WHERE feishu_open_id IS NOT NULL;",
+        )?;
+        tx.commit()
     }
 
     /// 自动导入首次发现的旧 `store.json`；原文件保留作备份。
@@ -340,6 +361,11 @@ impl Store {
         updated.feishu_user_name = user_name.map(str::to_string);
         updated.bind_code = None;
         let tx = conn.transaction().map_err(|_| "数据库写入失败")?;
+        tx.execute(
+            "UPDATE devices SET feishu_open_id = NULL, feishu_user_name = NULL
+             WHERE feishu_open_id = ?1 AND device_token != ?2",
+            params![open_id, updated.device_token],
+        ).map_err(|_| "数据库写入失败")?;
         Self::upsert_device_tx(&tx, &updated).map_err(|_| "数据库写入失败")?;
         tx.commit().map_err(|_| "数据库写入失败")?;
         Ok(updated)
@@ -540,6 +566,76 @@ mod tests {
             is_series: false,
             show_in_library: true,
         }
+    }
+
+    #[tokio::test]
+    async fn feishu_rebinding_moves_lookup_and_scheduler_without_losing_plans() {
+        let dir = std::env::temp_dir().join(format!("store_rebind_{}", rand::random::<u64>()));
+        let store = Store::new(&dir);
+        for token in ["old", "current"] {
+            store.sync_plans(token, vec![make_test_plan(token, &["2026-09-13"])], DailyNotes::new()).await;
+        }
+        let code = store.generate_bind_code("old").await.unwrap();
+        store.bind_feishu_for_test(&code, "reader").await;
+        let code = store.generate_bind_code("current").await.unwrap();
+        assert!(store.bind_by_code("invalid-code", "reader", None).await.is_err());
+        assert_eq!(store.get_plans_by_open_id("reader").await.unwrap().0.device_token, "old");
+        store.bind_feishu_for_test(&code, "reader").await;
+        assert!(store.bind_by_code(&code, "reader", None).await.is_err());
+        let (user, plans) = store.get_plans_by_open_id("reader").await.unwrap();
+        assert_eq!(user.device_token, "current");
+        assert_eq!(plans[0].id, "current");
+        assert_eq!(store.get_all_bound_users().await.len(), 1);
+        // 旧客户端继续同步也不能恢复已经解除的绑定。
+        let (_, _, bound, _, _, _) = store.sync_plans("old", vec![make_test_plan("old", &["2026-09-13"])], DailyNotes::new()).await;
+        assert!(!bound);
+        assert_eq!(Store::load_plans(&store.conn.lock().unwrap(), "old").len(), 1);
+        drop(store);
+        let restarted = Store::new(&dir);
+        assert_eq!(restarted.get_all_bound_users().await.len(), 1);
+        assert_eq!(restarted.get_plans_by_open_id("reader").await.unwrap().0.device_token, "current");
+        drop(restarted);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    impl Store {
+        async fn bind_feishu_for_test(&self, code: &str, open_id: &str) {
+            self.bind_by_code(code, open_id, Some("test user")).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_feishu_bindings_are_migrated_and_constrained() {
+        let dir = std::env::temp_dir().join(format!("store_binding_migration_{}", rand::random::<u64>()));
+        let store = Store::new(&dir);
+        for token in ["old", "current", "other"] {
+            store.sync_plans(token, vec![make_test_plan(token, &["2026-09-13"])], DailyNotes::new()).await;
+        }
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP INDEX idx_devices_feishu_unique;
+                 UPDATE devices SET feishu_open_id='reader', feishu_user_name='name', created_at='2026-09-01' WHERE device_token='old';
+                 UPDATE devices SET telegram_chat_id=123 WHERE device_token='old';
+                 UPDATE devices SET feishu_open_id='reader', feishu_user_name='name', created_at='2026-09-09' WHERE device_token='current';
+                 UPDATE devices SET feishu_open_id='another-reader' WHERE device_token='other';"
+            ).unwrap();
+        }
+        drop(store);
+        let store = Store::new(&dir);
+        assert_eq!(store.get_plans_by_open_id("reader").await.unwrap().0.device_token, "current");
+        assert_eq!(store.get_all_bound_users().await.len(), 2);
+        {
+            let conn = store.conn.lock().unwrap();
+            let old = Store::get_device(&conn, "old").unwrap();
+            assert!(old.feishu_open_id.is_none());
+            assert!(old.feishu_user_name.is_none());
+            assert_eq!(old.telegram_chat_id, Some(123));
+            assert_eq!(Store::load_plans(&conn, "old").len(), 1);
+            assert!(conn.execute("UPDATE devices SET feishu_open_id='reader' WHERE device_token='old'", []).is_err());
+        }
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
