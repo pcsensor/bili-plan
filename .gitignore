@@ -20,6 +20,17 @@ target/
 *.key
 *.pem
 *.p12
+# 本地配置数据库及 SQLite 辅助文件（包含登录凭据）
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+.bili-planner.json
+.bili-planner.json.*
 
 # ============================================================
 # IDE / 编辑器 配置与缓存
@@ -91,6 +102,8 @@ docs/
 
 # live_check 真机联调输出（含私有服务器信息，不入库）
 live_check*.out
+# 飞牛接口诊断响应含私有媒体名称、NAS 路径与条目 ID
+fnos-probe-dump*.json
 
 # 性能分析 / 覆盖率
 coverage/

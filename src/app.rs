@@ -83,6 +83,26 @@ struct CalendarTaskEditSeed {
     portion: i64,
 }
 
+/// 来源标记（`StudyPlan.source_type` / 历史记录 `source`）→ 展示用图标与短名。
+///
+/// 集中一处，避免新增来源时在各处散落的 `if tag == "jellyfin"` 分支漏改。
+fn source_badge(tag: &str) -> (&'static str, &'static str) {
+    match tag {
+        "jellyfin" => ("icons/film.svg", "JF"),
+        "fnos" => ("icons/server.svg", "飞牛"),
+        _ => ("icons/tv.svg", "B站"),
+    }
+}
+
+/// 来源标记 → 来源枚举。未知标记回退 B 站（兼容旧数据）。
+fn source_mode_of(tag: &str) -> SourceMode {
+    match tag {
+        "jellyfin" => SourceMode::Jellyfin,
+        "fnos" => SourceMode::FnOs,
+        _ => SourceMode::Bilibili,
+    }
+}
+
 /// 打开外部视频链接。
 fn open_video_link(source_type: &str, source_url: &str, vid_no: i64) {
     if source_url.trim().is_empty() {
@@ -430,6 +450,10 @@ pub struct PlannerApp {
     cookie_input: Entity<InputState>,
     jf_server_input: Entity<InputState>,
     jf_token_input: Entity<InputState>,
+    /// 飞牛影视来源的服务器地址与登录凭证（地址 + 账号 + 密码）。
+    fnos_server_input: Entity<InputState>,
+    fnos_user_input: Entity<InputState>,
+    fnos_password_input: Entity<InputState>,
     days_input: Entity<InputState>,
     /// 云端同步服务地址（在标题栏“云端设置”中编辑）。
     cloud_server_input: Entity<InputState>,
@@ -503,6 +527,15 @@ impl PlannerApp {
         let jf_token_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Jellyfin 后台「控制台 → 高级 → API 密钥」生成")
+                .masked(true)
+        });
+        let fnos_server_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("http://192.168.1.10:5666"));
+        let fnos_user_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("飞牛影视账号（非飞牛系统账号）"));
+        let fnos_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("飞牛影视密码")
                 .masked(true)
         });
         let days_input = cx.new(|cx| InputState::new(window, cx).placeholder("如 30"));
@@ -589,6 +622,21 @@ impl PlannerApp {
                 state.set_value(config.token.clone(), window, cx)
             });
         }
+        if !config.fnos_server_url.trim().is_empty() {
+            fnos_server_input.update(cx, |state, cx| {
+                state.set_value(config.fnos_server_url.clone(), window, cx)
+            });
+        }
+        if !config.fnos_username.trim().is_empty() {
+            fnos_user_input.update(cx, |state, cx| {
+                state.set_value(config.fnos_username.clone(), window, cx)
+            });
+        }
+        if !config.fnos_password.is_empty() {
+            fnos_password_input.update(cx, |state, cx| {
+                state.set_value(config.fnos_password.clone(), window, cx)
+            });
+        }
         cloud_server_input.update(cx, |state, cx| {
             state.set_value(config.sync_server_url.clone(), window, cx)
         });
@@ -616,6 +664,9 @@ impl PlannerApp {
             cookie_input,
             jf_server_input,
             jf_token_input,
+            fnos_server_input,
+            fnos_user_input,
+            fnos_password_input,
             days_input,
             cloud_server_input,
             calendar_year,
@@ -804,6 +855,37 @@ impl PlannerApp {
                 }
                 FetchSource::Jellyfin { server_url, token }
             }
+            SourceMode::FnOs => {
+                let mut base_url = self.input_value(&self.fnos_server_input, cx);
+                let username = self.input_value(&self.fnos_user_input, cx);
+                let password = self.input_value(&self.fnos_password_input, cx);
+                // 服务器地址留空时，尝试从粘贴的链接反推 `scheme://host:port`
+                // 并回填输入框——省去让用户从链接里手抄 NAS 地址。
+                if base_url.trim().is_empty() {
+                    if let Some(derived) = crate::jellyfin::extract_base_url(&input) {
+                        base_url = derived;
+                        self.fnos_server_input.update(cx, |state, cx| {
+                            state.set_value(base_url.clone(), window, cx)
+                        });
+                    }
+                }
+                // 前端先做最小校验，避免起任务后才报错；core 会再 trim 检查。
+                if base_url.trim().is_empty() {
+                    window
+                        .push_notification(Notification::warning("请填写飞牛影视服务器地址。"), cx);
+                    return;
+                }
+                if username.trim().is_empty() || password.is_empty() {
+                    window
+                        .push_notification(Notification::warning("请填写飞牛影视账号与密码。"), cx);
+                    return;
+                }
+                FetchSource::FnOs {
+                    base_url,
+                    username,
+                    password,
+                }
+            }
         };
 
         self.phase = Phase::Loading;
@@ -836,7 +918,7 @@ impl PlannerApp {
     ) {
         match result {
             Ok(mut rd) => {
-                // 本次成功：记住凭证（Jellyfin）+ 记录搜索历史并写盘。
+                // 本次成功：记住凭证（Jellyfin / 飞牛影视）+ 记录搜索历史并写盘。
                 if matches!(source_mode, SourceMode::Jellyfin) {
                     self.config.server_url = self
                         .input_value(&self.jf_server_input, cx)
@@ -846,6 +928,19 @@ impl PlannerApp {
                         .input_value(&self.jf_token_input, cx)
                         .trim()
                         .to_string();
+                }
+                if matches!(source_mode, SourceMode::FnOs) {
+                    self.config.fnos_server_url = self
+                        .input_value(&self.fnos_server_input, cx)
+                        .trim()
+                        .trim_end_matches('/')
+                        .to_string();
+                    self.config.fnos_username = self
+                        .input_value(&self.fnos_user_input, cx)
+                        .trim()
+                        .to_string();
+                    // 密码不做 trim：前后空格可能是密码本身的一部分。
+                    self.config.fnos_password = self.input_value(&self.fnos_password_input, cx);
                 }
                 record_history(&mut self.config, source_mode, &input, &rd.season_title);
                 save_config(&self.config);
@@ -1004,6 +1099,7 @@ impl PlannerApp {
                 "https://www.bilibili.com/video/BV1ps4y1d73V 或 BV 号 或 sid=6789"
             }
             SourceMode::Jellyfin => "https://host/web/#!/details?id=xxx 或直接粘贴 item ID",
+            SourceMode::FnOs => "http://host:5666/v/video?guid=fv_xxxx 或直接粘贴条目 guid",
         };
         self.link_input.update(cx, |state, cx| {
             state.set_placeholder(placeholder, window, cx)
@@ -1087,10 +1183,7 @@ impl PlannerApp {
                 }
             }
         };
-        let source_tag = match self.source {
-            SourceMode::Bilibili => "bilibili",
-            SourceMode::Jellyfin => "jellyfin",
-        };
+        let source_tag = crate::core::source_tag(self.source);
 
         match enroll_study_plan(
             &mut self.config,
@@ -1831,11 +1924,7 @@ impl PlannerApp {
             return;
         };
         let entry = entry.clone();
-        let source = if entry.source == "jellyfin" {
-            SourceMode::Jellyfin
-        } else {
-            SourceMode::Bilibili
-        };
+        let source = source_mode_of(&entry.source);
         if source != self.source {
             self.switch_source(source, window, cx);
         }
@@ -1887,11 +1976,7 @@ impl PlannerApp {
             .iter()
             .enumerate()
             .map(|(i, h)| {
-                let (icon_path, source_label) = if h.source == "jellyfin" {
-                    ("icons/film.svg", "JF")
-                } else {
-                    ("icons/tv.svg", "B站")
-                };
+                let (icon_path, source_label) = source_badge(&h.source);
                 let display = if h.title.is_empty() {
                     h.input.clone()
                 } else {
@@ -2401,6 +2486,16 @@ impl PlannerApp {
                         this.switch_source(SourceMode::Jellyfin, window, cx);
                     })),
             )
+            .child(
+                Button::new("source-fnos")
+                    .small()
+                    .icon(Icon::empty().path("icons/server.svg").size_4())
+                    .label("飞牛影视")
+                    .when(self.source == SourceMode::FnOs, |b| b.primary())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.switch_source(SourceMode::FnOs, window, cx);
+                    })),
+            )
     }
 
     /// 计划模式切换用的成组按钮。
@@ -2458,6 +2553,10 @@ impl PlannerApp {
                 "Jellyfin 链接 / item ID",
                 "粘贴 Jellyfin 网页详情页链接（取 ?id= 后部分）或直接 item ID；首次填写服务器/Token 后会自动保存到本机",
             ),
+            SourceMode::FnOs => (
+                "飞牛影视链接 / 条目 guid",
+                "粘贴飞牛影视网页链接（自动取 ?guid= 参数或路径末段）或直接输入 guid；首次填写服务器/账号后会自动保存到本机",
+            ),
         };
 
         let hint = if loading {
@@ -2469,6 +2568,9 @@ impl PlannerApp {
                 }
                 SourceMode::Jellyfin => {
                     "提示：若拉取失败，请确认 Token 有效且 Jellyfin 可访问".to_string()
+                }
+                SourceMode::FnOs => {
+                    "提示：链接需指向影视库/合集/季（有下级剧集），服务器需可从本机访问".to_string()
                 }
             }
         };
@@ -2538,6 +2640,35 @@ impl PlannerApp {
                             cx,
                         ))
                         .child(Input::new(&self.jf_token_input).cleanable(true))
+                        .into_any_element(),
+                ],
+                SourceMode::FnOs => vec![
+                    v_flex()
+                        .gap_1()
+                        .child(Self::field_label(
+                            "飞牛影视服务器地址",
+                            "形如 http://192.168.1.10:5666（不含 /v 等路径）",
+                            cx,
+                        ))
+                        .child(Input::new(&self.fnos_server_input).cleanable(true))
+                        .into_any_element(),
+                    v_flex()
+                        .gap_1()
+                        .child(Self::field_label(
+                            "飞牛影视账号",
+                            "飞牛影视自己的账号，不是飞牛系统登录账号",
+                            cx,
+                        ))
+                        .child(Input::new(&self.fnos_user_input).cleanable(true))
+                        .into_any_element(),
+                    v_flex()
+                        .gap_1()
+                        .child(Self::field_label(
+                            "飞牛影视密码",
+                            "仅保存在本机，用于换取登录 token",
+                            cx,
+                        ))
+                        .child(Input::new(&self.fnos_password_input).cleanable(true))
                         .into_any_element(),
                 ],
             })
@@ -3608,11 +3739,7 @@ impl PlannerApp {
                                         .gap_2()
                                         .child(
                                             Icon::empty()
-                                                .path(if source_type == "jellyfin" {
-                                                    "icons/film.svg"
-                                                } else {
-                                                    "icons/tv.svg"
-                                                })
+                                                .path(source_badge(&source_type).0)
                                                 .size_4()
                                                 .text_color(theme.primary),
                                         )

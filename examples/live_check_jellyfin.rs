@@ -1,6 +1,6 @@
 //! Jellyfin 端到端验证：命令行方式跑真实服务器，定位失败点。
 //! 用法：cargo run --example live_check_jellyfin -- "<链接/item ID>" [days] [all|科目号] [split|whole]
-//! 服务器地址可用环境变量 JF_SERVER 覆盖；令牌必须通过 JF_TOKEN 提供（不再内置）。
+//! 服务器地址和令牌分别通过环境变量 JF_SERVER / JF_TOKEN 提供。
 
 use bili_planner::core::{fetch_and_parse, generate_plan, FetchSource, Selection};
 use bili_planner::export;
@@ -8,11 +8,9 @@ use bili_planner::plan::Mode;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let input = args.get(1).cloned().unwrap_or_else(|| {
-        "https://jellyfin.pcsensor.cloud/web/#/list?\
-             parentId=699396e43b7061237d5b0c43086c7e42\
-             &serverId=eebf26e5024f4fb59c9ff3eabfbadaef"
-            .to_string()
+    let input = args.get(1).cloned().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| {
+        eprintln!("用法：cargo run --example live_check_jellyfin -- <链接/item ID> [days] [all|科目号] [split|whole]");
+        std::process::exit(1);
     });
     let days: i64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let select = args.get(3).map(|s| s.as_str()).unwrap_or("all");
@@ -21,16 +19,23 @@ fn main() {
     } else {
         Mode::Split
     };
-    let server =
-        std::env::var("JF_SERVER").unwrap_or_else(|_| "https://jellyfin.pcsensor.cloud".into());
-    let token = std::env::var("JF_TOKEN").unwrap_or_else(|_| {
-        eprintln!("!! 缺少环境变量 JF_TOKEN（出于安全考虑，令牌不再内置，请设置后重试）。");
-        std::process::exit(1);
-    });
+    let server = std::env::var("JF_SERVER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            eprintln!("!! 请设置环境变量 JF_SERVER。");
+            std::process::exit(1);
+        });
+    let token = std::env::var("JF_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            eprintln!("!! 请设置环境变量 JF_TOKEN。");
+            std::process::exit(1);
+        });
 
     eprintln!("== 输入：{input}");
     eprintln!("== 服务器：{server}");
-    eprintln!("== Token：{}…", &token[..6]);
 
     let source = FetchSource::Jellyfin {
         server_url: server,

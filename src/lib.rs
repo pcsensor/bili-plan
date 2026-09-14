@@ -6,6 +6,7 @@ pub mod assets;
 pub mod core;
 pub mod error;
 pub mod export;
+pub mod fnos;
 pub mod jellyfin;
 pub mod model;
 pub mod parse;
@@ -14,6 +15,11 @@ pub mod study;
 pub mod theme;
 
 pub use error::{Error, ErrorKind, Result};
+pub use fnos::{
+    classify_children, derive_root_title, duration_of, episode_from, episode_title_of,
+    extract_guid, gen_authx, item_list_body, md5_hex, order_items, FnItem, FnOsClient,
+    ItemListData,
+};
 pub use jellyfin::{
     classify_item, extract_base_url, extract_item_id, fetch_groups, group_episodes_by_season,
     group_episodes_by_series, ticks_to_secs, Item, JellyfinClient,

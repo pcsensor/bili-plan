@@ -26,16 +26,22 @@ pub enum Selection {
     Single(usize),
 }
 
-/// 视频来源：决定 `fetch_and_parse` 走 B 站还是 Jellyfin 适配器。
+/// 视频来源：决定 `fetch_and_parse` 走哪条适配器。
 ///
 /// UI 通过来源切换控件构造本枚举传给 `fetch_and_parse`，
-/// 实现一处入口、两条适配器路径。
+/// 实现一处入口、三条适配器路径。
 #[derive(Debug, Clone)]
 pub enum FetchSource {
     /// B 站：可选 Cookie（SESSDATA），用于风控时匿名→登录升级。
     Bilibili { cookie: Option<String> },
     /// Jellyfin：服务器地址 + API Token（必填）。
     Jellyfin { server_url: String, token: String },
+    /// 飞牛影视：服务器地址 + 账号密码（必填，用于换取并缓存登录 token）。
+    FnOs {
+        base_url: String,
+        username: String,
+        password: String,
+    },
 }
 
 /// UI 来源切换的状态枚举（与 `plan::Mode` 同样模式：`from_index`/`index`）。
@@ -44,20 +50,22 @@ pub enum SourceMode {
     #[default]
     Bilibili,
     Jellyfin,
+    FnOs,
 }
 
 impl SourceMode {
     pub fn from_index(i: usize) -> Self {
-        if i == 0 {
-            Self::Bilibili
-        } else {
-            Self::Jellyfin
+        match i {
+            0 => Self::Bilibili,
+            1 => Self::Jellyfin,
+            _ => Self::FnOs,
         }
     }
     pub fn index(self) -> usize {
         match self {
             Self::Bilibili => 0,
             Self::Jellyfin => 1,
+            Self::FnOs => 2,
         }
     }
 }
@@ -67,7 +75,7 @@ impl SourceMode {
 pub struct HistoryEntry {
     /// 用户输入的链接 / BV 号 / item ID（trim 后）。
     pub input: String,
-    /// 来源："bilibili" 或 "jellyfin"。
+    /// 来源："bilibili"、"jellyfin" 或 "fnos"。
     pub source: String,
     /// 获取成功时的合集标题（用于列表展示，可为空）。
     pub title: String,
@@ -111,6 +119,16 @@ pub struct AppConfig {
     pub server_url: String,
     #[serde(default)]
     pub token: String,
+    /// 飞牛影视服务器地址（形如 http://host:5666）。
+    #[serde(default)]
+    pub fnos_server_url: String,
+    /// 飞牛影视登录账号。
+    #[serde(default)]
+    pub fnos_username: String,
+    /// 飞牛影视登录密码。与 Jellyfin Token 一样明文存本机 SQLite，
+    /// 不做加密（与既有取舍保持一致）。
+    #[serde(default)]
+    pub fnos_password: String,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
     #[serde(default)]
@@ -138,6 +156,9 @@ impl Default for AppConfig {
         Self {
             server_url: String::new(),
             token: String::new(),
+            fnos_server_url: String::new(),
+            fnos_username: String::new(),
+            fnos_password: String::new(),
             history: Vec::new(),
             plans: Vec::new(),
             daily_notes: DailyNotes::new(),
@@ -156,10 +177,14 @@ impl Default for AppConfig {
 pub const HISTORY_LIMIT: usize = 20;
 
 /// 来源枚举 → 历史记录里的字符串标记。
-fn source_tag(source: SourceMode) -> &'static str {
+///
+/// 同时作为 `StudyPlan.source_type` 落库，供 UI 还原来源图标与链接，
+/// 因此对外公开，避免各调用点各写一份 match 漏掉新增来源。
+pub fn source_tag(source: SourceMode) -> &'static str {
     match source {
         SourceMode::Bilibili => "bilibili",
         SourceMode::Jellyfin => "jellyfin",
+        SourceMode::FnOs => "fnos",
     }
 }
 
@@ -230,8 +255,9 @@ pub struct PlanData {
 ///
 /// - `FetchSource::Bilibili`：sid → 归档接口；否则 BV → view API → parse_groups
 /// - `FetchSource::Jellyfin`：`JellyfinClient` → `jellyfin::fetch_groups`
+/// - `FetchSource::FnOs`：`FnOsClient`（登录换 token）→ `fnos::fetch_groups`
 ///
-/// 两条路径共用 `ReadyState` 构造与默认选择策略（多科目→All，单科目→Single(0)），
+/// 三条路径共用 `ReadyState` 构造与默认选择策略（多科目→All，单科目→Single(0)），
 /// 后续计划生成、表格、导出与来源无关。
 pub fn fetch_and_parse(input: &str, source: &FetchSource) -> Result<ReadyState, String> {
     let r = (|| -> crate::Result<ReadyState> {
@@ -277,6 +303,27 @@ pub fn fetch_and_parse(input: &str, source: &FetchSource) -> Result<ReadyState, 
                     token.trim().to_string(),
                 );
                 crate::jellyfin::fetch_groups(&client, input)?
+            }
+            FetchSource::FnOs {
+                base_url,
+                username,
+                password,
+            } => {
+                if base_url.trim().is_empty() {
+                    return Err(Error::input("请填写飞牛影视服务器地址。"));
+                }
+                if username.trim().is_empty() {
+                    return Err(Error::input("请填写飞牛影视账号。"));
+                }
+                if password.is_empty() {
+                    return Err(Error::input("请填写飞牛影视密码。"));
+                }
+                let client = crate::fnos::FnOsClient::new(
+                    base_url.trim(),
+                    username.trim(),
+                    password.clone(),
+                );
+                crate::fnos::fetch_groups(&client, input)?
             }
         };
         let selection = if groups.len() > 1 {
@@ -1028,8 +1075,43 @@ mod tests {
     fn source_mode_roundtrip() {
         assert_eq!(SourceMode::from_index(0), SourceMode::Bilibili);
         assert_eq!(SourceMode::from_index(1), SourceMode::Jellyfin);
+        assert_eq!(SourceMode::from_index(2), SourceMode::FnOs);
+        // 越界索引回退到最后一个来源，不 panic。
+        assert_eq!(SourceMode::from_index(9), SourceMode::FnOs);
         assert_eq!(SourceMode::Bilibili.index(), 0);
         assert_eq!(SourceMode::Jellyfin.index(), 1);
+        assert_eq!(SourceMode::FnOs.index(), 2);
+    }
+
+    #[test]
+    fn fnos_credentials_roundtrip_and_legacy_defaults() {
+        let cfg = AppConfig {
+            fnos_server_url: "http://nas:5666".to_string(),
+            fnos_username: "admin".to_string(),
+            fnos_password: "secret".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fnos_server_url, "http://nas:5666");
+        assert_eq!(parsed.fnos_username, "admin");
+        assert_eq!(parsed.fnos_password, "secret");
+
+        // 旧配置没有这三个键时必须能无损读入。
+        let legacy: AppConfig = serde_json::from_str(r#"{"server_url":"http://jf"}"#).unwrap();
+        assert!(legacy.fnos_server_url.is_empty());
+        assert!(legacy.fnos_username.is_empty());
+        assert!(legacy.fnos_password.is_empty());
+    }
+
+    #[test]
+    fn history_distinguishes_fnos_source_tag() {
+        let mut cfg = AppConfig::default();
+        record_history(&mut cfg, SourceMode::FnOs, "fv_abc", "飞牛剧集");
+        assert_eq!(cfg.history[0].source, "fnos");
+        // 同一输入在不同来源下视为两条独立记录。
+        record_history(&mut cfg, SourceMode::Jellyfin, "fv_abc", "");
+        assert_eq!(cfg.history.len(), 2);
     }
 
     #[test]
