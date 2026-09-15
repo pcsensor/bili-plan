@@ -1,6 +1,6 @@
 //! 只读联调：凭据从 FNOS_URL / FNOS_USER / FNOS_PASS 环境变量读取。
 //! cargo run --example live_check_fnos -- <guid|链接> [预期视频数]
-use bili_planner::fnos::{fetch_groups, FnOsClient};
+use bili_planner::fnos::{fetch_groups_with_progress, FnOsClient};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -11,7 +11,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FNOS_USER")?,
         std::env::var("FNOS_PASS")?,
     );
-    let (title, groups, structure) = fetch_groups(&client, &input)?;
+    let started = std::time::Instant::now();
+    let (title, groups, structure) = fetch_groups_with_progress(&client, &input, &mut |message| {
+        eprintln!("[{} 秒] {message}", started.elapsed().as_secs());
+    })?;
     let count: usize = groups.iter().map(|g| g.episodes.len()).sum();
     let seconds: i64 = groups
         .iter()

@@ -260,6 +260,15 @@ pub struct PlanData {
 /// 三条路径共用 `ReadyState` 构造与默认选择策略（多科目→All，单科目→Single(0)），
 /// 后续计划生成、表格、导出与来源无关。
 pub fn fetch_and_parse(input: &str, source: &FetchSource) -> Result<ReadyState, String> {
+    fetch_and_parse_with_progress(input, source, &mut |_| {})
+}
+
+/// 后台取数进度。回调运行于调用线程，UI 通过消息传递接收。
+pub fn fetch_and_parse_with_progress(
+    input: &str,
+    source: &FetchSource,
+    progress: &mut dyn FnMut(String),
+) -> Result<ReadyState, String> {
     let r = (|| -> crate::Result<ReadyState> {
         let (season_title, groups, structure) = match source {
             FetchSource::Bilibili { cookie } => {
@@ -323,7 +332,7 @@ pub fn fetch_and_parse(input: &str, source: &FetchSource) -> Result<ReadyState, 
                     username.trim(),
                     password.clone(),
                 );
-                crate::fnos::fetch_groups(&client, input)?
+                crate::fnos::fetch_groups_with_progress(&client, input, progress)?
             }
         };
         let selection = if groups.len() > 1 {

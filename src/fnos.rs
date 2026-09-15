@@ -35,8 +35,11 @@
 //! `item/list` 的 `duration` 字段单位是**秒**；`runtime` 是分钟，仅在
 //! `duration` 缺失或为 0 时兜底换算。
 
-use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc, Mutex,
+};
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
@@ -67,6 +70,8 @@ const DEFAULT_RETRIES: u32 = 3;
 const MAX_DEPTH: usize = 8;
 const PAGE_SIZE: usize = 200;
 const MAX_PAGES: usize = 10_000;
+const DURATION_WORKERS: usize = 3;
+const DURATION_POLL_ATTEMPTS: usize = 5;
 
 /// `item/list` 的业务错误码：签名无效（换 nonce/timestamp 重试即可）。
 const CODE_INVALID_SIGN: i64 = 5000;
@@ -503,7 +508,7 @@ pub struct FnOsClient {
     pub base_url: String,
     pub username: String,
     pub password: String,
-    token: RefCell<Option<String>>,
+    token: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for FnOsClient {
@@ -527,13 +532,13 @@ impl FnOsClient {
             base_url: base_url.into().trim().trim_end_matches('/').to_string(),
             username: username.into(),
             password: password.into(),
-            token: RefCell::new(None),
+            token: Mutex::new(None),
         }
     }
 
     /// 当前 token（无则登录）。
     fn token(&self) -> Result<String> {
-        if let Some(token) = self.token.borrow().as_ref() {
+        if let Some(token) = self.token.lock().unwrap().as_ref() {
             return Ok(token.clone());
         }
         self.login()
@@ -555,7 +560,7 @@ impl FnOsClient {
             .token
             .filter(|t| !t.trim().is_empty())
             .ok_or_else(|| Error::api("飞牛影视登录成功但未返回 token。"))?;
-        *self.token.borrow_mut() = Some(token.clone());
+        *self.token.lock().unwrap() = Some(token.clone());
         Ok(token)
     }
 
@@ -578,7 +583,7 @@ impl FnOsClient {
                 Ok(value) => return Ok(value),
                 Err(PostError::Expired) => {
                     last_err = "登录态已失效".to_string();
-                    *self.token.borrow_mut() = None;
+                    *self.token.lock().unwrap() = None;
                     if attempt + 1 >= max_attempts {
                         break;
                     }
@@ -713,23 +718,32 @@ impl FnOsClient {
                     .ok_or_else(|| Error::data("视频信息未返回文件 ID，无法探测时长。"))?
             }
         };
-        let data = self
-            .send(
-                API_STREAM,
-                serde_json::json!({
-                    "media_guid": media_guid,
-                    "level": 0,
-                    "ip": "bili-planner",
-                    "header": {"User-Agent": [crate::api::DEFAULT_UA]},
-                }),
-                true,
-            )
-            .map_err(Error::api)?;
-        stream_duration(data)
+        wait_for_duration(
+            || {
+                let data = self
+                    .send(
+                        API_STREAM,
+                        serde_json::json!({
+                            "media_guid": media_guid,
+                            "level": 0,
+                            "ip": "bili-planner",
+                            "header": {"User-Agent": [crate::api::DEFAULT_UA]},
+                        }),
+                        true,
+                    )
+                    .map_err(Error::api)?;
+                stream_duration(data)
+            },
+            || std::thread::sleep(Duration::from_secs(1)),
+        )
     }
 
-    fn complete_durations(&self, items: &mut [FnItem]) -> Result<()> {
-        complete_durations(items, |item| self.resolve_duration(item))
+    fn complete_durations(
+        &self,
+        items: &mut [FnItem],
+        progress: &mut dyn FnMut(String),
+    ) -> Result<()> {
+        complete_durations(items, |item| self.resolve_duration(item), progress)
     }
 }
 
@@ -740,39 +754,127 @@ fn stream_duration(data: serde_json::Value) -> Result<i64> {
     }
     let data: StreamData = serde_json::from_value(data)
         .map_err(|e| Error::data(format!("飞牛影视媒体信息解析失败：{e}")))?;
-    let duration = duration_of(&data.video_stream);
-    if duration <= 0 {
-        return Err(Error::data("飞牛影视媒体探测后仍未返回有效时长。"));
-    }
-    Ok(duration)
+    // 成功响应中的 0 可能表示网盘媒体仍在探测，交给调用方有限重查。
+    Ok(duration_of(&data.video_stream))
 }
 
-fn complete_durations<F>(items: &mut [FnItem], mut resolve: F) -> Result<()>
+fn wait_for_duration<F, W>(mut fetch: F, mut wait: W) -> Result<i64>
 where
-    F: FnMut(&FnItem) -> Result<i64>,
+    F: FnMut() -> Result<i64>,
+    W: FnMut(),
 {
-    for item in items {
-        if item.is_container() && clean(item.guid.as_deref()).is_none() {
-            return Err(Error::data(format!(
-                "飞牛影视目录「{}」缺少 ID，无法展开，当前结果不完整。",
-                item.display_title("未命名目录")
-            )));
+    for attempt in 1..=DURATION_POLL_ATTEMPTS {
+        let duration = fetch()?;
+        if duration > 0 {
+            return Ok(duration);
         }
-        if !item.is_container() && duration_of(item) <= 0 {
-            let title = item.display_title("未命名视频");
-            let duration = resolve(item).map_err(|e| {
-                Error::data(format!(
-                    "飞牛影视视频「{title}」时长补全失败：{} 当前结果不完整，请稍后重新获取。",
-                    e.message()
-                ))
-            })?;
-            if duration <= 0 {
+        if attempt < DURATION_POLL_ATTEMPTS {
+            wait();
+        }
+    }
+    Err(Error::data(format!(
+        "飞牛影视媒体信息仍未准备就绪（已查询 {DURATION_POLL_ATTEMPTS} 次），请稍后重试。"
+    )))
+}
+
+/// 有限并发探测，按原索引写回，避免完成先后顺序影响课程顺序。
+/// progress 始终在调用线程执行；失败时不返回部分课程。
+fn complete_durations<F>(
+    items: &mut [FnItem],
+    resolve: F,
+    progress: &mut dyn FnMut(String),
+) -> Result<()>
+where
+    F: Fn(&FnItem) -> Result<i64> + Sync,
+{
+    let mut pending = Vec::new();
+    let mut total = 0;
+    for (index, item) in items.iter().enumerate() {
+        if item.is_container() {
+            if clean(item.guid.as_deref()).is_none() {
                 return Err(Error::data(format!(
-                    "飞牛影视视频「{title}」缺少有效时长，无法生成完整计划。"
+                    "飞牛影视目录「{}」缺少 ID，无法展开，当前结果不完整。",
+                    item.display_title("未命名目录")
                 )));
             }
-            item.duration = Some(duration);
+        } else {
+            total += 1;
+            if duration_of(item) <= 0 {
+                pending.push(index);
+            }
         }
+    }
+    let mut ready = total - pending.len();
+    progress(format!("当前目录：{ready} / {total} 个视频时长已就绪"));
+    if pending.is_empty() {
+        return Ok(());
+    }
+    progress(format!(
+        "当前目录：{ready} / {total} 个视频时长已就绪，正在读取网盘媒体信息…"
+    ));
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel();
+    let mut resolved = Vec::new();
+    let mut first_error = None;
+    std::thread::scope(|scope| {
+        let items = &*items;
+        for _ in 0..DURATION_WORKERS.min(pending.len()) {
+            let (tx, pending, next, failed, resolve) =
+                (tx.clone(), &pending, &next, &failed, &resolve);
+            scope.spawn(move || {
+                while !failed.load(Ordering::Relaxed) {
+                    let Some(&index) = pending.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    let item = &items[index];
+                    let result = resolve(item)
+                        .and_then(|duration| {
+                            if duration > 0 {
+                                Ok(duration)
+                            } else {
+                                Err(Error::data("媒体探测未返回有效时长。"))
+                            }
+                        })
+                        .map_err(|e| {
+                            Error::data(format!(
+                        "飞牛影视视频「{}」时长补全失败：{} 当前结果不完整，请稍后重新获取。",
+                        item.display_title("未命名视频"), e.message()
+                    ))
+                        });
+                    if result.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    if tx.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for (index, result) in rx {
+            match result {
+                Ok(duration) => {
+                    resolved.push((index, duration));
+                    ready += 1;
+                    if first_error.is_none() {
+                        progress(format!("当前目录：{ready} / {total} 个视频时长已就绪"));
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        progress("视频时长探测失败，正在结束剩余请求…".to_string());
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+    });
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    for (index, duration) in resolved {
+        items[index].duration = Some(duration);
     }
     Ok(())
 }
@@ -874,7 +976,12 @@ fn truncate(text: &str, max_chars: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// 递归展开一个容器，返回其下全部可规划的视频单元。
-fn collect_leaves(client: &FnOsClient, guid: &str, depth: usize) -> Result<Vec<EpisodeItem>> {
+fn collect_leaves(
+    client: &FnOsClient,
+    guid: &str,
+    depth: usize,
+    progress: &mut dyn FnMut(String),
+) -> Result<Vec<EpisodeItem>> {
     if depth > MAX_DEPTH {
         return Err(Error::data(
             "飞牛影视目录层级过深，已停止展开（疑似媒体库结构异常）。",
@@ -882,11 +989,11 @@ fn collect_leaves(client: &FnOsClient, guid: &str, depth: usize) -> Result<Vec<E
     }
     let mut out: Vec<EpisodeItem> = Vec::new();
     let mut items = client.item_list(guid)?.list;
-    client.complete_durations(&mut items)?;
+    client.complete_durations(&mut items, progress)?;
     for item in order_items(items) {
         if item.is_container() {
             if let Some(child) = clean(item.guid.as_deref()) {
-                out.extend(collect_leaves(client, &child, depth + 1)?);
+                out.extend(collect_leaves(client, &child, depth + 1, progress)?);
             }
         } else if let Some(episode) = episode_from(&item) {
             out.push(episode);
@@ -897,6 +1004,15 @@ fn collect_leaves(client: &FnOsClient, guid: &str, depth: usize) -> Result<Vec<E
 
 /// 主入口：解析输入 → 拉取一层子项 → 归类分组。
 pub fn fetch_groups(client: &FnOsClient, input: &str) -> Result<(String, Vec<Group>, String)> {
+    fetch_groups_with_progress(client, input, &mut |_| {})
+}
+
+/// 支持进度回调的获取入口，供桌面与命令行展示后台工作状态。
+pub fn fetch_groups_with_progress(
+    client: &FnOsClient,
+    input: &str,
+    progress: &mut dyn FnMut(String),
+) -> Result<(String, Vec<Group>, String)> {
     if client.base_url.trim().is_empty() {
         return Err(Error::input("请填写飞牛影视服务器地址。"));
     }
@@ -910,6 +1026,7 @@ pub fn fetch_groups(client: &FnOsClient, input: &str) -> Result<(String, Vec<Gro
         )
     })?;
 
+    progress("正在连接飞牛影视并读取目录…".to_string());
     let root = client.item_list(&guid)?;
     if root.list.is_empty() {
         return Err(Error::data(
@@ -918,9 +1035,9 @@ pub fn fetch_groups(client: &FnOsClient, input: &str) -> Result<(String, Vec<Gro
         ));
     }
     let mut children = order_items(root.list);
-    client.complete_durations(&mut children)?;
+    client.complete_durations(&mut children, progress)?;
     classify_children(children, root.mdb_name.as_deref(), |child_guid| {
-        collect_leaves(client, child_guid, 1)
+        collect_leaves(client, child_guid, 1, progress)
     })
 }
 
@@ -1031,19 +1148,120 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let mut probes = 0;
-        complete_durations(&mut items, |item| {
-            assert_eq!(duration_of(item), 0);
-            probes += 1;
-            stream_duration(serde_json::json!({"video_stream":{"duration":1692}}))
-        })
+        let probes = AtomicUsize::new(0);
+        complete_durations(
+            &mut items,
+            |item| {
+                assert_eq!(duration_of(item), 0);
+                probes.fetch_add(1, Ordering::Relaxed);
+                stream_duration(serde_json::json!({"video_stream":{"duration":1692}}))
+            },
+            &mut |_| {},
+        )
         .unwrap();
         let (_, groups, _) =
             classify_children(items, Some("课程"), |_| panic!("视频不应下钻")).unwrap();
-        assert_eq!(probes, 22);
+        assert_eq!(probes.load(Ordering::Relaxed), 22);
         assert_eq!(groups[0].episodes.len(), 32);
         assert_eq!(groups[0].episodes[0].duration, 1692);
         assert_eq!(groups[0].episodes[19].duration, 600);
+    }
+
+    #[test]
+    fn pending_stream_duration_is_retried_but_failure_is_bounded() {
+        let mut values = [0, 0, 2338].into_iter();
+        let mut waits = 0;
+        assert_eq!(
+            wait_for_duration(|| Ok(values.next().unwrap()), || waits += 1).unwrap(),
+            2338
+        );
+        assert_eq!(waits, 2);
+        let mut calls = 0;
+        let err = wait_for_duration(
+            || {
+                calls += 1;
+                Ok(0)
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(calls, DURATION_POLL_ATTEMPTS);
+        assert!(err.message().contains("仍未准备就绪"));
+        let err = wait_for_duration(|| Err(Error::api("无权限")), || panic!("不应重试业务错误"))
+            .unwrap_err();
+        assert_eq!(err.message(), "无权限");
+    }
+
+    #[test]
+    fn concurrent_duration_completion_preserves_order_and_reports_progress() {
+        let mut items: Vec<_> = (0..9)
+            .map(|n| FnItem {
+                title: Some(n.to_string()),
+                kind: Some("Video".into()),
+                duration: Some(0),
+                ..Default::default()
+            })
+            .collect();
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut messages = Vec::new();
+        complete_durations(
+            &mut items,
+            |item| {
+                let n: u64 = item.title.as_ref().unwrap().parse().unwrap();
+                let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10 * (3 - n % 3)));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(100 + n as i64)
+            },
+            &mut |message| messages.push(message),
+        )
+        .unwrap();
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= DURATION_WORKERS);
+        assert_eq!(
+            items.iter().map(duration_of).collect::<Vec<_>>(),
+            (100..109).collect::<Vec<_>>()
+        );
+        for ready in 0..=9 {
+            assert!(messages
+                .iter()
+                .any(|s| s == &format!("当前目录：{ready} / 9 个视频时长已就绪")));
+        }
+    }
+
+    #[test]
+    fn concurrent_duration_failure_does_not_commit_partial_results() {
+        let mut items = vec![
+            FnItem {
+                title: Some("正常".into()),
+                kind: Some("Video".into()),
+                duration: Some(0),
+                ..Default::default()
+            },
+            FnItem {
+                title: Some("故障".into()),
+                kind: Some("Video".into()),
+                duration: Some(0),
+                ..Default::default()
+            },
+        ];
+        let err = complete_durations(
+            &mut items,
+            |item| {
+                if item.title.as_deref() == Some("故障") {
+                    Err(Error::network("超时"))
+                } else {
+                    Ok(100)
+                }
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.message().contains("故障"));
+        assert!(err.message().contains("超时"));
+        assert!(items.iter().all(|item| duration_of(item) == 0));
     }
 
     #[test]
@@ -1060,16 +1278,20 @@ mod tests {
                 ..Default::default()
             },
         ];
-        complete_durations(&mut items, |_| panic!("不需要探测")).unwrap();
+        complete_durations(&mut items, |_| panic!("不需要探测"), &mut |_| {}).unwrap();
         let mut items = vec![FnItem {
             kind: Some("Video".into()),
             title: Some("缺失课时".into()),
             ..Default::default()
         }];
-        let err = complete_durations(&mut items, |_| Err(Error::api("探测失败"))).unwrap_err();
+        let err = complete_durations(&mut items, |_| Err(Error::api("探测失败")), &mut |_| {})
+            .unwrap_err();
         assert!(err.message().contains("缺失课时"));
         assert!(err.message().contains("当前结果不完整"));
-        assert!(stream_duration(serde_json::json!({"video_stream":{"duration":0}})).is_err());
+        assert_eq!(
+            stream_duration(serde_json::json!({"video_stream":{"duration":0}})).unwrap(),
+            0
+        );
         assert!(stream_duration(serde_json::json!({})).is_err());
         assert_eq!(
             stream_duration(serde_json::json!({"video_stream":{"duration":"1692"}})).unwrap(),

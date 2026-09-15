@@ -462,6 +462,9 @@ pub struct PlannerApp {
     mode: Mode,
     phase: Phase,
     last_error: Option<String>,
+    fetch_progress: String,
+    fetch_elapsed_secs: u64,
+    fetch_generation: u64,
 
     /// 本机配置（Jellyfin 凭证 + 搜索历史 + 学习打卡计划），操作后写盘。
     config: AppConfig,
@@ -692,6 +695,9 @@ impl PlannerApp {
             mode: Mode::Split,
             phase: Phase::Input,
             last_error: None,
+            fetch_progress: String::new(),
+            fetch_elapsed_secs: 0,
+            fetch_generation: 0,
             config,
             plan_table: None,
             window_expanded: false,
@@ -831,6 +837,9 @@ impl PlannerApp {
 
     /// 点击「获取视频信息」：前台做最小校验，网络请求放到后台执行器。
     fn start_fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.phase, Phase::Loading) {
+            return;
+        }
         let input = self.input_value(&self.link_input, cx);
         let cookie = {
             let v = self.input_value(&self.cookie_input, cx);
@@ -890,20 +899,81 @@ impl PlannerApp {
 
         self.phase = Phase::Loading;
         self.last_error = None;
+        self.fetch_progress = "正在连接服务器…".to_string();
+        self.fetch_elapsed_secs = 0;
+        self.fetch_generation = self.fetch_generation.wrapping_add(1);
+        let generation = self.fetch_generation;
         cx.notify();
 
+        enum FetchMessage {
+            Progress(String),
+            Finished(Result<ReadyState, String>),
+        }
         let source_mode = self.source;
         cx.spawn_in(window, async move |this, cx| {
             let fetch_input = input.clone();
-            let fetch_source = source.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::core::fetch_and_parse(&fetch_input, &fetch_source) })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                this.on_fetched(result, input, source_mode, window, cx)
-            })
-            .ok();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let started = std::time::Instant::now();
+            cx.background_executor()
+                .spawn(async move {
+                    let result = crate::core::fetch_and_parse_with_progress(
+                        &fetch_input,
+                        &source,
+                        &mut |message| {
+                            let _ = tx.send(FetchMessage::Progress(message));
+                        },
+                    );
+                    let _ = tx.send(FetchMessage::Finished(result));
+                })
+                .detach();
+            loop {
+                let mut latest = None;
+                let mut finished = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(FetchMessage::Progress(message)) => latest = Some(message),
+                        Ok(FetchMessage::Finished(result)) => {
+                            finished = Some(result);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            finished = Some(Err("获取任务意外结束，请重新获取。".to_string()));
+                            break;
+                        }
+                    }
+                }
+                let keep_waiting = this
+                    .update_in(cx, |this, window, cx| {
+                        // 切换来源或发起新任务后，旧任务不得覆盖新状态。
+                        if this.fetch_generation != generation
+                            || !matches!(this.phase, Phase::Loading)
+                        {
+                            return false;
+                        }
+                        if let Some(result) = finished {
+                            this.on_fetched(result, input.clone(), source_mode, window, cx);
+                            return false;
+                        }
+                        let elapsed = started.elapsed().as_secs();
+                        let changed = latest.is_some() || elapsed != this.fetch_elapsed_secs;
+                        if let Some(message) = latest {
+                            this.fetch_progress = message;
+                        }
+                        this.fetch_elapsed_secs = elapsed;
+                        if changed {
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_waiting {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+            }
         })
         .detach();
     }
@@ -1089,6 +1159,10 @@ impl PlannerApp {
                     window.blur();
                 }
             });
+        }
+        if source != self.source && matches!(self.phase, Phase::Loading) {
+            self.fetch_generation = self.fetch_generation.wrapping_add(1);
+            self.phase = Phase::Input;
         }
         self.source = source;
         self.last_error = None;
@@ -2987,13 +3061,26 @@ impl PlannerApp {
     }
 
     fn render_loading(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
-        bcard(cx).child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(gpui_component::spinner::Spinner::new().small())
-                .child(Label::new("正在获取视频信息…").text_size(px(13.))),
-        )
+        bcard(cx)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(gpui_component::spinner::Spinner::new().small())
+                    .child(Label::new(self.fetch_progress.clone()).text_size(px(13.))),
+            )
+            .child(
+                Label::new(format!("已用时 {} 秒", self.fetch_elapsed_secs))
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .when(self.source == SourceMode::FnOs, |card| {
+                card.child(
+                    Label::new("网盘视频首次读取时长可能需要几分钟，完成后会自动生成计划。")
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
     }
 
     fn meta_line(label: &str, value: &str, theme: &gpui_component::ThemeColor) -> impl IntoElement {
@@ -6014,6 +6101,18 @@ mod tests {
                 // 切换暗色后再次构建（主题配置重套用 + 渲染路径不 panic）。
                 Theme::change(ThemeMode::Dark, Some(window), cx);
                 let _ = app.render(window, cx);
+
+                app.source = SourceMode::FnOs;
+                app.phase = Phase::Loading;
+                app.fetch_progress = "当前目录：11 / 36 个视频时长已就绪".into();
+                app.fetch_elapsed_secs = 42;
+                let _ = app.render(window, cx);
+                Theme::change(ThemeMode::Light, Some(window), cx);
+                let _ = app.render(window, cx);
+                let generation = app.fetch_generation;
+                app.switch_source(SourceMode::Jellyfin, window, cx);
+                assert!(matches!(app.phase, Phase::Input));
+                assert_ne!(app.fetch_generation, generation);
             })
             .expect("window update should succeed");
     }
