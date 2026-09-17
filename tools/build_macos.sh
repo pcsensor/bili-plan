@@ -72,9 +72,39 @@ cat <<PLIST > "${APP_DIR}/Contents/Info.plist"
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <!-- macOS 15+ 的「本地网络」隐私保护：飞牛影视服务器通常是 192.168.x.x /
+         .local 这类局域网地址，缺少这段说明系统会静默拒绝连接（表现为「连不上
+         网络」）。有了它首次访问局域网时才会弹出授权弹窗。 -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>需要访问局域网内的飞牛影视服务器，以读取影视库与剧集信息。</string>
+    <!-- 放宽 ATS：飞牛接口是明文 http。Rust 原生 socket 本身不受 ATS 约束，
+         这里一并声明，避免将来接入系统网络栈时被拦。 -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
 </dict>
 </plist>
 PLIST
+
+echo "==> 3.1 对 .app 做 ad-hoc 签名（关键步骤）..."
+# ---------------------------------------------------------------------------
+# 为什么必须签名：
+# `cargo build` 产出的 Mach-O 只带 linker 的临时 ad-hoc 签名，直接拷进 .app 后
+# codesign 会看到 `Identifier=bili_planner-<hash>`、`Info.plist=not bound`、
+# `Sealed Resources=none`。此时 Info.plist 不在签名封装内，TCC 读不到
+# NSLocalNetworkUsageDescription，macOS 15+ 会**静默拒绝**该 App 访问局域网，
+# 于是飞牛服务器永远连不上（而 `cargo run` 走的是终端已授权的本地网络权限，
+# 表现正常）。
+# 重新签名后标识变为 CFBundleIdentifier、Info.plist 被绑定、资源被 seal，
+# 授权弹窗才会正常出现且授予结果能持久化（不会因为每次重新构建而失效）。
+# ---------------------------------------------------------------------------
+rm -rf "${APP_DIR}/Contents/_CodeSignature"
+codesign --force --deep --sign - --timestamp=none "${APP_DIR}"
+codesign --verify --deep --strict --verbose=2 "${APP_DIR}" 2>&1 | tail -3
 
 echo "==> 已生成 .app: ${APP_DIR}"
 

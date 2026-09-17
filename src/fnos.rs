@@ -118,6 +118,21 @@ fn random_nonce() -> String {
     format!("{:06}", hasher.finish() % 1_000_000)
 }
 
+/// 连接失败时追加的排障提示。
+///
+/// macOS 15+ 对局域网地址（192.168.x.x / 10.x.x.x / .local）有「本地网络」
+/// 隐私管控：打包成 .app 后若未正确签名或未被授权，访问飞牛这类 NAS 会被
+/// 静默拒绝，表现为「连不上网络」；而 `cargo run` 走的是终端已授权的身份，
+/// 表现正常。这里给出明确指引，避免误判成服务端故障。
+fn local_network_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "（若已打包为 .app：请确认 系统设置 → 隐私与安全性 → 本地网络 中已允许本应用，\
+         且 .app 已做过 codesign 签名）"
+    } else {
+        ""
+    }
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -666,7 +681,7 @@ impl FnOsClient {
 
         let mut response = request
             .send(bytes)
-            .map_err(|e| format!("网络请求失败：{e}"))?;
+            .map_err(|e| format!("网络请求失败：{e}{}", local_network_hint()))?;
         let raw = response
             .body_mut()
             .read_to_string()
