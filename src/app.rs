@@ -3204,8 +3204,15 @@ impl PlannerApp {
             .py_5()
             .gap_5()
             .child(entrance("anim-hero", 0., self.render_hero(cx)))
-            .child(entrance("anim-form", 0.12, self.render_form_card(cx)))
-            .children(self.render_history_card(cx));
+            .child(entrance("anim-form", 0.12, self.render_form_card(cx)));
+
+        // 加载卡片紧跟表单：点击「获取视频信息」后立刻可见进度与用时，
+        // 不会被历史记录卡片挤到视口之外（网盘视频探测可能持续数分钟）。
+        if matches!(self.phase, Phase::Loading) {
+            left = left.child(self.render_loading(cx));
+        }
+
+        left = left.children(self.render_history_card(cx));
 
         if let Some(err) = &self.last_error {
             left = left.child(
@@ -3215,12 +3222,8 @@ impl PlannerApp {
             );
         }
 
-        match &self.phase {
-            Phase::Loading => left = left.child(self.render_loading(cx)),
-            Phase::Ready(rd) => {
-                left = left.children(self.render_ready_left(rd, cx));
-            }
-            Phase::Input => {}
+        if let Phase::Ready(rd) = &self.phase {
+            left = left.children(self.render_ready_left(rd, cx));
         }
 
         // 右栏：就绪后展开的计划面板，独立滚动、高度撑满窗口。
@@ -5852,7 +5855,10 @@ impl Render for PlannerApp {
             .text_color(theme.foreground)
             .child(render_backdrop(dark, theme.background))
             .child(self.render_title_bar(dark, cx))
-            .child(div().flex_1().min_h_0().child(body))
+            // 关键：内容包裹层必须是 flex 容器。gpui 的 div() 默认 display:Block，
+            // Block 子元素高度为 auto，各页面根节点（overflow_y_scroll + 百分比高度）
+            // 解析不到确定高度，滚动永远不会触发、内容溢出窗口底部。
+            .child(div().flex().flex_1().min_h_0().child(body))
             .children(bind_modal)
             .children(sync_modal)
             .children(cloud_settings_modal)

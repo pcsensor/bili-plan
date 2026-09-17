@@ -509,6 +509,9 @@ pub struct FnOsClient {
     pub username: String,
     pub password: String,
     token: Mutex<Option<String>>,
+    /// 复用同一 HTTP Agent：探测网盘视频时长会发出大量小请求，
+    /// keep-alive 连接复用能避免每次请求都重建 TCP/TLS 连接。
+    agent: ureq::Agent,
 }
 
 impl std::fmt::Debug for FnOsClient {
@@ -533,7 +536,15 @@ impl FnOsClient {
             username: username.into(),
             password: password.into(),
             token: Mutex::new(None),
+            agent: Self::build_agent(),
         }
+    }
+
+    fn build_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))
+            .build()
+            .new_agent()
     }
 
     /// 当前 token（无则登录）。
@@ -642,11 +653,8 @@ impl FnOsClient {
         // 2. authx 用的 nonce 与 body 里的防重放 nonce 是两个独立随机值。
         let authx = gen_authx(path, &bytes, &random_nonce(), now_ms());
 
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))
-            .build()
-            .new_agent();
-        let mut request = agent
+        let mut request = self
+            .agent
             .post(url)
             .header("User-Agent", crate::api::DEFAULT_UA)
             .header("Accept", "application/json")
@@ -681,12 +689,30 @@ impl FnOsClient {
 
     /// 分页拉取某容器（媒体库/合集/季/文件夹）的全部直属子项。
     pub fn item_list(&self, parent_guid: &str) -> Result<ItemListData> {
+        self.item_list_with_progress(parent_guid, &mut |_| {})
+    }
+
+    /// 同 [`FnOsClient::item_list`]，但每翻一页就回报进度。
+    ///
+    /// 网盘挂载的大目录分页可能很慢，回报进度避免界面长时间静默；
+    /// 单页就能读完的目录（绝大多数）不回报，避免刷屏。
+    pub fn item_list_with_progress(
+        &self,
+        parent_guid: &str,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<ItemListData> {
+        let mut fetched = 0usize;
         collect_pages(parent_guid, |page| {
             let mut body = item_list_body(parent_guid);
             body["page"] = serde_json::json!(page);
             let value = self.item_list_with_body(body)?;
-            serde_json::from_value(value)
-                .map_err(|e| Error::network(format!("飞牛影视 item/list 响应解析失败：{e}")))
+            let data: ItemListData = serde_json::from_value(value)
+                .map_err(|e| Error::network(format!("飞牛影视 item/list 响应解析失败：{e}")))?;
+            fetched = fetched.saturating_add(data.list.len());
+            if page > 1 {
+                progress(format!("正在读取目录：第 {page} 页，累计 {fetched} 项…"));
+            }
+            Ok(data)
         })
     }
 
@@ -812,6 +838,12 @@ where
     progress(format!(
         "当前目录：{ready} / {total} 个视频时长已就绪，正在读取网盘媒体信息…"
     ));
+    /// 工作线程 → 汇总线程的事件：开始探测 / 探测结束。
+    /// 开始事件用于在长时间探测期间持续回报「正在探测哪个视频」。
+    enum ProbeEvent {
+        Started(usize),
+        Finished(usize, Result<i64>),
+    }
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel();
@@ -828,6 +860,9 @@ where
                         break;
                     };
                     let item = &items[index];
+                    if tx.send(ProbeEvent::Started(index)).is_err() {
+                        break;
+                    }
                     let result = resolve(item)
                         .and_then(|duration| {
                             if duration > 0 {
@@ -845,28 +880,40 @@ where
                     if result.is_err() {
                         failed.store(true, Ordering::Relaxed);
                     }
-                    if tx.send((index, result)).is_err() {
+                    if tx.send(ProbeEvent::Finished(index, result)).is_err() {
                         break;
                     }
                 }
             });
         }
         drop(tx);
-        for (index, result) in rx {
-            match result {
-                Ok(duration) => {
-                    resolved.push((index, duration));
-                    ready += 1;
+        for event in rx {
+            match event {
+                ProbeEvent::Started(index) => {
+                    // 网盘探测单个视频可能要等很久，开始时先回报标题，
+                    // 用户才能区分「正在工作」和「卡住了」。
                     if first_error.is_none() {
-                        progress(format!("当前目录：{ready} / {total} 个视频时长已就绪"));
+                        let title = truncate(&items[index].display_title("未命名视频"), 24);
+                        progress(format!(
+                            "当前目录：{ready} / {total} 已就绪，正在探测「{title}」…"
+                        ));
                     }
                 }
-                Err(error) => {
-                    if first_error.is_none() {
-                        progress("视频时长探测失败，正在结束剩余请求…".to_string());
-                        first_error = Some(error);
+                ProbeEvent::Finished(index, result) => match result {
+                    Ok(duration) => {
+                        resolved.push((index, duration));
+                        ready += 1;
+                        if first_error.is_none() {
+                            progress(format!("当前目录：{ready} / {total} 个视频时长已就绪"));
+                        }
                     }
-                }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            progress("视频时长探测失败，正在结束剩余请求…".to_string());
+                            first_error = Some(error);
+                        }
+                    }
+                },
             }
         }
     });
@@ -988,7 +1035,7 @@ fn collect_leaves(
         ));
     }
     let mut out: Vec<EpisodeItem> = Vec::new();
-    let mut items = client.item_list(guid)?.list;
+    let mut items = client.item_list_with_progress(guid, progress)?.list;
     client.complete_durations(&mut items, progress)?;
     for item in order_items(items) {
         if item.is_container() {
@@ -1027,7 +1074,7 @@ pub fn fetch_groups_with_progress(
     })?;
 
     progress("正在连接飞牛影视并读取目录…".to_string());
-    let root = client.item_list(&guid)?;
+    let root = client.item_list_with_progress(&guid, progress)?;
     if root.list.is_empty() {
         return Err(Error::data(
             "飞牛影视未返回任何条目。请确认该 guid 指向影视库 / 合集 / 季，\
