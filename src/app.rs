@@ -43,9 +43,9 @@ use crate::core::{
     checkin_study_task, clear_history, create_calendar_series_plan, delete_calendar_task,
     delete_daily_note, enroll_study_plan, export_payload, generate_plan, get_daily_notes,
     load_config, parse_days, push_forward_study_plan, record_history, remove_history,
-    remove_study_plan, request_cloud_bind_code, save_config, sync_with_cloud,
-    toggle_study_plan_status, update_calendar_task, AppConfig, FetchSource, ReadyState, Selection,
-    SourceMode,
+    remove_study_plan, request_cloud_bind_code, reschedule_unfinished_study_plan, save_config,
+    sync_with_cloud, toggle_study_plan_status, update_calendar_task, AppConfig, FetchSource,
+    ReadyState, Selection, SourceMode,
 };
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
@@ -443,6 +443,10 @@ pub struct PlannerApp {
     custom_days_input: Entity<InputState>,
     custom_duration_input: Entity<InputState>,
     custom_skip_weekends_toggle: bool,
+    /// 计划库中整体调整未完成任务日期的弹窗。
+    plan_reschedule_modal_open: bool,
+    plan_reschedule_plan_id: Option<String>,
+    plan_reschedule_date_input: Entity<InputState>,
 
     /// gpui-component 输入框为独立 `Entity<InputState>`，这里持有引用并
     /// 在渲染时绑定；取值通过 `read(cx).value()` 按需读取。
@@ -561,6 +565,11 @@ impl PlannerApp {
         let custom_days_input = cx.new(|cx| InputState::new(window, cx).placeholder("例如 7"));
         let custom_duration_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("例如 30（分钟）"));
+        let plan_reschedule_date_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(today_date_str(), window, cx);
+            state.placeholder("YYYY-MM-DD")
+        });
 
         // 启动时加载本机配置：Jellyfin 凭证预热输入框，历史记录供列表展示。
         let config = load_config().unwrap_or_default();
@@ -663,6 +672,9 @@ impl PlannerApp {
             custom_days_input,
             custom_duration_input,
             custom_skip_weekends_toggle: false,
+            plan_reschedule_modal_open: false,
+            plan_reschedule_plan_id: None,
+            plan_reschedule_date_input,
             link_input,
             cookie_input,
             jf_server_input,
@@ -1507,6 +1519,87 @@ impl PlannerApp {
             Err(e) => {
                 window.push_notification(Notification::error(e), cx);
             }
+        }
+        cx.notify();
+    }
+
+    /// 打开整门计划的未完成任务改期弹窗，并用当前最早未完成日期预填。
+    fn open_plan_reschedule_action(
+        &mut self,
+        plan_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plan) = self.config.plans.iter().find(|plan| plan.id == plan_id) else {
+            window.push_notification(Notification::error("未找到指定计划"), cx);
+            return;
+        };
+        let Some(current_start) = plan
+            .schedules
+            .iter()
+            .filter(|schedule| schedule.tasks.iter().any(|task| !task.completed))
+            .map(|schedule| schedule.date.as_str())
+            .min()
+        else {
+            window.push_notification(Notification::info("该计划没有未完成任务。"), cx);
+            return;
+        };
+        self.plan_reschedule_date_input.update(cx, |state, cx| {
+            state.set_value(current_start.to_string(), window, cx)
+        });
+        self.plan_reschedule_plan_id = Some(plan_id.to_string());
+        self.plan_reschedule_modal_open = true;
+        cx.notify();
+    }
+
+    /// 保存整门计划的未完成任务排期调整。
+    fn save_plan_reschedule_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan_id) = self.plan_reschedule_plan_id.clone() else {
+            self.plan_reschedule_modal_open = false;
+            cx.notify();
+            return;
+        };
+        let target_start = self.input_value(&self.plan_reschedule_date_input, cx);
+        let (plan_title, current_start) = self
+            .config
+            .plans
+            .iter()
+            .find(|plan| plan.id == plan_id)
+            .map(|plan| {
+                let start = plan
+                    .schedules
+                    .iter()
+                    .filter(|schedule| schedule.tasks.iter().any(|task| !task.completed))
+                    .map(|schedule| schedule.date.clone())
+                    .min()
+                    .unwrap_or_default();
+                (plan.title.clone(), start)
+            })
+            .unwrap_or_else(|| ("计划".to_string(), String::new()));
+
+        match reschedule_unfinished_study_plan(&mut self.config, &plan_id, target_start.trim()) {
+            Ok(true) => {
+                let direction = if target_start.trim() < current_start.as_str() {
+                    "前移"
+                } else {
+                    "后移"
+                };
+                self.plan_reschedule_modal_open = false;
+                self.plan_reschedule_plan_id = None;
+                window.push_notification(
+                    Notification::success(format!(
+                        "已将《{plan_title}》未完成任务整体{direction}，最早任务从 {} 开始；已完成记录保持原日期。",
+                        target_start.trim()
+                    )),
+                    cx,
+                );
+                self.trigger_auto_sync(window, cx);
+            }
+            Ok(false) => window.push_notification(
+                Notification::info("目标日期未变化，或该计划已没有未完成任务。"),
+                cx,
+            ),
+            Err(error) => window.push_notification(Notification::error(error), cx),
         }
         cx.notify();
     }
@@ -4863,6 +4956,7 @@ impl PlannerApp {
                 let pid = plan.id.clone();
                 let pid_del = plan.id.clone();
                 let pid_push = plan.id.clone();
+                let pid_reschedule = plan.id.clone();
 
                 let status_badge_bg = match plan.status {
                     PlanStatus::Active => theme.primary,
@@ -4935,6 +5029,19 @@ impl PlannerApp {
                                             })
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.toggle_plan_status_action(&pid, window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("reschedule-plan", p_idx))
+                                            .small()
+                                            .label("📅 调整未完成排期")
+                                            .disabled(done_cnt >= total_cnt)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_plan_reschedule_action(
+                                                    &pid_reschedule,
+                                                    window,
+                                                    cx,
+                                                );
                                             })),
                                     )
                                     .child(
@@ -5025,6 +5132,158 @@ impl PlannerApp {
             .child(entrance("anim-myplans-head", 0.0, header))
             .children(custom_task_form)
             .child(entrance("anim-myplans-cards", 0.1, plan_cards))
+            .into_any_element()
+    }
+
+    /// 计划库中整体调整未完成任务日期的弹窗。
+    fn render_plan_reschedule_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let plan = self
+            .plan_reschedule_plan_id
+            .as_deref()
+            .and_then(|plan_id| self.config.plans.iter().find(|plan| plan.id == plan_id));
+        let plan_title = plan
+            .map(|plan| plan.title.clone())
+            .unwrap_or_else(|| "学习计划".to_string());
+        let unfinished_count = plan
+            .map(|plan| {
+                plan.schedules
+                    .iter()
+                    .flat_map(|schedule| &schedule.tasks)
+                    .filter(|task| !task.completed)
+                    .count()
+            })
+            .unwrap_or(0);
+        let unfinished_dates: Vec<&str> = plan
+            .map(|plan| {
+                plan.schedules
+                    .iter()
+                    .filter(|schedule| schedule.tasks.iter().any(|task| !task.completed))
+                    .map(|schedule| schedule.date.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let current_start = unfinished_dates.iter().copied().min().unwrap_or("-");
+        let current_end = unfinished_dates.iter().copied().max().unwrap_or("-");
+
+        div()
+            .id("plan-reschedule-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(hsla(0.0, 0.0, 0.0, 0.6))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .child(
+                v_flex()
+                    .id("plan-reschedule-modal")
+                    .w(px(560.))
+                    .bg(theme.background)
+                    .border_2()
+                    .border_color(theme.foreground)
+                    .shadow_lg()
+                    .p_6()
+                    .gap_4()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::empty()
+                                            .path("icons/calendar-days.svg")
+                                            .size_5()
+                                            .text_color(theme.primary),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(format!("调整《{plan_title}》未完成排期")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("close-plan-reschedule")
+                                    .cursor_pointer()
+                                    .p_1()
+                                    .child(
+                                        Icon::empty()
+                                            .path("icons/square.svg")
+                                            .size_4()
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.plan_reschedule_modal_open = false;
+                                        this.plan_reschedule_plan_id = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "当前未完成排期：{current_start} 至 {current_end} · {unfinished_count} 项任务"
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(Self::field_label(
+                                "新的未完成任务起始日期",
+                                "YYYY-MM-DD",
+                                cx,
+                            ))
+                            .child(Input::new(&self.plan_reschedule_date_input)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .p_3()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.primary.opacity(0.08))
+                            .child(
+                                "所有未完成日期批次会整体平移相同的自然日数，批次间隔和手动周末安排保持不变；已完成任务及其打卡日期不会移动。",
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-plan-reschedule")
+                                    .label("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.plan_reschedule_modal_open = false;
+                                        this.plan_reschedule_plan_id = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("save-plan-reschedule")
+                                    .primary()
+                                    .label("保存排期")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_plan_reschedule_action(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -5841,6 +6100,9 @@ impl Render for PlannerApp {
         let calendar_task_edit_modal = self
             .calendar_task_edit_modal_open
             .then(|| self.render_calendar_task_edit_modal(cx));
+        let plan_reschedule_modal = self
+            .plan_reschedule_modal_open
+            .then(|| self.render_plan_reschedule_modal(cx));
         let sheet_layer = Root::render_sheet_layer(window, cx);
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
@@ -5864,6 +6126,7 @@ impl Render for PlannerApp {
             .children(cloud_settings_modal)
             .children(calendar_task_modal)
             .children(calendar_task_edit_modal)
+            .children(plan_reschedule_modal)
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)

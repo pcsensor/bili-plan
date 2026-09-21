@@ -824,6 +824,24 @@ pub fn push_forward_study_plan(
     Ok(changed)
 }
 
+/// 整体调整指定计划中所有未完成任务的日期，并持久化。
+pub fn reschedule_unfinished_study_plan(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    target_start_date: &str,
+) -> Result<bool, String> {
+    let plan = cfg
+        .plans
+        .iter_mut()
+        .find(|plan| plan.id == plan_id)
+        .ok_or_else(|| "未找到指定计划".to_string())?;
+    let changed = study::reschedule_unfinished_plan(plan, target_start_date)?;
+    if changed {
+        save_config(cfg);
+    }
+    Ok(changed)
+}
+
 /// 将某个未来日期已经打卡的任务划归今天，并按整日/部分完成规则更新后续排期。
 pub fn advance_completed_study_tasks(
     cfg: &mut AppConfig,

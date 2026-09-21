@@ -1082,6 +1082,83 @@ pub fn push_forward_plan(plan: &mut StudyPlan, destination_date_str: &str) -> Re
     Ok(true)
 }
 
+/// 将计划中所有未完成任务整体平移，使最早的未完成任务从 `target_start_date` 开始。
+///
+/// 每个未完成日期批次使用相同的自然日偏移量，因此原有批次间隔、手动周末安排与任务顺序
+/// 都会保留；已完成任务始终留在原日期。整体改期属于新的显式安排，会清除这些未完成任务
+/// 之前由“一键提前”产生的归位信号，避免以后撤销旧操作时覆盖新排期。
+pub fn reschedule_unfinished_plan(
+    plan: &mut StudyPlan,
+    target_start_date: &str,
+) -> Result<bool, String> {
+    let target_start = validate_date(target_start_date)?;
+    let Some(current_start_text) = plan
+        .schedules
+        .iter()
+        .filter(|schedule| schedule.tasks.iter().any(|task| !task.completed))
+        .map(|schedule| schedule.date.as_str())
+        .min()
+    else {
+        return Ok(false);
+    };
+    let current_start = validate_date(current_start_text)?;
+    let offset_days = target_start.signed_duration_since(current_start).num_days();
+    if offset_days == 0 {
+        return Ok(false);
+    }
+
+    let unfinished_ids: Vec<String> = plan
+        .schedules
+        .iter()
+        .flat_map(|schedule| &schedule.tasks)
+        .filter(|task| !task.completed)
+        .map(|task| task.id.clone())
+        .collect();
+    for task_id in &unfinished_ids {
+        crate::schedule_recovery::detach_task(plan, task_id);
+    }
+
+    let mut rebuilt = Vec::new();
+    for schedule in std::mem::take(&mut plan.schedules) {
+        let source_date = validate_date(&schedule.date)?;
+        let shifted_date = source_date
+            .checked_add_signed(Duration::days(offset_days))
+            .ok_or_else(|| "目标日期超出支持范围。".to_string())?;
+        let shifted_date = format_date(shifted_date);
+        let mut completed_tasks = Vec::new();
+        let mut unfinished_tasks = Vec::new();
+        for mut task in schedule.tasks {
+            if task.completed {
+                completed_tasks.push(task);
+            } else {
+                task.advanced_from_date = None;
+                task.advance_restored = false;
+                unfinished_tasks.push(task);
+            }
+        }
+        if !completed_tasks.is_empty() {
+            rebuilt.push(DailySchedule {
+                day_index: schedule.day_index,
+                date: schedule.date,
+                tasks: completed_tasks,
+                is_rest_day: false,
+            });
+        }
+        if !unfinished_tasks.is_empty() {
+            rebuilt.push(DailySchedule {
+                day_index: schedule.day_index,
+                date: shifted_date,
+                tasks: unfinished_tasks,
+                is_rest_day: false,
+            });
+        }
+    }
+
+    plan.schedules = rebuilt;
+    refresh_plan_schedule_summary(plan);
+    Ok(true)
+}
+
 /// 将指定未来日期中已打卡的任务条目移动到今天。
 ///
 /// 若该计划在指定未来日期的全部任务均已完成，则移除该日并把更晚的日程
@@ -1755,6 +1832,128 @@ mod tests {
         assert!(!second.tasks[0].completed);
         assert_eq!(third.tasks.len(), 2); // 原 9/2 日程整体后移
         assert_eq!(plan.end_date, "2026-09-03");
+    }
+
+    #[test]
+    fn reschedule_unfinished_plan_moves_only_open_tasks_and_keeps_batches() {
+        let mut plan = create_study_plan(
+            "高数",
+            "bilibili",
+            "BV123",
+            "全集",
+            &mock_plan_out(),
+            "2026-09-01",
+            false,
+        );
+        let completed_id = plan.schedules[0].tasks[0].id.clone();
+        plan.schedules[0].tasks[0].completed = true;
+        plan.schedules[0].tasks[0].completed_at = Some(100);
+
+        assert!(reschedule_unfinished_plan(&mut plan, "2026-09-05").unwrap());
+        let completed_day = plan
+            .schedules
+            .iter()
+            .find(|schedule| schedule.date == "2026-09-01")
+            .unwrap();
+        assert_eq!(completed_day.tasks.len(), 1);
+        assert_eq!(completed_day.tasks[0].id, completed_id);
+        assert!(completed_day.tasks[0].completed);
+        assert_eq!(
+            plan.schedules
+                .iter()
+                .find(|schedule| schedule.date == "2026-09-05")
+                .unwrap()
+                .tasks
+                .len(),
+            1
+        );
+        assert_eq!(
+            plan.schedules
+                .iter()
+                .find(|schedule| schedule.date == "2026-09-06")
+                .unwrap()
+                .tasks
+                .len(),
+            2
+        );
+        assert_eq!(
+            plan.schedules
+                .iter()
+                .flat_map(|schedule| &schedule.tasks)
+                .count(),
+            4
+        );
+        assert_eq!(plan.end_date, "2026-09-06");
+    }
+
+    #[test]
+    fn reschedule_unfinished_plan_can_move_backward_and_detaches_old_restore_history() {
+        let mut plan = create_study_plan(
+            "高数",
+            "bilibili",
+            "BV123",
+            "全集",
+            &mock_plan_out(),
+            "2026-09-01",
+            false,
+        );
+        plan.schedules[0].tasks[0].completed = true;
+        let unfinished_id = plan.schedules[0].tasks[1].id.clone();
+        plan.schedules[0].tasks[1].advanced_from_date = Some("2026-09-08".to_string());
+        plan.advance_shifts
+            .push(crate::schedule_recovery::ScheduleShift {
+                trigger_task_ids: vec![unfinished_id.clone()],
+                moves: vec![crate::schedule_recovery::TaskDateMove {
+                    task_id: unfinished_id.clone(),
+                    from: "2026-09-08".to_string(),
+                    to: "2026-09-01".to_string(),
+                }],
+                date_slots: vec![("2026-09-08".to_string(), "2026-09-01".to_string())],
+            });
+
+        assert!(reschedule_unfinished_plan(&mut plan, "2026-08-30").unwrap());
+        let moved = plan
+            .schedules
+            .iter()
+            .find(|schedule| schedule.date == "2026-08-30")
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|task| task.id == unfinished_id)
+            .unwrap();
+        assert!(moved.advanced_from_date.is_none());
+        assert!(!moved.advance_restored);
+        assert!(plan.advance_shifts.is_empty());
+        assert!(plan.schedules.iter().any(|schedule| {
+            schedule.date == "2026-09-01" && schedule.tasks.iter().any(|task| task.completed)
+        }));
+        assert!(plan
+            .schedules
+            .iter()
+            .any(|schedule| schedule.date == "2026-08-31"));
+    }
+
+    #[test]
+    fn reschedule_unfinished_plan_is_noop_without_a_new_start_or_open_tasks() {
+        let mut plan = create_study_plan(
+            "高数",
+            "bilibili",
+            "BV123",
+            "全集",
+            &mock_plan_out(),
+            "2026-09-01",
+            false,
+        );
+        assert!(!reschedule_unfinished_plan(&mut plan, "2026-09-01").unwrap());
+        for task in plan
+            .schedules
+            .iter_mut()
+            .flat_map(|schedule| &mut schedule.tasks)
+        {
+            task.completed = true;
+        }
+        assert!(!reschedule_unfinished_plan(&mut plan, "2026-09-10").unwrap());
+        assert!(reschedule_unfinished_plan(&mut plan, "not-a-date").is_err());
     }
 
     #[test]
