@@ -534,6 +534,7 @@ dependencies = [
  "gpui-component-assets",
  "md5",
  "pollster 0.4.0",
+ "rand 0.8.8",
  "rfd",
  "rusqlite",
  "rust-embed",

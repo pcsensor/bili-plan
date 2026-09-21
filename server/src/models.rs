@@ -135,13 +135,40 @@ pub struct BindStatusResponse {
     pub telegram_user_name: Option<String>,
 }
 
-/// 同步请求载荷。
+/// 同步请求载荷。设备身份走 `Authorization: Bearer` 头，不在 body 里重复携带。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncPayload {
-    pub device_token: String,
+    /// 仅供旧版客户端滚动升级。新客户端必须使用 Authorization 头。
+    #[serde(default)]
+    pub device_token: Option<String>,
+    #[serde(default)]
     pub plans: Vec<StudyPlan>,
     #[serde(default)]
     pub daily_notes: DailyNotes,
+}
+
+/// 设备注册响应：令牌由服务端签发，客户端持久化后用于后续所有请求。
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterResponse {
+    pub device_token: String,
+}
+
+/// 同步失败原因。区分"令牌未知"与"存储故障"，前者要让客户端重新注册而不是重试。
+#[derive(Debug)]
+pub enum SyncError {
+    UnknownDevice,
+    Storage,
+}
+
+/// 一次同步合并后的服务端状态。
+#[derive(Debug)]
+pub struct SyncOutcome {
+    pub plans: Vec<StudyPlan>,
+    pub daily_notes: DailyNotes,
+    pub feishu_bound: bool,
+    pub feishu_user_name: Option<String>,
+    pub telegram_bound: bool,
+    pub telegram_user_name: Option<String>,
 }
 
 /// 同步响应载荷。

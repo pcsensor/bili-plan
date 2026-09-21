@@ -437,7 +437,8 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                             let _ = telegram.send_message(chat_id, &reply, None).await;
                                         }
                                         Err(e) => {
-                                            let reply = format!("❌ 绑定失败：{}\n请在电脑端重新生成绑定码。", escape_html(e));
+                                            // 错误文案已自带下一步指引（重新生成 / 等待锁定结束），不再追加。
+                                            let reply = format!("❌ 绑定失败：{}", escape_html(&e));
                                             let _ = telegram.send_message(chat_id, &reply, None).await;
                                         }
                                     }
