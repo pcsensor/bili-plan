@@ -9,7 +9,7 @@ mod store;
 mod telegram;
 
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -23,7 +23,6 @@ use models::{
     RegisterResponse, SyncError, SyncPayload, SyncResponse,
 };
 use ratelimit::RateLimiter;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::env;
 use std::net::SocketAddr;
@@ -32,7 +31,7 @@ use std::time::Duration;
 use store::Store;
 use telegram::TelegramClient;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, info_span, warn};
+use tracing::{error, info, info_span};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -55,7 +54,6 @@ struct AppState {
     feishu: FeishuClient,
     feishu_verification_token: String,
     limiter: RateLimiter,
-    allow_legacy_token_transport: bool,
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -91,9 +89,8 @@ async fn authorize_device(
     headers: &HeaderMap,
     peer: &SocketAddr,
     policy: RatePolicy,
-    legacy_token: Option<&str>,
 ) -> Result<DeviceUser, ApiError> {
-    let credential = auth::device_credential(headers, legacy_token).ok_or_else(|| {
+    let token = auth::bearer_token(headers).ok_or_else(|| {
         api_error(
             StatusCode::UNAUTHORIZED,
             "缺少或无效的 Authorization: Bearer 设备令牌",
@@ -111,17 +108,9 @@ async fn authorize_device(
         ));
     }
 
-    if credential.legacy_transport && !state.allow_legacy_token_transport {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "旧版设备令牌传输已停用，请升级桌面客户端",
-        ));
-    }
-
-    // 旧客户端只允许继续使用服务端已存在的设备，绝不能借兼容路径匿名建号。
     let user = state
         .store
-        .get_device_by_token(&credential.token)
+        .get_device_by_token(&token)
         .await
         .map_err(|_| {
             api_error(
@@ -138,7 +127,7 @@ async fn authorize_device(
         })?;
 
     if !state.limiter.allow(
-        &format!("{}:token:{}", policy.scope, credential.token),
+        &format!("{}:token:{}", policy.scope, token),
         policy.token_limit,
         policy.window,
     ) {
@@ -146,9 +135,6 @@ async fn authorize_device(
             StatusCode::TOO_MANY_REQUESTS,
             "请求过于频繁，请稍后再试",
         ));
-    }
-    if credential.legacy_transport {
-        warn!("来源 {} 使用旧版设备令牌传输；请尽快升级桌面客户端", ip);
     }
     Ok(user)
 }
@@ -193,15 +179,6 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3005);
-    let allow_legacy_token_transport = env::var("ALLOW_LEGACY_TOKEN_TRANSPORT")
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no"
-            )
-        })
-        .unwrap_or(true);
-
     info!(
         "🚀 正在启动 bili-plan-server (端口: {}, App ID: {})",
         port, app_id
@@ -232,7 +209,6 @@ async fn main() {
         feishu,
         feishu_verification_token,
         limiter: RateLimiter::new(),
-        allow_legacy_token_transport,
     };
 
     let app = Router::new()
@@ -242,7 +218,7 @@ async fn main() {
         .route("/api/bind/status", get(query_bind_status))
         .route("/api/sync", post(sync_plans))
         .route("/api/feishu/callback", post(feishu_callback))
-        // 只记录 path，不记录 query；旧客户端迁移期的 query 可能含设备令牌。
+        // 只记录 path；即使调用方错误地把敏感信息放进 query，也不写入访问日志。
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
                 info_span!(
@@ -303,18 +279,11 @@ async fn register_device(
     }))
 }
 
-/// 客户端请求 6 位绑定码
-#[derive(Deserialize, Default)]
-struct LegacyBindRequest {
-    #[serde(default)]
-    device_token: Option<String>,
-}
-
+/// 客户端请求 6 位绑定码。
 async fn request_bind_code(
     State(state): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    payload: Option<Json<LegacyBindRequest>>,
 ) -> Result<Json<BindRequestResponse>, ApiError> {
     let user = authorize_device(
         &state,
@@ -326,9 +295,6 @@ async fn request_bind_code(
             ip_limit: BIND_REQUEST_PER_IP,
             window: HOUR,
         },
-        payload
-            .as_ref()
-            .and_then(|Json(payload)| payload.device_token.as_deref()),
     )
     .await?;
     let code = state
@@ -339,23 +305,15 @@ async fn request_bind_code(
 
     Ok(Json(BindRequestResponse {
         bind_code: code,
-        device_token: user.device_token,
         expires_in_secs: 600,
     }))
 }
 
-/// 客户端查询当前设备是否已被飞书或 Telegram 绑定
-#[derive(Deserialize, Default)]
-struct LegacyBindStatusQuery {
-    #[serde(default)]
-    device_token: Option<String>,
-}
-
+/// 客户端查询当前设备是否已被飞书或 Telegram 绑定。
 async fn query_bind_status(
     State(state): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(query): Query<LegacyBindStatusQuery>,
 ) -> Result<Json<BindStatusResponse>, ApiError> {
     let user = authorize_device(
         &state,
@@ -367,7 +325,6 @@ async fn query_bind_status(
             ip_limit: BIND_STATUS_PER_IP,
             window: MINUTE,
         },
-        query.device_token.as_deref(),
     )
     .await?;
     let feishu_bound = user.feishu_open_id.is_some();
@@ -388,7 +345,6 @@ async fn sync_plans(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(payload): Json<SyncPayload>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    let legacy_token = payload.device_token.as_deref();
     let user = authorize_device(
         &state,
         &headers,
@@ -399,7 +355,6 @@ async fn sync_plans(
             ip_limit: SYNC_PER_IP,
             window: MINUTE,
         },
-        legacy_token,
     )
     .await?;
 
@@ -662,4 +617,57 @@ async fn feishu_callback(
     }
 
     Json(json!({ "code": 0, "msg": "success" })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::AUTHORIZATION;
+
+    #[tokio::test]
+    async fn sync_rejects_body_token_and_accepts_bearer_header() {
+        let dir = std::env::temp_dir().join(format!("bili_auth_{}", rand::random::<u64>()));
+        let store = Store::new(&dir);
+        let token = store.register_device().await.unwrap().device_token;
+        let state = AppState {
+            store,
+            feishu: FeishuClient::new("test-app", "test-secret"),
+            feishu_verification_token: "test-verification".to_string(),
+            limiter: RateLimiter::new(),
+        };
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let old_body = serde_json::from_value(json!({
+            "device_token": token,
+            "base_revision": 0,
+            "plans": []
+        }))
+        .unwrap();
+        let rejected = sync_plans(
+            State(state.clone()),
+            HeaderMap::new(),
+            ConnectInfo(peer),
+            Json(old_body),
+        )
+        .await;
+        assert_eq!(rejected.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        let payload = serde_json::from_value(json!({"base_revision": 0, "plans": []})).unwrap();
+        let accepted = sync_plans(
+            State(state.clone()),
+            headers.clone(),
+            ConnectInfo(peer),
+            Json(payload),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.0.revision, 1);
+        let bind = request_bind_code(State(state), headers, ConnectInfo(peer))
+            .await
+            .unwrap();
+        let bind_json = serde_json::to_value(bind.0).unwrap();
+        assert!(bind_json.get("device_token").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

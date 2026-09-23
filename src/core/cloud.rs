@@ -32,16 +32,6 @@ impl CloudFailure {
             CloudFailure::Other(message) => message,
         }
     }
-
-    fn permits_legacy_fallback(&self) -> bool {
-        matches!(
-            self,
-            CloudFailure::HttpStatus {
-                status: 400 | 404 | 405 | 415 | 422,
-                ..
-            }
-        )
-    }
 }
 
 /// 携带 `Authorization: Bearer <device_token>` 发起一次云端请求。
@@ -209,90 +199,15 @@ fn cloud_request(
     }
 }
 
-/// 旧服务兼容仅在新版请求明确返回“不支持该协议”的状态码后启用。新服务仍只允许旧版
-/// 传输访问数据库中已经存在的设备，不会恢复匿名建号漏洞。
-fn legacy_device_token(cfg: &mut AppConfig) -> String {
-    if let Some(token) = cfg
-        .sync_device_token
-        .clone()
-        .filter(|token| !token.trim().is_empty())
-    {
-        return token;
-    }
-    let token = format!(
-        "desktop_{:016x}{:016x}",
-        rand::random::<u64>(),
-        rand::random::<u64>()
-    );
-    persist_cloud_token(cfg, token.clone());
-    token
-}
-
-fn send_legacy_cloud(
-    cfg: &mut AppConfig,
-    path: &str,
-    request: CloudRequest<'_>,
-    timeout: std::time::Duration,
-) -> Result<serde_json::Value, String> {
-    let token = legacy_device_token(cfg);
-    let server = cfg.sync_server_url.trim_end_matches('/');
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .build()
-        .new_agent();
-    let sent = match request {
-        CloudRequest::Get => agent
-            .get(format!("{server}{path}?device_token={token}"))
-            .call(),
-        CloudRequest::PostEmpty => {
-            let body = serde_json::json!({ "device_token": token });
-            let payload = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-            agent
-                .post(format!("{server}{path}"))
-                .header("Content-Type", "application/json")
-                .send(payload)
-        }
-        CloudRequest::PostJson(body) => {
-            let mut legacy_body = body.clone();
-            legacy_body["device_token"] = serde_json::Value::String(token);
-            let payload = serde_json::to_vec(&legacy_body).map_err(|e| e.to_string())?;
-            agent
-                .post(format!("{server}{path}"))
-                .header("Content-Type", "application/json")
-                .send(payload)
-        }
-    };
-    let mut response = sent.map_err(|e| format!("旧版云端请求失败: {e}"))?;
-    let raw = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("读取旧版云端响应失败: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("解析旧版云端响应失败: {e}"))
-}
-
-fn cloud_request_with_legacy_fallback(
-    cfg: &mut AppConfig,
-    path: &str,
-    request: CloudRequest<'_>,
-    timeout: std::time::Duration,
-) -> Result<serde_json::Value, String> {
-    match cloud_request(cfg, path, request, timeout) {
-        Ok(data) => Ok(data),
-        Err(failure) if failure.permits_legacy_fallback() => {
-            send_legacy_cloud(cfg, path, request, timeout)
-        }
-        Err(failure) => Err(failure.message()),
-    }
-}
-
 /// 请求云端 6 位绑定验证码。
 pub fn request_cloud_bind_code(cfg: &mut AppConfig) -> Result<(String, u64), String> {
-    let data = cloud_request_with_legacy_fallback(
+    let data = cloud_request(
         cfg,
         "/api/bind/request",
         CloudRequest::PostEmpty,
         CLOUD_TIMEOUT,
-    )?;
+    )
+    .map_err(CloudFailure::message)?;
     let code = data["bind_code"]
         .as_str()
         .ok_or_else(|| "缺少 bind_code".to_string())?
@@ -308,12 +223,8 @@ pub fn check_cloud_bind_status(cfg: &mut AppConfig) -> Result<bool, String> {
     if cfg.sync_device_token.is_none() {
         return Ok(false);
     }
-    let data = cloud_request_with_legacy_fallback(
-        cfg,
-        "/api/bind/status",
-        CloudRequest::Get,
-        CLOUD_TIMEOUT,
-    )?;
+    let data = cloud_request(cfg, "/api/bind/status", CloudRequest::Get, CLOUD_TIMEOUT)
+        .map_err(CloudFailure::message)?;
     let bound = data["bound"].as_bool().unwrap_or(false);
     cfg.feishu_bound = bound;
     cfg.feishu_user_name = data["feishu_user_name"].as_str().map(|s| s.to_string());
@@ -331,12 +242,13 @@ pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
         "daily_notes": cfg.daily_notes,
         "base_revision": cfg.sync_revision
     });
-    let data = cloud_request_with_legacy_fallback(
+    let data = cloud_request(
         cfg,
         "/api/sync",
         CloudRequest::PostJson(&body),
         CLOUD_SYNC_TIMEOUT,
-    )?;
+    )
+    .map_err(CloudFailure::message)?;
 
     if let Some(plans_val) = data.get("plans") {
         if let Ok(merged_plans) = serde_json::from_value::<Vec<StudyPlan>>(plans_val.clone()) {

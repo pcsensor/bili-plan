@@ -128,6 +128,22 @@ for path in (ROOT / "src/app").glob("*.rs"):
 cloud = (ROOT / "src/core/cloud.rs").read_text()
 sync = cloud.split("pub fn sync_with_cloud(", 1)[-1]
 require("save_config(" not in sync, "background cloud sync must not persist its snapshot")
+for path in (
+    ROOT / "src/core/cloud.rs",
+    ROOT / "server/src/auth.rs",
+    ROOT / "server/src/main.rs",
+    ROOT / "server/.env.example",
+):
+    source = path.read_text()
+    require(
+        "ALLOW_LEGACY_TOKEN_TRANSPORT" not in source
+        and "legacy_transport" not in source
+        and "send_legacy_cloud" not in source
+        and "?device_token=" not in source,
+        f"insecure token transport returned: {path}",
+    )
+sync_payload = (ROOT / "server/src/models.rs").read_text().split("pub struct SyncPayload {", 1)[-1].split("\n}", 1)[0]
+require("pub device_token:" not in sync_payload, "sync body must not carry the device credential")
 
 if errors:
     for error in errors:

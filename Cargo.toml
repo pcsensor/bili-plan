@@ -35,7 +35,6 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 pollster = "0.4"
 rust-embed = "8"
 rusqlite = { version = "0.32", features = ["bundled"] }
-rand = "0.8"
 # 飞牛影视接口的 authx 签名算法要求 MD5（协议校验和，非安全用途）。
 md5 = "0.7"
 

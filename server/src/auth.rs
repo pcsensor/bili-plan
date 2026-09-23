@@ -5,12 +5,6 @@ use std::net::{IpAddr, SocketAddr};
 /// 设备令牌长度上限。超限一律拒绝，避免攻击者用超长字符串撑大限流表的 key。
 const MAX_TOKEN_LEN: usize = 128;
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct DeviceCredential {
-    pub token: String,
-    pub legacy_transport: bool,
-}
-
 /// 从 `Authorization` 头取出设备令牌。
 ///
 /// 令牌只走请求头，不再出现在 query string 中——后者会落进反向代理访问日志与
@@ -29,25 +23,6 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
 fn valid_token(token: &str) -> bool {
     !token.is_empty() && token.len() <= MAX_TOKEN_LEN
-}
-
-/// 优先使用标准 Bearer 头；仅当请求完全没有 Authorization 头时，才接受旧版客户端
-/// 放在 body/query 中的令牌。这样畸形头不会静默降级到旧协议。
-pub fn device_credential(
-    headers: &HeaderMap,
-    legacy_token: Option<&str>,
-) -> Option<DeviceCredential> {
-    if headers.contains_key(axum::http::header::AUTHORIZATION) {
-        return bearer_token(headers).map(|token| DeviceCredential {
-            token,
-            legacy_transport: false,
-        });
-    }
-    let token = legacy_token?.trim();
-    valid_token(token).then(|| DeviceCredential {
-        token: token.to_string(),
-        legacy_transport: true,
-    })
 }
 
 /// 解析限流用的客户端 IP。
@@ -176,17 +151,13 @@ mod tests {
     }
 
     #[test]
-    fn bearer_header_cannot_downgrade_to_legacy_transport() {
-        let legacy = Some("legacy-token");
+    fn only_authorization_bearer_header_is_accepted() {
         assert_eq!(
-            device_credential(&headers(&[]), legacy),
-            Some(DeviceCredential {
-                token: "legacy-token".to_string(),
-                legacy_transport: true,
-            })
+            bearer_token(&headers(&[("x-device-token", "legacy-token")])),
+            None
         );
         assert_eq!(
-            device_credential(&headers(&[("authorization", "Basic Zm9v")]), legacy),
+            bearer_token(&headers(&[("authorization", "Basic Zm9v")])),
             None
         );
     }

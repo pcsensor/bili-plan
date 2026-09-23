@@ -22,7 +22,6 @@ pub struct DeviceUser {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BindRequestResponse {
     pub bind_code: String,
-    pub device_token: String,
     pub expires_in_secs: u64,
 }
 
@@ -41,9 +40,6 @@ pub struct BindStatusResponse {
 /// 同步请求载荷。设备身份走 `Authorization: Bearer` 头，不在 body 里重复携带。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncPayload {
-    /// 仅供旧版客户端滚动升级。新客户端必须使用 Authorization 头。
-    #[serde(default)]
-    pub device_token: Option<String>,
     /// Omitted only by a legacy client. New clients must send their last revision.
     #[serde(default)]
     pub base_revision: Option<i64>,

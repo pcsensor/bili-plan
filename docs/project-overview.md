@@ -73,7 +73,7 @@ model ────────────────────────�
 
 机器人打卡使用任务的 `updated_at` 合并；同一任务在同一秒的连续操作仍要有严格递增的时间戳。备注删除保留 tombstone。整日提前的补位历史和机器人撤销后的 `advance_restored` 信号需要跨同步保留到客户端完成归位。
 
-升级顺序为**先服务端，后桌面端**。旧客户端在服务端版本仍为 0 时可以继续同步；首次新版桌面同步使版本增加后，旧客户端的无版本快照会被拒绝。多个桌面端使用同一设备令牌并发编辑时，版本检查防止旧快照静默覆盖新数据，但系统没有自动合并两份独立排期的能力。
+绑定与同步接口只从 `Authorization: Bearer` 请求头读取设备令牌。服务端不接受 body/query 令牌，桌面端也不再回退旧传输格式。升级时应同时准备好新版服务端和桌面端：旧传输格式的客户端在服务端升级后立即收到 401。仍用 Bearer 头但未提交版本号的旧客户端，仅在服务端版本为 0 时可同步；首次新版同步使版本增加后，其无版本快照也会被拒绝。多个桌面端使用同一设备令牌并发编辑时，版本检查防止旧快照静默覆盖新数据，但系统没有自动合并两份独立排期的能力。
 
 本地数据库写入失败会输出错误信息；部分旧 UI 动作仍使用不返回错误的保存入口。新增关键写入流程应使用 `try_save_config` 并向用户显示失败，不要把内存更新当作已经落盘。
 
@@ -110,7 +110,7 @@ bash tools/check.sh
 # 仅运行共享领域测试
 cargo test -p planner-domain --locked
 
-# 服务端编译；Docker Compose 从 server/ 启动，构建上下文是仓库根目录
+# 服务端编译；Docker Compose 从完整仓库的 server/ 启动，构建上下文是仓库根目录
 cargo build --release --locked -p bili-plan-server
 
 # 桌面端
@@ -118,3 +118,5 @@ cargo run --release --bin bili-planner
 ```
 
 桌面端在 macOS 上构建需要可用的 Xcode Metal Toolchain；`xcrun --find metal` 和 `xcrun metal -v` 可检查本机工具链。真实 B 站、Jellyfin、飞牛影视、飞书或 Telegram 联调会访问外部服务，不属于离线测试脚本。
+
+服务端部署必须保持完整 workspace 目录结构。旧版只上传 `server/` 内容到 `/opt/bili-plan-server` 的方式与当前 `docker-compose.yml` 不兼容；迁移目录及数据步骤见根目录 README 的部署章节。

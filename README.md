@@ -88,12 +88,29 @@
 ### 2. 方式一：Docker Compose 部署（推荐）
 
 #### 步骤 1：准备部署目录与配置文件
-在服务器上拉取完整仓库。服务端依赖 `crates/domain`，不能只复制 `server/`。以下命令假定 `/opt/bili-plan-server` 是仓库根目录：
+在服务器上拉取**完整仓库**。服务端依赖 `crates/domain`，不能只复制旧版的单目录服务端。以下命令假定 `/opt/bili-plan` 是仓库根目录：
 
 ```bash
-mkdir -p /opt/bili-plan-server
-cd /opt/bili-plan-server
+cd /opt/bili-plan
 ```
+
+部署前应看到以下层级（其余仓库文件也一并保留）：
+
+```text
+/opt/bili-plan/
+├── Cargo.toml
+├── Cargo.lock
+├── crates/domain/Cargo.toml
+└── server/
+    ├── Cargo.toml
+    ├── Dockerfile
+    ├── docker-compose.yml
+    ├── .env
+    ├── data/
+    └── src/
+```
+
+如果服务器上仍是 `/opt/bili-plan-server/{Dockerfile,docker-compose.yml,src,data}` 这种旧版单目录布局，应先把完整仓库上传到新的 `/opt/bili-plan/`。把旧目录的 `.env` 和 `data/` 迁移到新仓库的 `server/` 下；复制 SQLite 数据前先停止旧容器，避免复制过程中数据库仍在写入。不要仅把 `docker-compose.yml` 的 `context` 改为 `.`，因为服务端源码还依赖上级的 `crates/domain` 和根目录的 workspace 锁文件。
 
 创建 `server/.env` 文件（可参考 `server/.env.example`）：
 ```env
@@ -213,10 +230,10 @@ cargo run --release
 - **拒绝匿名写入**：`/api/sync` 与 `/api/bind/*` 使用 Bearer 令牌——缺失或畸形回 401，
   服务端查无此设备回带有 `unknown_device` 错误码的 404。客户端只在确认该错误码后注册
   新设备，并在重试成功后替换本地令牌；普通代理 404 不会导致绑定丢失。
-- **滚动升级兼容**：迁移期内服务端仍识别旧客户端放在 body/query 中的令牌，但只允许访问
-  数据库中已经存在的设备，绝不会通过旧协议创建新设备。新版客户端只在服务器明确不支持
-  新协议时回退旧格式。所有桌面端升级后，将 `ALLOW_LEGACY_TOKEN_TRANSPORT=false` 并重启
-  服务，即可彻底拒绝旧传输；迁移期间也应关闭反向代理的 query 日志。
+- **仅接受安全传输**：绑定与同步请求都必须通过 `Authorization: Bearer` 传设备令牌；
+  body/query 中的旧版令牌不再用于鉴权。客户端不会因服务器返回 400/404 等状态而降级到
+  旧格式。仍使用旧传输方式的桌面端必须升级，服务端不再提供过渡开关；服务器现有
+  `server/.env` 中若还有 `ALLOW_LEGACY_TOKEN_TRANSPORT`，可直接删除该行。
 - **限流**（固定窗口，超限回 429）：注册 20 次/小时/IP；同步 120 次/分/设备、600 次/分/IP；
   生成绑定码 10 次/小时/设备；查询绑定状态 60 次/分/设备。服务先执行 IP 限流、再验证
   设备、最后记录设备桶；限流表有硬容量，随机伪造令牌不能造成无界内存增长。
