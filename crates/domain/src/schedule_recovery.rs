@@ -1,24 +1,8 @@
 //! 客户端和机器人共用的排期补位/归位逻辑；历史按任务 ID 记录，避免恢复整份旧计划。
-use crate::schedule_model::{DailySchedule, PlanStatus, StudyPlan};
+use crate::model::{DailySchedule, PlanStatus, StudyPlan};
+pub use crate::model::{ScheduleShift, TaskDateMove};
 use chrono::{Datelike, Duration, NaiveDate};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskDateMove {
-    pub task_id: String,
-    pub from: String,
-    pub to: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduleShift {
-    pub trigger_task_ids: Vec<String>,
-    pub moves: Vec<TaskDateMove>,
-    /// 固定的日期槽位映射；某项后来手动改期后仍保留，以便更新其他批次。
-    #[serde(default)]
-    pub date_slots: Vec<(String, String)>,
-}
 
 pub fn refresh(plan: &mut StudyPlan) {
     // 日期唯一；休息日不能遮住真实任务。

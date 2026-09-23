@@ -7,11 +7,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 
-pub fn start_scheduler(
-    store: Store,
-    feishu: FeishuClient,
-    telegram: Option<TelegramClient>,
-) {
+pub fn start_scheduler(store: Store, feishu: FeishuClient, telegram: Option<TelegramClient>) {
     tokio::spawn(async move {
         info!("🕒 定时推送调度器已启动 (每日 08:30 早报 / 21:30 晚间督促)");
         loop {
@@ -26,11 +22,17 @@ pub fn start_scheduler(
                 let feishu_users = store.get_all_bound_users().await;
                 for (user, plans) in feishu_users {
                     if let Some(open_id) = &user.feishu_open_id {
-                        if store.record_pushed_date(open_id, "morning", &date_str).await {
+                        if store
+                            .record_pushed_date(open_id, "morning", &date_str)
+                            .await
+                        {
                             info!("向飞书用户 {} 触发晨间计划推送", open_id);
                             let card = build_today_study_card(&plans, &date_str);
                             if let Err(e) = feishu.send_card_message(open_id, card).await {
                                 error!("推送飞书晨间卡片失败: {}", e);
+                                store
+                                    .release_pushed_date(open_id, "morning", &date_str)
+                                    .await;
                             }
                         }
                     }
@@ -44,8 +46,11 @@ pub fn start_scheduler(
                             let key = format!("tg_{}", chat_id);
                             if store.record_pushed_date(&key, "morning", &date_str).await {
                                 info!("向 Telegram 用户 {} 触发晨间计划推送", chat_id);
-                                if let Err(e) = tg.send_today_study_card(chat_id, &plans, &date_str).await {
+                                if let Err(e) =
+                                    tg.send_today_study_card(chat_id, &plans, &date_str).await
+                                {
                                     error!("推送 Telegram 晨间卡片失败: {}", e);
+                                    store.release_pushed_date(&key, "morning", &date_str).await;
                                 }
                             }
                         }
@@ -59,11 +64,17 @@ pub fn start_scheduler(
                 let feishu_users = store.get_all_bound_users().await;
                 for (user, plans) in feishu_users {
                     if let Some(open_id) = &user.feishu_open_id {
-                        if store.record_pushed_date(open_id, "evening", &date_str).await {
+                        if store
+                            .record_pushed_date(open_id, "evening", &date_str)
+                            .await
+                        {
                             info!("向飞书用户 {} 触发晚间督促推送", open_id);
                             let card = build_today_study_card(&plans, &date_str);
                             if let Err(e) = feishu.send_card_message(open_id, card).await {
                                 error!("推送飞书晚间卡片失败: {}", e);
+                                store
+                                    .release_pushed_date(open_id, "evening", &date_str)
+                                    .await;
                             }
                         }
                     }
@@ -77,8 +88,11 @@ pub fn start_scheduler(
                             let key = format!("tg_{}", chat_id);
                             if store.record_pushed_date(&key, "evening", &date_str).await {
                                 info!("向 Telegram 用户 {} 触发晚间督促推送", chat_id);
-                                if let Err(e) = tg.send_today_study_card(chat_id, &plans, &date_str).await {
+                                if let Err(e) =
+                                    tg.send_today_study_card(chat_id, &plans, &date_str).await
+                                {
                                     error!("推送 Telegram 晚间卡片失败: {}", e);
+                                    store.release_pushed_date(&key, "evening", &date_str).await;
                                 }
                             }
                         }

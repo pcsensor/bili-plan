@@ -2,6 +2,16 @@ use crate::models::{PlanStatus, StudyPlan, TaskItem};
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{json, Value};
 
+fn source_label(source_type: &str) -> &'static str {
+    match source_type {
+        "bilibili" => "📺 B站",
+        "jellyfin" => "🎬 Jellyfin",
+        "fnos" => "🖥️ 飞牛影视",
+        "custom" => "📝 自定义任务",
+        _ => "📁 其他来源",
+    }
+}
+
 fn fmt_seconds(seconds: f64) -> String {
     let s = seconds.round() as u64;
     let m = s / 60;
@@ -34,7 +44,9 @@ fn clean_bili_link(source_url: &str, vid_no: i64) -> String {
     for i in 0..n.saturating_sub(11) {
         if chars[i] == 'B'
             && chars[i + 1] == 'V'
-            && chars[i + 2..i + 12].iter().all(|c| c.is_ascii_alphanumeric())
+            && chars[i + 2..i + 12]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric())
         {
             let bvid: String = chars[i..i + 12].iter().collect();
             return format!("https://www.bilibili.com/video/{}?p={}", bvid, vid_no);
@@ -54,7 +66,10 @@ pub fn build_today_study_card(plans: &[StudyPlan], target_date: &str) -> Value {
         .unwrap_or_else(|_| Local::now().date_naive());
     let weekday_str = get_weekday_name(&parsed_date);
 
-    let active_plans: Vec<_> = plans.iter().filter(|p| p.status == PlanStatus::Active).collect();
+    let active_plans: Vec<_> = plans
+        .iter()
+        .filter(|p| p.status == PlanStatus::Active)
+        .collect();
 
     let mut total_tasks = 0;
     let mut done_tasks = 0;
@@ -177,9 +192,15 @@ pub fn build_today_study_card(plans: &[StudyPlan], target_date: &str) -> Value {
                     String::new()
                 };
                 let item_md = if is_done {
-                    format!("✅ ~~(P{}) {} (已学 {})~~{}", vno, task.title, dur_str, link_suffix)
+                    format!(
+                        "✅ ~~(P{}) {} (已学 {})~~{}",
+                        vno, task.title, dur_str, link_suffix
+                    )
                 } else {
-                    format!("⬜ **(P{}) {}** (⏱️ {}){}", vno, task.title, dur_str, link_suffix)
+                    format!(
+                        "⬜ **(P{}) {}** (⏱️ {}){}",
+                        vno, task.title, dur_str, link_suffix
+                    )
                 };
 
                 let btn_text = if is_done { "已打卡" } else { "打卡" };
@@ -283,8 +304,12 @@ pub fn build_my_plans_card(plans: &[StudyPlan]) -> Value {
                 0.0
             };
 
-            let weekend_tag = if p.skip_weekends { " · 跳过周末" } else { "" };
-            let source_icon = if p.source_type == "bilibili" { "📺 B站" } else { "🎬 Jellyfin" };
+            let weekend_tag = if p.skip_weekends {
+                " · 跳过周末"
+            } else {
+                ""
+            };
+            let source_icon = source_label(&p.source_type);
 
             let plan_md = format!(
                 "**{}. 《{}》** · {}\n• 📊 **任务进度**: {}/{} 课 ({:.1}%)\n• ⏱️ **时长进度**: {} / {}\n• 📅 **排期范围**: {} ~ {} (共 {} 天{})\n• 🏷️ **视频来源**: {} | {}",
@@ -343,4 +368,17 @@ pub fn build_my_plans_card(plans: &[StudyPlan]) -> Value {
         },
         "elements": elements
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_label;
+
+    #[test]
+    fn cards_label_every_supported_source() {
+        assert!(source_label("bilibili").contains("B站"));
+        assert!(source_label("jellyfin").contains("Jellyfin"));
+        assert!(source_label("fnos").contains("飞牛影视"));
+        assert!(source_label("custom").contains("自定义"));
+    }
 }

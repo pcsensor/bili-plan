@@ -1,0 +1,51 @@
+{
+  "TaskItem": {
+    "id": "String",
+    "vid_no": "i64",
+    "title": "String",
+    "portion": "i64",
+    "from_prev": "bool",
+    "remainder": "i64",
+    "completed": "bool",
+    "completed_at": "Option<i64>",
+    "updated_at": "i64",
+    "advanced_from_date": "Option<String>",
+    "advance_restored": "bool"
+  },
+  "DailySchedule": {
+    "day_index": "usize",
+    "date": "String",
+    "tasks": "Vec<TaskItem>",
+    "is_rest_day": "bool"
+  },
+  "StudyPlan": {
+    "id": "String",
+    "title": "String",
+    "source_type": "String",
+    "source_url": "String",
+    "scope_desc": "String",
+    "total_duration": "i64",
+    "planned_days": "usize",
+    "start_date": "String",
+    "end_date": "String",
+    "skip_weekends": "bool",
+    "status": "PlanStatus",
+    "created_at": "i64",
+    "schedules": "Vec<DailySchedule>",
+    "advance_shifts": "Vec<ScheduleShift>",
+    "is_series": "bool",
+    "show_in_library": "bool"
+  },
+  "DailyNote": {
+    "id": "String",
+    "content": "String",
+    "created_at": "i64",
+    "updated_at": "i64",
+    "deleted": "bool"
+  },
+  "ScheduleShift": {
+    "trigger_task_ids": "Vec<String>",
+    "moves": "Vec<TaskDateMove>",
+    "date_slots": "Vec<(String, String)>"
+  }
+}

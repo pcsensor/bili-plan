@@ -10,8 +10,7 @@ pub mod fnos;
 pub mod jellyfin;
 pub mod model;
 pub mod parse;
-pub mod plan;
-pub mod study;
+pub use planner_domain::{plan, schedule_recovery, study};
 pub mod theme;
 
 pub use error::{Error, ErrorKind, Result};
@@ -35,7 +34,3 @@ pub use study::{
     toggle_task_checkin, update_calendar_task, DailyNote, DailyNotes, DailySchedule, PlanStatus,
     StudyPlan, StudyStats, TaskItem, TodayTaskView,
 };
-
-pub(crate) use study as schedule_model;
-#[path = "../server/src/schedule_recovery.rs"]
-pub mod schedule_recovery;

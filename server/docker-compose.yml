@@ -1,8 +1,8 @@
-version: '3.7'
-
 services:
   bili-plan-server:
-    build: .
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
     container_name: bili-plan-server
     restart: always
     ports:

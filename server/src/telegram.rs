@@ -72,7 +72,10 @@ impl TelegramClient {
         text: &str,
         reply_markup: Option<Value>,
     ) -> Result<(), String> {
-        let url = format!("https://api.telegram.org/bot{}/editMessageText", self.bot_token);
+        let url = format!(
+            "https://api.telegram.org/bot{}/editMessageText",
+            self.bot_token
+        );
         let mut body = json!({
             "chat_id": chat_id,
             "message_id": message_id,
@@ -117,7 +120,10 @@ impl TelegramClient {
         text: Option<&str>,
         show_alert: bool,
     ) -> Result<(), String> {
-        let url = format!("https://api.telegram.org/bot{}/answerCallbackQuery", self.bot_token);
+        let url = format!(
+            "https://api.telegram.org/bot{}/answerCallbackQuery",
+            self.bot_token
+        );
         let mut body = json!({
             "callback_query_id": query_id,
             "show_alert": show_alert
@@ -200,7 +206,9 @@ fn clean_bili_url(source_type: &str, source_url: &str, vid_no: i64) -> String {
         for i in 0..n.saturating_sub(11) {
             if chars[i] == 'B'
                 && chars[i + 1] == 'V'
-                && chars[i + 2..i + 12].iter().all(|c| c.is_ascii_alphanumeric())
+                && chars[i + 2..i + 12]
+                    .iter()
+                    .all(|c| c.is_ascii_alphanumeric())
             {
                 found_bv = Some(chars[i..i + 12].iter().collect::<String>());
                 break;
@@ -272,7 +280,10 @@ pub fn build_telegram_today_card(
                         ("⬜", format!("<b>{}</b> (⏱️ {})", safe_title, dur_str))
                     };
 
-                    lines.push(format!("  {} (P{}) {}", status_icon, task.vid_no, title_text));
+                    lines.push(format!(
+                        "  {} (P{}) {}",
+                        status_icon, task.vid_no, title_text
+                    ));
 
                     // Inline Keyboard 打卡按钮与直达链接
                     let btn_text = if task.completed {
@@ -281,7 +292,8 @@ pub fn build_telegram_today_card(
                         format!("⬜ 打卡 P{}", task.vid_no)
                     };
                     let callback_data = format!("chk:{}:{}:{}", plan.id, task.id, target_date);
-                    let direct_url = clean_bili_url(&plan.source_type, &plan.source_url, task.vid_no);
+                    let direct_url =
+                        clean_bili_url(&plan.source_type, &plan.source_url, task.vid_no);
 
                     let mut row = vec![json!({
                         "text": btn_text,
@@ -417,7 +429,8 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                 .or_else(|| msg["from"]["first_name"].as_str())
                                 .unwrap_or("学习者");
 
-                            let first_word = text.split_whitespace().next().unwrap_or("").to_lowercase();
+                            let first_word =
+                                text.split_whitespace().next().unwrap_or("").to_lowercase();
 
                             if first_word == "/bind" || first_word.starts_with("/bind@") {
                                 let parts: Vec<&str> = text.split_whitespace().collect();
@@ -431,15 +444,20 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                         .await;
                                 } else {
                                     let code = parts[1].trim();
-                                    match store.bind_telegram_by_code(code, chat_id, Some(user_name)).await {
+                                    match store
+                                        .bind_telegram_by_code(code, chat_id, Some(user_name))
+                                        .await
+                                    {
                                         Ok(_) => {
                                             let reply = "🎉 <b>绑定成功！</b>\n━━━━━━━━━━━━━━━━━━\n已与您的电脑端 <b>bili-planner</b> 建立双向连接。\n\n• 每日 <b>08:30</b> 自动推送今日学习早报\n• 每日 <b>21:30</b> 自动提醒晚间复盘\n• 发送 <code>/today</code> 随时呼出今日任务卡片并在 TG 内一键打卡\n• 发送 <code>/plans</code> 查看所有科目总体进度".to_string();
-                                            let _ = telegram.send_message(chat_id, &reply, None).await;
+                                            let _ =
+                                                telegram.send_message(chat_id, &reply, None).await;
                                         }
                                         Err(e) => {
                                             // 错误文案已自带下一步指引（重新生成 / 等待锁定结束），不再追加。
                                             let reply = format!("❌ 绑定失败：{}", escape_html(&e));
-                                            let _ = telegram.send_message(chat_id, &reply, None).await;
+                                            let _ =
+                                                telegram.send_message(chat_id, &reply, None).await;
                                         }
                                     }
                                 }
@@ -450,10 +468,15 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                 || text == "今天"
                                 || text == "打卡"
                             {
-                                if let Some((_, plans)) = store.get_plans_by_telegram_chat_id(chat_id).await {
+                                if let Some((_, plans)) =
+                                    store.get_plans_by_telegram_chat_id(chat_id).await
+                                {
                                     let today = Local::now().format("%Y-%m-%d").to_string();
-                                    let (card_text, markup) = build_telegram_today_card(&plans, &today);
-                                    if let Err(e) = telegram.send_message(chat_id, &card_text, markup).await {
+                                    let (card_text, markup) =
+                                        build_telegram_today_card(&plans, &today);
+                                    if let Err(e) =
+                                        telegram.send_message(chat_id, &card_text, markup).await
+                                    {
                                         warn!("发送今日打卡卡片失败: {}", e);
                                     }
                                 } else {
@@ -465,16 +488,23 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                 || text == "计划库"
                                 || text == "进度"
                             {
-                                if let Some((_, plans)) = store.get_plans_by_telegram_chat_id(chat_id).await {
+                                if let Some((_, plans)) =
+                                    store.get_plans_by_telegram_chat_id(chat_id).await
+                                {
                                     let reply = build_telegram_plans_card(&plans);
-                                    if let Err(e) = telegram.send_message(chat_id, &reply, None).await {
+                                    if let Err(e) =
+                                        telegram.send_message(chat_id, &reply, None).await
+                                    {
                                         warn!("发送计划库卡片失败: {}", e);
                                     }
                                 } else {
                                     let reply = "⚠️ 您尚未绑定设备！\n请在电脑端 bili-planner 点击「绑定」获取 6 位验证码，并发送 <code>/bind 验证码</code> 进行连接。";
                                     let _ = telegram.send_message(chat_id, reply, None).await;
                                 }
-                            } else if first_word == "/help" || first_word.starts_with("/help@") || text == "帮助" {
+                            } else if first_word == "/help"
+                                || first_word.starts_with("/help@")
+                                || text == "帮助"
+                            {
                                 let help_text = "📖 <b>bili-planner Telegram 助手指令指南</b>\n━━━━━━━━━━━━━━━━━━\n\n• <code>/bind &lt;验证码&gt;</code> - 绑定电脑端应用\n• <code>/today</code> - 查看今日任务并直接打卡\n• <code>/plans</code> - 查看全部学习计划与科目进度\n• <code>/help</code> - 显示帮助菜单";
                                 let _ = telegram.send_message(chat_id, help_text, None).await;
                             }
@@ -494,23 +524,41 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                                     let task_id = parts[2];
                                     let target_date = parts[3];
 
-                                    match store.toggle_task_by_telegram_chat_id(chat_id, plan_id, task_id).await {
+                                    match store
+                                        .toggle_task_by_telegram_chat_id(chat_id, plan_id, task_id)
+                                        .await
+                                    {
                                         Ok(is_done) => {
                                             let alert_msg = if is_done {
                                                 "✅ 打卡成功！保持专注 🔥"
                                             } else {
                                                 "已撤销打卡 ↩️"
                                             };
-                                            let _ = telegram.answer_callback_query(query_id, Some(alert_msg), false).await;
+                                            let _ = telegram
+                                                .answer_callback_query(
+                                                    query_id,
+                                                    Some(alert_msg),
+                                                    false,
+                                                )
+                                                .await;
 
                                             // 重新获取最新计划并原地编辑消息卡片
-                                            if let Some((_, plans)) = store.get_plans_by_telegram_chat_id(chat_id).await {
-                                                let (new_text, new_markup) = build_telegram_today_card(&plans, target_date);
-                                                let _ = telegram.edit_message_text(chat_id, msg_id, &new_text, new_markup).await;
+                                            if let Some((_, plans)) =
+                                                store.get_plans_by_telegram_chat_id(chat_id).await
+                                            {
+                                                let (new_text, new_markup) =
+                                                    build_telegram_today_card(&plans, target_date);
+                                                let _ = telegram
+                                                    .edit_message_text(
+                                                        chat_id, msg_id, &new_text, new_markup,
+                                                    )
+                                                    .await;
                                             }
                                         }
                                         Err(e) => {
-                                            let _ = telegram.answer_callback_query(query_id, Some(e), true).await;
+                                            let _ = telegram
+                                                .answer_callback_query(query_id, Some(e), true)
+                                                .await;
                                         }
                                     }
                                 }

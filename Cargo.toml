@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/domain", "server"]
+resolver = "2"
+
 [package]
 name = "bili-planner"
 version = "0.2.0"
@@ -19,6 +23,7 @@ name = "bili-planner"
 path = "src/main.rs"
 
 [dependencies]
+planner-domain = { path = "crates/domain" }
 gpui = "0.2"
 gpui-component = "0.5"
 gpui-component-assets = "0.5"

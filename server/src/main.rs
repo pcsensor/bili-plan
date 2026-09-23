@@ -1,7 +1,6 @@
 mod auth;
 mod ratelimit;
-mod schedule_recovery;
-use models as schedule_model;
+use planner_domain::schedule_recovery;
 mod card;
 mod feishu;
 mod models;
@@ -406,11 +405,17 @@ async fn sync_plans(
 
     match state
         .store
-        .sync_plans(&user.device_token, payload.plans, payload.daily_notes)
+        .sync_plans_versioned(
+            &user.device_token,
+            payload.plans,
+            payload.daily_notes,
+            payload.base_revision,
+        )
         .await
     {
         Ok(outcome) => Ok(Json(SyncResponse {
             success: true,
+            revision: outcome.revision,
             plans: outcome.plans,
             daily_notes: outcome.daily_notes,
             feishu_bound: outcome.feishu_bound,
@@ -423,6 +428,11 @@ async fn sync_plans(
             StatusCode::NOT_FOUND,
             "unknown_device",
             "设备未注册，请重新注册",
+        )),
+        Err(SyncError::StaleSnapshot) => Err(api_error_code(
+            StatusCode::CONFLICT,
+            "stale_snapshot",
+            "计划快照已过期；请升级客户端并在原设备核对数据后重试",
         )),
         Err(SyncError::Storage) => {
             // 同样不落令牌明文，只记来源 IP。

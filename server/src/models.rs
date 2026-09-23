@@ -1,104 +1,7 @@
+#[cfg(test)]
+pub use planner_domain::study::{DailyNote, DailySchedule};
+pub use planner_domain::study::{DailyNotes, PlanStatus, StudyPlan, TaskItem};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-/// 计划状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum PlanStatus {
-    #[default]
-    Active,
-    Paused,
-    Completed,
-    Archived,
-}
-
-#[allow(dead_code)]
-impl PlanStatus {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Active => "进行中",
-            Self::Paused => "已暂停",
-            Self::Completed => "已完成",
-            Self::Archived => "已归档",
-        }
-    }
-}
-
-/// 单项打卡任务。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TaskItem {
-    pub id: String,
-    pub vid_no: i64,
-    pub title: String,
-    pub portion: i64,
-    pub remainder: i64,
-    pub from_prev: bool,
-    #[serde(default)]
-    pub completed: bool,
-    #[serde(default)]
-    pub completed_at: Option<i64>,
-    #[serde(default)]
-    pub updated_at: i64,
-    #[serde(default)]
-    pub advanced_from_date: Option<String>,
-    /// 机器人撤销提前后保留至客户端确认的归位信号。
-    #[serde(default)]
-    pub advance_restored: bool,
-}
-
-/// 每日排期。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DailySchedule {
-    pub day_index: usize,
-    pub date: String,
-    pub tasks: Vec<TaskItem>,
-    pub is_rest_day: bool,
-}
-
-/// 科目学习计划。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StudyPlan {
-    pub id: String,
-    pub title: String,
-    pub source_type: String,
-    pub source_url: String,
-    pub scope_desc: String,
-    pub total_duration: i64,
-    pub planned_days: usize,
-    pub start_date: String,
-    pub end_date: String,
-    #[serde(default)]
-    pub skip_weekends: bool,
-    #[serde(default)]
-    pub status: PlanStatus,
-    #[serde(default)]
-    pub created_at: i64,
-    pub schedules: Vec<DailySchedule>,
-    /// 整日提前引起的补位历史；取消其中任一任务打卡时只撤销一次。
-    #[serde(default)]
-    pub advance_shifts: Vec<crate::schedule_recovery::ScheduleShift>,
-    #[serde(default)]
-    pub is_series: bool,
-    #[serde(default = "default_show_in_library")]
-    pub show_in_library: bool,
-}
-
-fn default_show_in_library() -> bool {
-    true
-}
-
-/// 可跨端同步的单条日历备注。`deleted` 是删除同步用的 tombstone。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DailyNote {
-    pub id: String,
-    pub content: String,
-    pub created_at: i64,
-    #[serde(default)]
-    pub updated_at: i64,
-    #[serde(default)]
-    pub deleted: bool,
-}
-
-pub type DailyNotes = HashMap<String, Vec<DailyNote>>;
 
 /// 绑定的设备用户。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -141,6 +44,9 @@ pub struct SyncPayload {
     /// 仅供旧版客户端滚动升级。新客户端必须使用 Authorization 头。
     #[serde(default)]
     pub device_token: Option<String>,
+    /// Omitted only by a legacy client. New clients must send their last revision.
+    #[serde(default)]
+    pub base_revision: Option<i64>,
     #[serde(default)]
     pub plans: Vec<StudyPlan>,
     #[serde(default)]
@@ -157,12 +63,14 @@ pub struct RegisterResponse {
 #[derive(Debug)]
 pub enum SyncError {
     UnknownDevice,
+    StaleSnapshot,
     Storage,
 }
 
 /// 一次同步合并后的服务端状态。
 #[derive(Debug)]
 pub struct SyncOutcome {
+    pub revision: i64,
     pub plans: Vec<StudyPlan>,
     pub daily_notes: DailyNotes,
     pub feishu_bound: bool,
@@ -175,6 +83,7 @@ pub struct SyncOutcome {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub success: bool,
+    pub revision: i64,
     pub plans: Vec<StudyPlan>,
     #[serde(default)]
     pub daily_notes: DailyNotes,

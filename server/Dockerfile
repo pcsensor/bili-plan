@@ -1,7 +1,7 @@
 FROM rust:latest AS builder
 WORKDIR /usr/src/app
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --locked -p bili-plan-server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates tzdata && rm -rf /var/lib/apt/lists/*

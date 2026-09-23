@@ -1,0 +1,9 @@
+.git
+target
+server/target
+server/data
+server/.env
+*.sqlite3
+*.sqlite3-*
+.workbuddy
+node_modules

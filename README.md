@@ -32,7 +32,7 @@
   - 基于 Rust + [GPUI](https://gpui.rs) / [gpui-component](https://github.com/longbridge/gpui-component) 实现，纯 GPU 硬件加速渲染，冷启动毫秒级响应，内置亮/暗双色主题。
 
 ### 2. 云端服务与飞书机器人 (Cloud Server)
-- **多端实时打卡同步**：桌面端生成的计划可一键同步至云端，保持进度最新。
+- **桌面与机器人打卡同步**：桌面端生成的计划可一键同步至云端，机器人打卡与桌面进度合并；过期桌面快照会被拒绝，避免覆盖更新的计划。
 - **飞书机器人交互**：
   - **每日定时推送**：早 08:30 自动推送当日学习任务卡片；晚 21:30 自动检查并督促未打卡科目。
   - **富文本交互卡片**：直接在飞书聊天界面点击按钮完成单集打卡，即时更新卡片进度条。
@@ -45,13 +45,14 @@
 
 ```
 .
-├── src/                      # 桌面客户端源码 (GPUI + 核心业务)
-│   ├── app.rs                # 桌面端主界面与交互状态机
-│   ├── core.rs               # 业务编排层（解析/计划/打卡/云端同步）
+├── crates/domain/           # 纯领域层与跨端数据契约
+├── src/                      # 桌面客户端源码 (GPUI + 来源适配器)
+│   ├── app.rs / app/         # 桌面状态、动作、视图与表格
+│   ├── core.rs / core/       # 编排、本地 SQLite 与云端同步
 │   ├── api.rs / parse.rs     # B 站适配器与合集结构提取
 │   ├── jellyfin.rs           # Jellyfin 媒体库适配器
 │   ├── fnos.rs               # 飞牛影视适配器（含 authx 签名）
-│   └── plan.rs / export.rs   # 核心计划生成算法与文本导出
+│   └── export.rs             # 文本导出
 ├── server/                   # 云端服务与飞书机器人后端 (Rust Axum)
 │   ├── Dockerfile            # 多阶段构建 Dockerfile
 │   ├── docker-compose.yml    # 一键部署编排文件
@@ -60,6 +61,8 @@
 ├── assets/ / icons/          # 静态资产与跨平台图标
 └── tools/                    # 自动化打包构建脚本
 ```
+
+架构边界和新增功能流程见 [项目架构说明](docs/project-overview.md)。
 
 ---
 
@@ -85,14 +88,14 @@
 ### 2. 方式一：Docker Compose 部署（推荐）
 
 #### 步骤 1：准备部署目录与配置文件
-在服务器上创建工作目录并拉取项目（或仅拷贝 `server/` 目录）：
+在服务器上拉取完整仓库。服务端依赖 `crates/domain`，不能只复制 `server/`。以下命令假定 `/opt/bili-plan-server` 是仓库根目录：
 
 ```bash
 mkdir -p /opt/bili-plan-server
 cd /opt/bili-plan-server
 ```
 
-创建 `.env` 文件（可参考 `server/.env.example`）：
+创建 `server/.env` 文件（可参考 `server/.env.example`）：
 ```env
 PORT=3005
 FEISHU_APP_ID=cli_xxxxxxxxxxxxxx
@@ -102,10 +105,11 @@ DATA_DIR=/app/data
 ```
 
 #### 步骤 2：启动容器
-确保目录下包含 `Dockerfile`、`docker-compose.yml`、`Cargo.toml`、`src/` 及 `.env`：
+确保仓库根目录的 `Cargo.toml`、`Cargo.lock`、`crates/domain/` 与 `server/` 都在。`server/docker-compose.yml` 会以仓库根目录作为构建上下文：
 
 ```bash
 # 构建并后台启动
+cd server
 docker compose up -d --build
 
 # 查看运行日志与健康状态
@@ -120,8 +124,7 @@ docker compose logs -f
 
 #### 步骤 1：本地/服务器构建
 ```bash
-cd server
-cargo build --release
+cargo build --release --locked -p bili-plan-server
 ```
 
 #### 步骤 2：配置 Systemd 守护进程
@@ -312,12 +315,8 @@ cargo packager --release
 ## 🧪 测试与质量保证
 
 ```bash
-# 运行全部单元测试与集成测试
-cargo test
-
-# 运行代码规范检查
-cargo clippy --all-targets
-cargo fmt --all -- --check
+# 从仓库根目录运行架构、契约、格式、Clippy 与全量测试
+bash tools/check.sh
 
 # 端到端 API 真实联调验证示例
 cargo run --example live_check -- "BV1ps4y1d73V" 30 all split

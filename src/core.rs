@@ -5,15 +5,18 @@
 //! 计划算法在 `plan`/`export` 模块，本模块只做纯函数编排，供任意 UI 层
 //! （gpui-component）驱动。
 
-use std::path::{Path, PathBuf};
-
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
-
 use crate::api;
 use crate::export;
 use crate::parse::{self, EpisodeItem, Group};
 use crate::plan::{build_plan, Mode, PlanEntry};
 use crate::{extract_sid, Error};
+
+mod cloud;
+mod storage;
+pub use cloud::{check_cloud_bind_status, request_cloud_bind_code, sync_with_cloud};
+pub use storage::{load_config, save_config, try_save_config};
+#[cfg(test)]
+use storage::{load_config_at, LocalConfigStore};
 
 // ---------------------------------------------------------------------------
 // 状态数据
@@ -125,6 +128,9 @@ pub struct AppConfig {
     /// `Authorization: Bearer` 凭据。
     #[serde(default)]
     pub sync_device_token: Option<String>,
+    /// Desktop snapshot revision acknowledged by the cloud service.
+    #[serde(default)]
+    pub sync_revision: i64,
     #[serde(default)]
     pub feishu_bound: bool,
     #[serde(default)]
@@ -150,6 +156,7 @@ impl Default for AppConfig {
             daily_notes: DailyNotes::new(),
             sync_server_url: default_sync_server_url(),
             sync_device_token: None,
+            sync_revision: 0,
             feishu_bound: false,
             feishu_user_name: None,
             telegram_bound: false,
@@ -426,208 +433,6 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// 本地 SQLite 持久化
-// ---------------------------------------------------------------------------
-
-/// 本机数据库路径：用户家目录下 `.bili-planner.sqlite3`。
-/// 旧版 JSON 路径仅用于一次性迁移，迁移后不再作为运行时数据源。
-fn config_db_path() -> Option<PathBuf> {
-    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    let home = std::env::var(key).ok()?;
-    Some(PathBuf::from(home).join(".bili-planner.sqlite3"))
-}
-
-fn legacy_config_path() -> Option<PathBuf> {
-    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    let home = std::env::var(key).ok()?;
-    Some(PathBuf::from(home).join(".bili-planner.json"))
-}
-
-/// 本地数据库表。配置标量、历史、计划、备注分表保存，计划和备注保留其
-/// serde JSON 数据契约，避免 UI 领域模型与存储模式耦合。
-struct LocalConfigStore;
-
-impl LocalConfigStore {
-    fn open(path: &Path) -> rusqlite::Result<Connection> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(3))?;
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS app_meta (
-                id INTEGER PRIMARY KEY CHECK(id = 1),
-                payload_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS history (
-                position INTEGER PRIMARY KEY,
-                input TEXT NOT NULL,
-                source TEXT NOT NULL,
-                title TEXT NOT NULL,
-                at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS plans (
-                plan_id TEXT PRIMARY KEY,
-                position INTEGER NOT NULL,
-                payload_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS daily_notes (
-                date TEXT NOT NULL,
-                note_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                payload_json TEXT NOT NULL,
-                PRIMARY KEY(date, note_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_daily_notes_date_position
-                ON daily_notes(date, position);
-            ",
-        )?;
-        Ok(conn)
-    }
-
-    fn metadata(cfg: &AppConfig) -> AppConfig {
-        let mut metadata = cfg.clone();
-        metadata.history.clear();
-        metadata.plans.clear();
-        metadata.daily_notes.clear();
-        metadata
-    }
-
-    fn write_history(tx: &Transaction<'_>, history: &[HistoryEntry]) -> rusqlite::Result<()> {
-        tx.execute("DELETE FROM history", [])?;
-        for (position, entry) in history.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO history(position, input, source, title, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![position as i64, entry.input, entry.source, entry.title, entry.at],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn write_plans(tx: &Transaction<'_>, plans: &[StudyPlan]) -> rusqlite::Result<()> {
-        tx.execute("DELETE FROM plans", [])?;
-        for (position, plan) in plans.iter().enumerate() {
-            let payload = serde_json::to_string(plan).unwrap_or_else(|_| "{}".to_string());
-            tx.execute(
-                "INSERT INTO plans(plan_id, position, payload_json) VALUES (?1, ?2, ?3)",
-                params![plan.id, position as i64, payload],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn write_notes(tx: &Transaction<'_>, notes: &DailyNotes) -> rusqlite::Result<()> {
-        tx.execute("DELETE FROM daily_notes", [])?;
-        for (date, entries) in notes {
-            for (position, note) in entries.iter().enumerate() {
-                let payload = serde_json::to_string(note).unwrap_or_else(|_| "{}".to_string());
-                tx.execute(
-                    "INSERT INTO daily_notes(date, note_id, position, payload_json) VALUES (?1, ?2, ?3, ?4)",
-                    params![date, note.id, position as i64, payload],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn save(path: &Path, cfg: &AppConfig) -> rusqlite::Result<()> {
-        let mut conn = Self::open(path)?;
-        let tx = conn.transaction()?;
-        let metadata =
-            serde_json::to_string(&Self::metadata(cfg)).unwrap_or_else(|_| "{}".to_string());
-        tx.execute(
-            "INSERT INTO app_meta(id, payload_json) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json",
-            [metadata],
-        )?;
-        Self::write_history(&tx, &cfg.history)?;
-        Self::write_plans(&tx, &cfg.plans)?;
-        Self::write_notes(&tx, &cfg.daily_notes)?;
-        tx.commit()
-    }
-
-    fn load(path: &Path) -> Option<AppConfig> {
-        let conn = Self::open(path).ok()?;
-        let metadata: String = conn
-            .query_row(
-                "SELECT payload_json FROM app_meta WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()??;
-        let mut cfg: AppConfig = serde_json::from_str(&metadata).ok()?;
-
-        let mut history = Vec::new();
-        let mut history_statement = conn
-            .prepare("SELECT input, source, title, at FROM history ORDER BY position ASC")
-            .ok()?;
-        let rows = history_statement
-            .query_map([], |row| {
-                Ok(HistoryEntry {
-                    input: row.get(0)?,
-                    source: row.get(1)?,
-                    title: row.get(2)?,
-                    at: row.get(3)?,
-                })
-            })
-            .ok()?;
-        history.extend(rows.filter_map(Result::ok));
-        cfg.history = history;
-
-        let mut plans = Vec::new();
-        let mut plans_statement = conn
-            .prepare("SELECT payload_json FROM plans ORDER BY position ASC")
-            .ok()?;
-        let rows = plans_statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .ok()?;
-        plans.extend(
-            rows.filter_map(Result::ok)
-                .filter_map(|payload| serde_json::from_str(&payload).ok()),
-        );
-        cfg.plans = plans;
-
-        let mut notes = DailyNotes::new();
-        let mut notes_statement = conn
-            .prepare("SELECT date, payload_json FROM daily_notes ORDER BY date ASC, position ASC")
-            .ok()?;
-        let rows = notes_statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()?;
-        for row in rows.filter_map(Result::ok) {
-            if let Ok(note) = serde_json::from_str::<DailyNote>(&row.1) {
-                notes.entry(row.0).or_default().push(note);
-            }
-        }
-        cfg.daily_notes = notes;
-        Some(cfg)
-    }
-}
-
-/// 加载给定路径的 SQLite；数据库不存在或尚未初始化时导入旧 JSON。
-fn load_config_at(db_path: &Path, legacy_path: &Path) -> Option<AppConfig> {
-    if db_path.exists() {
-        if let Some(config) = LocalConfigStore::load(db_path) {
-            return Some(config);
-        }
-    }
-
-    let legacy_data = std::fs::read_to_string(legacy_path).ok()?;
-    let config: AppConfig = serde_json::from_str(&legacy_data).ok()?;
-    LocalConfigStore::save(db_path, &config).ok()?;
-    Some(config)
-}
-
-/// 启动时加载 SQLite。本地尚未迁移时，导入旧 JSON 并保留原文件为备份。
-pub fn load_config() -> Option<AppConfig> {
-    let db_path = config_db_path()?;
-    let legacy_path = legacy_config_path()?;
-    load_config_at(&db_path, &legacy_path)
-}
-
 /// 把已生成的计划保存到打卡学习计划库。
 pub fn enroll_study_plan(
     cfg: &mut AppConfig,
@@ -861,378 +666,6 @@ pub fn advance_completed_study_tasks(
     Ok(moved)
 }
 
-/// 云端普通请求的超时；同步载荷更大，单独放宽。
-const CLOUD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const CLOUD_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// 云端接口只用到三种请求形态。
-#[derive(Clone, Copy)]
-enum CloudRequest<'a> {
-    Get,
-    PostEmpty,
-    PostJson(&'a serde_json::Value),
-}
-
-enum CloudFailure {
-    /// 服务端查无此设备令牌，需要重新注册。
-    UnknownDevice,
-    HttpStatus {
-        status: u16,
-        message: String,
-    },
-    Other(String),
-}
-
-impl CloudFailure {
-    fn message(self) -> String {
-        match self {
-            CloudFailure::UnknownDevice => "云端不认识本机设备，且重新注册失败".to_string(),
-            CloudFailure::HttpStatus { status, message } => {
-                format!("云端请求失败（HTTP {status}）：{message}")
-            }
-            CloudFailure::Other(message) => message,
-        }
-    }
-
-    fn permits_legacy_fallback(&self) -> bool {
-        matches!(
-            self,
-            CloudFailure::HttpStatus {
-                status: 400 | 404 | 405 | 415 | 422,
-                ..
-            }
-        )
-    }
-}
-
-/// 携带 `Authorization: Bearer <device_token>` 发起一次云端请求。
-///
-/// 设备令牌只走请求头：放在 query string 里会被反向代理访问日志与 TraceLayer 记录下来，
-/// 等于把这把不记名密钥广播出去。
-fn send_cloud(
-    server: &str,
-    path: &str,
-    request: CloudRequest<'_>,
-    token: &str,
-    timeout: std::time::Duration,
-) -> Result<serde_json::Value, CloudFailure> {
-    let url = format!("{server}{path}");
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-    let authorization = format!("Bearer {token}");
-    let sent = match request {
-        CloudRequest::Get => agent
-            .get(url.as_str())
-            .header("Authorization", authorization.as_str())
-            .call(),
-        CloudRequest::PostEmpty => agent
-            .post(url.as_str())
-            .header("Authorization", authorization.as_str())
-            .send_empty(),
-        CloudRequest::PostJson(body) => {
-            let payload = serde_json::to_vec(body)
-                .map_err(|e| CloudFailure::Other(format!("序列化请求体失败: {}", e)))?;
-            agent
-                .post(url.as_str())
-                .header("Authorization", authorization.as_str())
-                .header("Content-Type", "application/json")
-                .send(payload)
-        }
-    };
-    let mut resp = sent.map_err(|e| CloudFailure::Other(format!("云端请求失败: {e}")))?;
-    let status = resp.status().as_u16();
-    let raw = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| CloudFailure::Other(format!("读取云端响应失败: {}", e)))?;
-    let data = serde_json::from_str::<serde_json::Value>(&raw);
-    if !(200..300).contains(&status) {
-        if status == 404
-            && data
-                .as_ref()
-                .ok()
-                .and_then(|value| value.get("code"))
-                .and_then(|value| value.as_str())
-                == Some("unknown_device")
-        {
-            return Err(CloudFailure::UnknownDevice);
-        }
-        let message = data
-            .as_ref()
-            .ok()
-            .and_then(|value| value.get("message"))
-            .and_then(|value| value.as_str())
-            .unwrap_or(raw.as_str())
-            .to_string();
-        return Err(CloudFailure::HttpStatus { status, message });
-    }
-    data.map_err(|e| CloudFailure::Other(format!("解析云端响应失败: {e}")))
-}
-
-/// 向云端注册本设备。调用方只有在后续目标请求也成功后才替换已有令牌，避免代理或
-/// 路由误报 404 时丢失仍然有效的机器人绑定。
-///
-/// 令牌一律由服务端发牌：客户端自造令牌会让 `/api/sync` 退化成一个匿名可写的注册入口，
-/// 任何人都能凭空往云端灌设备记录。
-fn register_cloud_device(server: &str) -> Result<String, CloudFailure> {
-    let url = format!("{}/api/device/register", server.trim_end_matches('/'));
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(CLOUD_TIMEOUT))
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-    let mut resp = agent
-        .post(url.as_str())
-        .send_empty()
-        .map_err(|e| CloudFailure::Other(format!("注册云端设备失败: {e}")))?;
-    let status = resp.status().as_u16();
-    let raw = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| CloudFailure::Other(format!("读取注册响应失败: {e}")))?;
-    let data: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        if (200..300).contains(&status) {
-            CloudFailure::Other(format!("解析注册响应失败: {e}"))
-        } else {
-            CloudFailure::HttpStatus {
-                status,
-                message: raw.clone(),
-            }
-        }
-    })?;
-    if !(200..300).contains(&status) {
-        return Err(CloudFailure::HttpStatus {
-            status,
-            message: data["message"].as_str().unwrap_or(raw.as_str()).to_string(),
-        });
-    }
-    let token = data["device_token"]
-        .as_str()
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| CloudFailure::Other("云端未返回 device_token".to_string()))?
-        .to_string();
-    Ok(token)
-}
-
-fn persist_cloud_token(cfg: &mut AppConfig, token: String) {
-    cfg.sync_device_token = Some(token);
-    save_config(cfg);
-}
-
-/// 带设备令牌访问云端接口，返回解析后的 JSON。
-///
-/// 只有服务端回带 `unknown_device` 机器错误码的 404 才说明本机令牌已不被承认。
-/// 普通代理/路由 404 不会触发轮换；替换令牌也只在目标请求重试成功后持久化。
-fn cloud_request(
-    cfg: &mut AppConfig,
-    path: &str,
-    request: CloudRequest<'_>,
-    timeout: std::time::Duration,
-) -> Result<serde_json::Value, CloudFailure> {
-    let server = cfg.sync_server_url.trim_end_matches('/').to_string();
-    let existing_token = cfg
-        .sync_device_token
-        .clone()
-        .filter(|token| !token.trim().is_empty());
-    let token = match existing_token.as_ref() {
-        Some(token) => token.clone(),
-        None => register_cloud_device(&server)?,
-    };
-    match send_cloud(&server, path, request, &token, timeout) {
-        Ok(data) => {
-            if existing_token.is_none() {
-                persist_cloud_token(cfg, token);
-            }
-            Ok(data)
-        }
-        Err(CloudFailure::UnknownDevice) => {
-            let replacement = register_cloud_device(&server)?;
-            let data = send_cloud(&server, path, request, &replacement, timeout)?;
-            persist_cloud_token(cfg, replacement);
-            Ok(data)
-        }
-        Err(failure) => Err(failure),
-    }
-}
-
-/// 旧服务兼容仅在新版请求明确返回“不支持该协议”的状态码后启用。新服务仍只允许旧版
-/// 传输访问数据库中已经存在的设备，不会恢复匿名建号漏洞。
-fn legacy_device_token(cfg: &mut AppConfig) -> String {
-    if let Some(token) = cfg
-        .sync_device_token
-        .clone()
-        .filter(|token| !token.trim().is_empty())
-    {
-        return token;
-    }
-    let token = format!(
-        "desktop_{:016x}{:016x}",
-        rand::random::<u64>(),
-        rand::random::<u64>()
-    );
-    persist_cloud_token(cfg, token.clone());
-    token
-}
-
-fn send_legacy_cloud(
-    cfg: &mut AppConfig,
-    path: &str,
-    request: CloudRequest<'_>,
-    timeout: std::time::Duration,
-) -> Result<serde_json::Value, String> {
-    let token = legacy_device_token(cfg);
-    let server = cfg.sync_server_url.trim_end_matches('/');
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .build()
-        .new_agent();
-    let sent = match request {
-        CloudRequest::Get => agent
-            .get(format!("{server}{path}?device_token={token}"))
-            .call(),
-        CloudRequest::PostEmpty => {
-            let body = serde_json::json!({ "device_token": token });
-            let payload = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-            agent
-                .post(format!("{server}{path}"))
-                .header("Content-Type", "application/json")
-                .send(payload)
-        }
-        CloudRequest::PostJson(body) => {
-            let mut legacy_body = body.clone();
-            legacy_body["device_token"] = serde_json::Value::String(token);
-            let payload = serde_json::to_vec(&legacy_body).map_err(|e| e.to_string())?;
-            agent
-                .post(format!("{server}{path}"))
-                .header("Content-Type", "application/json")
-                .send(payload)
-        }
-    };
-    let mut response = sent.map_err(|e| format!("旧版云端请求失败: {e}"))?;
-    let raw = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("读取旧版云端响应失败: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("解析旧版云端响应失败: {e}"))
-}
-
-fn cloud_request_with_legacy_fallback(
-    cfg: &mut AppConfig,
-    path: &str,
-    request: CloudRequest<'_>,
-    timeout: std::time::Duration,
-) -> Result<serde_json::Value, String> {
-    match cloud_request(cfg, path, request, timeout) {
-        Ok(data) => Ok(data),
-        Err(failure) if failure.permits_legacy_fallback() => {
-            send_legacy_cloud(cfg, path, request, timeout)
-        }
-        Err(failure) => Err(failure.message()),
-    }
-}
-
-/// 请求云端 6 位绑定验证码。
-pub fn request_cloud_bind_code(cfg: &mut AppConfig) -> Result<(String, u64), String> {
-    let data = cloud_request_with_legacy_fallback(
-        cfg,
-        "/api/bind/request",
-        CloudRequest::PostEmpty,
-        CLOUD_TIMEOUT,
-    )?;
-    let code = data["bind_code"]
-        .as_str()
-        .ok_or_else(|| "缺少 bind_code".to_string())?
-        .to_string();
-    let expires = data["expires_in_secs"].as_u64().unwrap_or(600);
-    Ok((code, expires))
-}
-
-/// 查询云端飞书绑定状态。
-pub fn check_cloud_bind_status(cfg: &mut AppConfig) -> Result<bool, String> {
-    // 尚未注册过设备时不发请求：一次状态查询不该顺带在云端建号。
-    if cfg.sync_device_token.is_none() {
-        return Ok(false);
-    }
-    let data = cloud_request_with_legacy_fallback(
-        cfg,
-        "/api/bind/status",
-        CloudRequest::Get,
-        CLOUD_TIMEOUT,
-    )?;
-    let bound = data["bound"].as_bool().unwrap_or(false);
-    cfg.feishu_bound = bound;
-    cfg.feishu_user_name = data["feishu_user_name"].as_str().map(|s| s.to_string());
-    cfg.telegram_bound = data["telegram_bound"].as_bool().unwrap_or(false);
-    cfg.telegram_user_name = data["telegram_user_name"].as_str().map(|s| s.to_string());
-    save_config(cfg);
-
-    Ok(bound)
-}
-
-/// 执行双向增量同步。
-pub fn sync_with_cloud(cfg: &mut AppConfig) -> Result<String, String> {
-    let body = serde_json::json!({
-        "plans": cfg.plans,
-        "daily_notes": cfg.daily_notes
-    });
-    let data = cloud_request_with_legacy_fallback(
-        cfg,
-        "/api/sync",
-        CloudRequest::PostJson(&body),
-        CLOUD_SYNC_TIMEOUT,
-    )?;
-
-    if let Some(plans_val) = data.get("plans") {
-        if let Ok(merged_plans) = serde_json::from_value::<Vec<StudyPlan>>(plans_val.clone()) {
-            if cfg.plans.is_empty() {
-                cfg.plans = merged_plans;
-            } else {
-                let mut remote_map: std::collections::HashMap<String, StudyPlan> =
-                    std::collections::HashMap::new();
-                for rp in merged_plans {
-                    remote_map.insert(rp.id.clone(), rp);
-                }
-
-                for plan in &mut cfg.plans {
-                    if let Some(rp) = remote_map.get(&plan.id) {
-                        crate::schedule_recovery::merge_checkins(plan, rp, true);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(notes_val) = data.get("daily_notes") {
-        if let Ok(remote_notes) = serde_json::from_value::<DailyNotes>(notes_val.clone()) {
-            study::merge_daily_notes(&mut cfg.daily_notes, remote_notes);
-        }
-    }
-
-    // 保留归位信号给 GUI 合并：后台副本的排期不会直接覆盖正在操作的界面。
-    for plan in &mut cfg.plans {
-        crate::schedule_recovery::restore(plan, true);
-    }
-
-    if let Some(bound) = data.get("feishu_bound").and_then(|b| b.as_bool()) {
-        cfg.feishu_bound = bound;
-    }
-    if let Some(name) = data.get("feishu_user_name").and_then(|n| n.as_str()) {
-        cfg.feishu_user_name = Some(name.to_string());
-    }
-    if let Some(bound) = data.get("telegram_bound").and_then(|b| b.as_bool()) {
-        cfg.telegram_bound = bound;
-    }
-    if let Some(name) = data.get("telegram_user_name").and_then(|n| n.as_str()) {
-        cfg.telegram_user_name = Some(name.to_string());
-    }
-
-    save_config(cfg);
-    Ok("云端同步完成！".to_string())
-}
-
 /// 追加并持久化某日期的一条学习备注。
 pub fn add_daily_note(
     cfg: &mut AppConfig,
@@ -1256,12 +689,6 @@ pub fn delete_daily_note(cfg: &mut AppConfig, date_str: &str, note_id: &str) -> 
 /// 读取某日期可见的全部学习备注。
 pub fn get_daily_notes<'a>(cfg: &'a AppConfig, date_str: &str) -> Vec<&'a DailyNote> {
     study::get_daily_notes(&cfg.daily_notes, date_str)
-}
-
-/// 把应用配置原子写入本地 SQLite。失败静默：不阻塞主流程。
-pub fn save_config(cfg: &AppConfig) {
-    let Some(path) = config_db_path() else { return };
-    let _ = LocalConfigStore::save(&path, cfg);
 }
 
 #[cfg(test)]
@@ -1316,6 +743,7 @@ mod tests {
         assert!(legacy.fnos_server_url.is_empty());
         assert!(legacy.fnos_username.is_empty());
         assert!(legacy.fnos_password.is_empty());
+        assert_eq!(legacy.sync_revision, 0);
     }
 
     #[test]
@@ -1418,6 +846,7 @@ mod tests {
         let mut cfg = AppConfig {
             server_url: "https://media.example.com".to_string(),
             token: "jf-token".to_string(),
+            sync_revision: 7,
             ..Default::default()
         };
         record_history(&mut cfg, SourceMode::Bilibili, "BV1test", "测试合集");
@@ -1432,6 +861,7 @@ mod tests {
         LocalConfigStore::save(&db_path, &cfg).unwrap();
         let loaded = LocalConfigStore::load(&db_path).unwrap();
         assert_eq!(loaded.server_url, cfg.server_url);
+        assert_eq!(loaded.sync_revision, 7);
         assert_eq!(loaded.history, cfg.history);
         assert_eq!(loaded.plans, cfg.plans);
         assert_eq!(

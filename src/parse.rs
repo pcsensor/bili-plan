@@ -3,21 +3,7 @@
 use crate::api;
 use crate::error::{Error, Result};
 use crate::model::{ArchiveItem, Episode, ViewData};
-use serde::Serialize;
-
-/// 一个观看单元（视频或分 P）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EpisodeItem {
-    pub title: String,
-    pub duration: i64,
-}
-
-/// 一门科目（分栏 / 多 P 视频 / 整个合集）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Group {
-    pub name: String,
-    pub episodes: Vec<EpisodeItem>,
-}
+pub use planner_domain::catalog::{EpisodeItem, Group};
 
 /// parse_groups 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
