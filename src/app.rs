@@ -53,6 +53,7 @@ use crate::study::{
     generate_month_calendar_matrix, get_tasks_for_date, infer_plan_start_date, parse_date_or_today,
     today_date_str, PlanStatus, StudyPlan,
 };
+use planner_domain::source::{video_link, SourceKind};
 
 /// 顶部活动标签页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,18 +88,18 @@ struct CalendarTaskEditSeed {
 ///
 /// 集中一处，避免新增来源时在各处散落的 `if tag == "jellyfin"` 分支漏改。
 fn source_badge(tag: &str) -> (&'static str, &'static str) {
-    match tag {
-        "jellyfin" => ("icons/film.svg", "JF"),
-        "fnos" => ("icons/server.svg", "飞牛"),
+    match SourceKind::from_tag(tag) {
+        SourceKind::Jellyfin => ("icons/film.svg", "JF"),
+        SourceKind::FnOs => ("icons/server.svg", "飞牛"),
         _ => ("icons/tv.svg", "B站"),
     }
 }
 
 /// 来源标记 → 来源枚举。未知标记回退 B 站（兼容旧数据）。
 fn source_mode_of(tag: &str) -> SourceMode {
-    match tag {
-        "jellyfin" => SourceMode::Jellyfin,
-        "fnos" => SourceMode::FnOs,
+    match SourceKind::from_tag(tag) {
+        SourceKind::Jellyfin => SourceMode::Jellyfin,
+        SourceKind::FnOs => SourceMode::FnOs,
         _ => SourceMode::Bilibili,
     }
 }
@@ -108,35 +109,7 @@ fn open_video_link(source_type: &str, source_url: &str, vid_no: i64) {
     if source_url.trim().is_empty() {
         return; // 自定义任务没有外部播放地址。
     }
-    let url = if source_type == "bilibili" {
-        let trimmed = source_url.trim();
-        // 识别形如 BV... 的 12 位 ID
-        let chars: Vec<char> = trimmed.chars().collect();
-        let n = chars.len();
-        let mut found_bv = None;
-        for i in 0..n.saturating_sub(11) {
-            if chars[i] == 'B'
-                && chars[i + 1] == 'V'
-                && chars[i + 2..i + 12]
-                    .iter()
-                    .all(|c| c.is_ascii_alphanumeric())
-            {
-                found_bv = Some(chars[i..i + 12].iter().collect::<String>());
-                break;
-            }
-        }
-
-        if let Some(bvid) = found_bv {
-            format!("https://www.bilibili.com/video/{bvid}?p={vid_no}")
-        } else if trimmed.starts_with("http") {
-            let base = trimmed.split('?').next().unwrap_or(trimmed);
-            format!("{base}?p={vid_no}")
-        } else {
-            format!("https://www.bilibili.com/video/{trimmed}?p={vid_no}")
-        }
-    } else {
-        source_url.to_string()
-    };
+    let url = video_link(source_type, source_url, vid_no);
 
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&url).spawn();
@@ -738,8 +711,10 @@ mod action_plans;
 mod action_sync;
 mod table;
 mod view_calendar;
+mod view_cloud_modals;
 mod view_library;
 mod view_modals;
+mod view_plan_generator;
 mod view_shell;
 mod view_today;
 use table::PlanTableDelegate;
@@ -805,94 +780,4 @@ impl Render for PlannerApp {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parse::{EpisodeItem, Group};
-    use gpui::TestAppContext;
-
-    #[test]
-    fn compact_subject_shortens_prefix() {
-        assert_eq!(table::compact_subject("[科目 1] P1 前言"), "科1·P1 前言");
-        assert_eq!(table::compact_subject("[科目12] 集合"), "科12·集合");
-        assert_eq!(table::compact_subject("普通标题"), "普通标题");
-        assert_eq!(table::compact_subject("[科目"), "[科目");
-    }
-
-    /// 构造带两门科目、已生成 3 天计划的就绪状态。
-    fn ready_with_plan() -> ReadyState {
-        let groups = vec![
-            Group {
-                name: "第一章 基础".into(),
-                episodes: vec![EpisodeItem {
-                    title: "1.1 集合".into(),
-                    duration: 3720,
-                }],
-            },
-            Group {
-                name: "第二章 进阶".into(),
-                episodes: vec![EpisodeItem {
-                    title: "2.1 图论".into(),
-                    duration: 5400,
-                }],
-            },
-        ];
-        ReadyState {
-            season_title: "测试合集".into(),
-            structure: "多分栏合集".into(),
-            groups,
-            selection: Selection::All,
-            plan: None,
-        }
-    }
-
-    /// 无头渲染冒烟：窗口构建、计划表委托、亮/暗主题下的元素树构建
-    /// 都不应 panic。
-    #[gpui::test]
-    async fn render_smoke_both_themes(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::theme::init(cx);
-        });
-
-        let window = cx.add_window(|window, cx| {
-            let mut app = PlannerApp::new(window, cx);
-            let mut rd = ready_with_plan();
-            let mut expanded = false;
-            PlannerApp::run_generate(
-                &mut rd,
-                Mode::Split,
-                3,
-                &mut app.plan_table,
-                &mut expanded,
-                window,
-                cx,
-            );
-            assert!(rd.plan.is_some(), "计划应已生成");
-            app.phase = Phase::Ready(rd);
-            app
-        });
-
-        window
-            .update(cx, |app, window, cx| {
-                // 亮色：构建完整元素树（表单卡 + 信息卡 + 科目选择 + 表格）。
-                let _ = app.render(window, cx);
-
-                // 切换暗色后再次构建（主题配置重套用 + 渲染路径不 panic）。
-                Theme::change(ThemeMode::Dark, Some(window), cx);
-                let _ = app.render(window, cx);
-
-                app.source = SourceMode::FnOs;
-                app.phase = Phase::Loading;
-                app.fetch_progress = "当前目录：11 / 36 个视频时长已就绪".into();
-                app.fetch_elapsed_secs = 42;
-                let _ = app.render(window, cx);
-                Theme::change(ThemeMode::Light, Some(window), cx);
-                let _ = app.render(window, cx);
-                let generation = app.fetch_generation;
-                app.switch_source(SourceMode::Jellyfin, window, cx);
-                assert!(matches!(app.phase, Phase::Input));
-                assert_ne!(app.fetch_generation, generation);
-            })
-            .expect("window update should succeed");
-    }
-}
+mod tests;

@@ -10,6 +10,7 @@ use crate::export;
 use crate::parse::{self, EpisodeItem, Group};
 use crate::plan::{build_plan, Mode, PlanEntry};
 use crate::{extract_sid, Error};
+use planner_domain::source::SourceKind;
 
 mod cloud;
 mod storage;
@@ -175,9 +176,9 @@ pub const HISTORY_LIMIT: usize = 20;
 /// 因此对外公开，避免各调用点各写一份 match 漏掉新增来源。
 pub fn source_tag(source: SourceMode) -> &'static str {
     match source {
-        SourceMode::Bilibili => "bilibili",
-        SourceMode::Jellyfin => "jellyfin",
-        SourceMode::FnOs => "fnos",
+        SourceMode::Bilibili => SourceKind::Bilibili.tag(),
+        SourceMode::Jellyfin => SourceKind::Jellyfin.tag(),
+        SourceMode::FnOs => SourceKind::FnOs.tag(),
     }
 }
 
@@ -457,7 +458,7 @@ pub fn enroll_study_plan(
         &plan_out,
         start_date_str,
         skip_weekends,
-    );
+    )?;
 
     // 插入或更新
     cfg.plans.retain(|p| p.id != study_plan.id);

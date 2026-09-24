@@ -47,6 +47,23 @@ fn mock_plan_out() -> PlanOut {
 }
 
 #[test]
+fn creating_a_plan_rejects_invalid_start_date() {
+    let result = create_study_plan(
+        "课程",
+        "bilibili",
+        "BV1",
+        "全集",
+        &mock_plan_out(),
+        "2026-02-30",
+        false,
+    );
+    assert!(
+        result.is_err(),
+        "invalid dates must not silently become today"
+    );
+}
+
+#[test]
 fn manual_move_preserves_task_and_other_schedules() {
     let mut plan = create_study_plan(
         "课程",
@@ -56,7 +73,8 @@ fn manual_move_preserves_task_and_other_schedules() {
         &mock_plan_out(),
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
     let original = plan.clone();
     let task = original.schedules[0].tasks[1].clone();
     move_task_to_date(&mut plan, &task.id, "2026-09-05").unwrap();
@@ -165,7 +183,8 @@ fn create_plan_continuous_days() {
         &plan_out,
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
 
     assert_eq!(plan.title, "高数");
     assert_eq!(plan.planned_days, 2);
@@ -273,7 +292,8 @@ fn create_plan_skip_weekends() {
         &plan_out,
         "2026-08-28",
         true,
-    );
+    )
+    .unwrap();
 
     assert_eq!(plan.start_date, "2026-08-28");
     // 28(五任务), 29(六休息), 30(日休息), 31(一任务)
@@ -300,7 +320,8 @@ fn task_checkin_and_progress() {
         &plan_out,
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
 
     let task_id = plan.schedules[0].tasks[0].id.clone();
     let plan_id = plan.id.clone();
@@ -329,7 +350,8 @@ fn push_forward_plan_test() {
         &plan_out,
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
 
     // 打卡第 1 天任务 0
     plan.schedules[0].tasks[0].completed = true;
@@ -369,7 +391,8 @@ fn reschedule_unfinished_plan_moves_only_open_tasks_and_keeps_batches() {
         &mock_plan_out(),
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
     let completed_id = plan.schedules[0].tasks[0].id.clone();
     plan.schedules[0].tasks[0].completed = true;
     plan.schedules[0].tasks[0].completed_at = Some(100);
@@ -421,7 +444,8 @@ fn reschedule_unfinished_plan_can_move_backward_and_detaches_old_restore_history
         &mock_plan_out(),
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
     plan.schedules[0].tasks[0].completed = true;
     let unfinished_id = plan.schedules[0].tasks[1].id.clone();
     plan.schedules[0].tasks[1].advanced_from_date = Some("2026-09-08".to_string());
@@ -468,7 +492,8 @@ fn reschedule_unfinished_plan_is_noop_without_a_new_start_or_open_tasks() {
         &mock_plan_out(),
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
     assert!(!reschedule_unfinished_plan(&mut plan, "2026-09-01").unwrap());
     for task in plan
         .schedules
@@ -492,7 +517,8 @@ fn multi_plan_superposition_and_stats_test() {
         &plan_out,
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
     let plan2 = create_study_plan(
         "计网",
         "jellyfin",
@@ -501,7 +527,8 @@ fn multi_plan_superposition_and_stats_test() {
         &plan_out,
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
 
     let mut plans = vec![plan1, plan2];
 
@@ -537,7 +564,8 @@ fn push_forward_to_today_with_partial_checkin() {
         &plan_out,
         "2026-08-30",
         false,
-    );
+    )
+    .unwrap();
 
     // 8月30日当天完成任务0，但任务1未完成
     plan.schedules[0].tasks[0].completed = true;
@@ -574,7 +602,8 @@ fn advance_partial_future_day_then_postpone_today_composes_correctly() {
         &plan_out,
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
     // 今天完成 A、未完成 B；未来 9/2 提前完成 C、未完成 D。
     plan.schedules[0].tasks[0].completed = true;
     plan.schedules[1].tasks[0].completed = true;
@@ -652,7 +681,8 @@ fn cancelling_an_advanced_checkin_restores_its_original_date() {
         &plan_out,
         "2026-09-01",
         false,
-    );
+    )
+    .unwrap();
     plan.schedules[1].tasks[0].completed = true;
     let advanced_task_id = plan.schedules[1].tasks[0].id.clone();
     assert_eq!(
@@ -727,7 +757,8 @@ fn streak_with_skip_weekends() {
         &plan_out,
         "2026-08-28",
         true, // 跳过周末
-    );
+    )
+    .unwrap();
 
     // 周五 (08-28) 打卡
     plan.schedules[0].tasks[0].completed = true;
@@ -754,7 +785,8 @@ fn calendar_matrix_and_month_stats_test() {
         &plan_out,
         "2026-08-15",
         false,
-    );
+    )
+    .unwrap();
 
     let plans = vec![plan];
     let matrix = generate_month_calendar_matrix(2026, 8, &plans);

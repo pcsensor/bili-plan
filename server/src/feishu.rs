@@ -22,6 +22,32 @@ struct TokenResponse {
     expire: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct MessageResponse {
+    code: i32,
+    msg: Option<String>,
+    data: Option<SentMessage>,
+}
+
+#[derive(Deserialize)]
+struct SentMessage {
+    message_id: String,
+}
+
+impl MessageResponse {
+    fn message_id(self) -> Result<String, String> {
+        if self.code != 0 {
+            return Err(format!(
+                "发送失败: {}",
+                self.msg.as_deref().unwrap_or("未知错误")
+            ));
+        }
+        self.data
+            .map(|data| data.message_id)
+            .ok_or_else(|| "飞书成功响应缺少 message_id".to_string())
+    }
+}
+
 impl FeishuClient {
     pub fn new(app_id: impl Into<String>, app_secret: impl Into<String>) -> Self {
         Self {
@@ -99,19 +125,17 @@ impl FeishuClient {
             .map_err(|e| format!("发送飞书卡片网络错误: {}", e))?;
 
         let status = res.status();
-        let body: Value = res
+        let body: MessageResponse = res
             .json()
             .await
             .map_err(|e| format!("解析发送响应错误: {}", e))?;
 
-        if body["code"].as_i64() == Some(0) {
-            let msg_id = body["data"]["message_id"].as_str().unwrap_or_default();
-            info!("成功向飞书用户 {} 发送卡片消息 (id: {})", open_id, msg_id);
-            Ok(msg_id.to_string())
-        } else {
-            error!("发送飞书卡片失败 (HTTP {}): {:?}", status, body);
-            Err(format!("发送失败: {:?}", body["msg"]))
-        }
+        let msg_id = body.message_id().map_err(|message| {
+            error!("发送飞书卡片失败 (HTTP {}): {}", status, message);
+            message
+        })?;
+        info!("成功向飞书用户 {} 发送卡片消息 (id: {})", open_id, msg_id);
+        Ok(msg_id)
     }
 
     /// 向用户发送纯文本消息。
@@ -135,16 +159,29 @@ impl FeishuClient {
             .await
             .map_err(|e| format!("发送飞书文本网络错误: {}", e))?;
 
-        let body: Value = res
+        let body: MessageResponse = res
             .json()
             .await
             .map_err(|e| format!("解析发送响应错误: {}", e))?;
 
-        if body["code"].as_i64() == Some(0) {
-            let msg_id = body["data"]["message_id"].as_str().unwrap_or_default();
-            Ok(msg_id.to_string())
-        } else {
-            Err(format!("发送失败: {:?}", body["msg"]))
-        }
+        body.message_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageResponse;
+
+    #[test]
+    fn send_response_requires_a_message_id_on_success() {
+        let ok: MessageResponse =
+            serde_json::from_str(r#"{"code":0,"msg":"success","data":{"message_id":"om_123"}}"#)
+                .unwrap();
+        assert_eq!(ok.message_id().unwrap(), "om_123");
+        let incomplete: MessageResponse = serde_json::from_str(r#"{"code":0}"#).unwrap();
+        assert!(incomplete.message_id().is_err());
+        let failed: MessageResponse =
+            serde_json::from_str(r#"{"code":999,"msg":"invalid token"}"#).unwrap();
+        assert!(failed.message_id().unwrap_err().contains("invalid token"));
     }
 }

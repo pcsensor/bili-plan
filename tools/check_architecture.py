@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from rust_imports import crate_roots
 
 ROOT = Path(__file__).resolve().parents[1]
 errors: list[str] = []
@@ -51,11 +52,12 @@ domain_edges = {
     "model": set(),
     "plan": {"catalog"},
     "schedule_recovery": {"model"},
-    "study": {"model", "plan", "schedule_recovery"},
+    "source": set(),
+    "study": {"model", "plan", "schedule_recovery", "source"},
 }
 for module, allowed in domain_edges.items():
     path = ROOT / "crates/domain/src" / f"{module}.rs"
-    imports = set(re.findall(r"\bcrate::([a-z_]+)", path.read_text()))
+    imports = crate_roots(path.read_text())
     require(imports <= allowed, f"domain dependency direction violated in {module}: {imports - allowed}")
 
 desktop_adapter_edges = {
@@ -68,9 +70,11 @@ desktop_adapter_edges = {
     "export": {"parse", "plan"},
 }
 for module, allowed in desktop_adapter_edges.items():
-    source = (ROOT / "src" / f"{module}.rs").read_text()
-    imports = set(re.findall(r"\bcrate::([a-z_]+)", source))
-    require(imports <= allowed, f"desktop adapter depends upward in {module}: {imports - allowed}")
+    paths = [(ROOT / "src" / f"{module}.rs")]
+    paths.extend((ROOT / "src" / module).rglob("*.rs") if (ROOT / "src" / module).exists() else ())
+    for path in paths:
+        imports = crate_roots(path.read_text())
+        require(imports <= allowed, f"desktop adapter depends upward in {path.relative_to(ROOT)}: {imports - allowed}")
 
 server_edges = {
     "auth": set(),
@@ -84,7 +88,7 @@ server_edges = {
 }
 for module, allowed in server_edges.items():
     source = (ROOT / "server/src" / f"{module}.rs").read_text()
-    imports = set(re.findall(r"\bcrate::([a-z_]+)", source))
+    imports = crate_roots(source)
     require(imports <= allowed, f"server dependency direction violated in {module}: {imports - allowed}")
 
 for path in list((ROOT / "src").rglob("*.rs")) + list((ROOT / "server/src").rglob("*.rs")):
@@ -116,14 +120,18 @@ for name, expected_fields in contract.items():
 for path, maximum in {
     "src/app.rs": 1000,
     "src/core.rs": 1000,
+    "src/fnos.rs": 900,
     "crates/domain/src/study.rs": 1600,
     "server/src/store.rs": 1000,
 }.items():
     actual = len((ROOT / path).read_text().splitlines())
     require(actual <= maximum, f"{path} grew to {actual} lines (budget {maximum}); split responsibilities")
-for path in (ROOT / "src/app").glob("*.rs"):
+for path in (ROOT / "src/app").rglob("*.rs"):
     actual = len(path.read_text().splitlines())
     require(actual <= 1200, f"{path.relative_to(ROOT)} grew to {actual} lines; split the feature")
+for path in (ROOT / "src/fnos").rglob("*.rs"):
+    actual = len(path.read_text().splitlines())
+    require(actual <= 900, f"{path.relative_to(ROOT)} grew to {actual} lines; split the adapter")
 
 cloud = (ROOT / "src/core/cloud.rs").read_text()
 sync = cloud.split("pub fn sync_with_cloud(", 1)[-1]

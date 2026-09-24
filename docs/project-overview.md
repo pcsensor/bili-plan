@@ -26,9 +26,10 @@
 catalog ──> plan ─────────────┐
 model ────> schedule_recovery ├──> study
 model ────────────────────────┘
+source ────────────────────────> study
 ```
 
-`catalog` 包含 `EpisodeItem`、`Group`；`model` 包含 `StudyPlan`、`TaskItem`、`DailyNote`、`ScheduleShift` 等持久化类型；`plan` 分配视频时长；`schedule_recovery` 负责补位与撤销；`study` 组合这些规则形成打卡、改期、日历及统计操作。图中没有反向边，检查脚本也会拒绝新增反向导入。
+`catalog` 包含 `EpisodeItem`、`Group`；`model` 包含 `StudyPlan`、`TaskItem`、`DailyNote`、`ScheduleShift` 等持久化类型；`plan` 分配视频时长；`schedule_recovery` 负责补位与撤销；`source` 集中来源标签和跨端播放链接；`study` 组合这些规则形成打卡、改期、日历及统计操作。图中没有反向边，检查脚本也会拒绝新增反向导入。
 
 ## 2. 桌面端模块边界
 
@@ -67,6 +68,8 @@ model ────────────────────────�
 
 `schema_contract.json` 是变更提醒，不是自动迁移工具；检查通过也不等于所有历史数据都已验证。
 
+`StudyPlan.source_type` 与日期字段继续以字符串存储，保持旧 JSON 与现有服务端协议兼容。来源判断应经 `planner_domain::source::SourceKind`，新写入的日期须先在领域层严格解析；不应把错误日期静默替换成今天。
+
 ## 5. 云同步的一致性规则
 
 同步采用**一个桌面端主写计划结构、机器人更新任务打卡**的模型。桌面端提交完整计划快照和上次确认的 `base_revision`。服务端在同一个 SQLite 事务中读取版本、拒绝过期快照、合并机器人任务状态、保存快照并递增版本。版本不匹配时返回 HTTP 409；客户端必须提示用户核对数据，不能拿旧请求体自动重试。
@@ -96,7 +99,7 @@ model ────────────────────────�
 2. **列出兼容性影响。** 核对持久化 JSON、SQLite schema、同步请求/响应、旧客户端、来源响应和渠道展示。涉及跨端协议时写出升级顺序与冲突处理方式。
 3. **先固定关键行为。** 为新规则或历史故障增加能失败的测试。排期改动覆盖周末、稀疏日期、重复操作与撤销顺序；同步改动覆盖旧快照、机器人打卡、重复请求和重启；来源改动覆盖解析与所有展示路径。
 4. **按依赖方向实现。** 新功能从内向外完成领域、适配、编排和 UI；只暴露上层需要的接口。若模块超过 `tools/check_architecture.py` 中的体量预算，先拆职责再扩大功能。
-5. **在本地运行检查。** 从仓库根目录执行 `bash tools/check.sh`。它依次运行架构与契约检查、`cargo fmt --check`、workspace Clippy（警告视为错误）、workspace 全目标测试。单独运行脚本时也可用 `python3 tools/check_architecture.py` 快速检查依赖。
+5. **在本地运行检查。** 从仓库根目录执行 `bash tools/check.sh`。它依次运行架构与契约检查、架构导入解析器测试、`cargo fmt --check`、workspace Clippy（警告视为错误）、workspace 全目标测试。单独运行脚本时也可用 `python3 tools/check_architecture.py` 快速检查依赖。
 6. **交付前复核。** 记录用户可见变化、测试结果、未验证的真实环境、旧数据兼容性与发布顺序。改了容器构建上下文且本机有 Docker 时，再运行 `docker build -f server/Dockerfile -t bili-plan-server:local .`。
 
 检查脚本会拦截包级和主要模块级反向依赖、领域层引入 GUI/网络/数据库、跨目录源码包含、跨端模型重复定义、字段或类型漂移、关键模块继续膨胀，以及后台同步函数直接保存配置。它是自动保护网，不能替代行为测试和代码审查。

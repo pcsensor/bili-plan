@@ -5,8 +5,8 @@
 //! 纯函数行为——`app.rs` 的每个交互动作最终都落到这些函数上。
 
 use bili_planner::core::{
-    export_payload, fetch_and_parse, generate_plan, parse_days, FetchSource, ReadyState, Selection,
-    SourceMode,
+    enroll_study_plan, export_payload, fetch_and_parse, generate_plan, parse_days, AppConfig,
+    FetchSource, ReadyState, Selection, SourceMode,
 };
 use bili_planner::parse::{EpisodeItem, Group};
 use bili_planner::plan::Mode;
@@ -104,6 +104,23 @@ fn generate_plan_single_scope_uses_group_episodes() {
     let plan = rd.plan.expect("plan");
     assert_eq!(plan.total, 5400, "单科目范围只统计该科目时长");
     assert_eq!(plan.scope_desc, "第二章 进阶（1 个视频）");
+}
+
+#[test]
+fn enrolling_with_an_invalid_date_does_not_change_config() {
+    let mut ready = sample_ready(two_groups());
+    generate_plan(&mut ready, 3, Mode::Split).unwrap();
+    let mut config = AppConfig::default();
+    assert!(enroll_study_plan(
+        &mut config,
+        &ready,
+        "BV1ab2345678",
+        "bilibili",
+        "2026-02-30",
+        false,
+    )
+    .is_err());
+    assert!(config.plans.is_empty());
 }
 
 #[test]

@@ -1,10 +1,59 @@
 use crate::models::StudyPlan;
 use crate::store::Store;
 use chrono::Local;
+use planner_domain::source::video_link;
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::{info, warn};
+
+#[derive(Deserialize)]
+struct ApiResponse<T> {
+    ok: bool,
+    result: Option<T>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SentMessage {
+    message_id: i64,
+}
+
+#[derive(Deserialize)]
+pub struct TelegramUpdate {
+    update_id: i64,
+    #[serde(default)]
+    message: Option<TelegramMessage>,
+    #[serde(default)]
+    callback_query: Option<TelegramCallback>,
+}
+
+#[derive(Deserialize)]
+struct TelegramMessage {
+    message_id: Option<i64>,
+    chat: TelegramChat,
+    text: Option<String>,
+    from: Option<TelegramUser>,
+}
+
+#[derive(Deserialize)]
+struct TelegramChat {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct TelegramUser {
+    username: Option<String>,
+    first_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TelegramCallback {
+    id: String,
+    message: Option<TelegramMessage>,
+    data: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct TelegramClient {
@@ -48,18 +97,20 @@ impl TelegramClient {
             .await
             .map_err(|e| format!("Telegram 发送失败: {}", e))?;
 
-        let res_json: Value = resp
+        let res_json: ApiResponse<SentMessage> = resp
             .json()
             .await
             .map_err(|e| format!("解析 Telegram 响应失败: {}", e))?;
 
-        if res_json["ok"].as_bool() == Some(true) {
-            let msg_id = res_json["result"]["message_id"].as_i64().unwrap_or(0);
-            Ok(msg_id)
+        if res_json.ok {
+            res_json
+                .result
+                .map(|message| message.message_id)
+                .ok_or_else(|| "Telegram 成功响应缺少 message_id".to_string())
         } else {
             Err(format!(
                 "Telegram API 错误: {}",
-                res_json["description"].as_str().unwrap_or("未知错误")
+                res_json.description.as_deref().unwrap_or("未知错误")
             ))
         }
     }
@@ -96,15 +147,15 @@ impl TelegramClient {
             .await
             .map_err(|e| format!("Telegram 编辑失败: {}", e))?;
 
-        let res_json: Value = resp
+        let res_json: ApiResponse<serde::de::IgnoredAny> = resp
             .json()
             .await
             .map_err(|e| format!("解析 Telegram 响应失败: {}", e))?;
 
-        if res_json["ok"].as_bool() == Some(true) {
+        if res_json.ok {
             Ok(())
         } else {
-            let desc = res_json["description"].as_str().unwrap_or("");
+            let desc = res_json.description.as_deref().unwrap_or("");
             if desc.contains("message is not modified") {
                 Ok(())
             } else {
@@ -138,7 +189,11 @@ impl TelegramClient {
     }
 
     /// 长轮询获取 Updates。
-    pub async fn get_updates(&self, offset: i64, timeout: u64) -> Result<Vec<Value>, String> {
+    pub async fn get_updates(
+        &self,
+        offset: i64,
+        timeout: u64,
+    ) -> Result<Vec<TelegramUpdate>, String> {
         let url = format!("https://api.telegram.org/bot{}/getUpdates", self.bot_token);
         let body = json!({
             "offset": offset,
@@ -154,18 +209,19 @@ impl TelegramClient {
             .await
             .map_err(|e| format!("Telegram 轮询网络错误: {}", e))?;
 
-        let res_json: Value = resp
+        let res_json: ApiResponse<Vec<TelegramUpdate>> = resp
             .json()
             .await
             .map_err(|e| format!("解析 Telegram Updates 失败: {}", e))?;
 
-        if res_json["ok"].as_bool() == Some(true) {
-            let updates = res_json["result"].as_array().cloned().unwrap_or_default();
-            Ok(updates)
+        if res_json.ok {
+            res_json
+                .result
+                .ok_or_else(|| "Telegram 成功响应缺少 Updates 列表".to_string())
         } else {
             Err(format!(
                 "Telegram API 轮询错误: {}",
-                res_json["description"].as_str().unwrap_or("未知")
+                res_json.description.as_deref().unwrap_or("未知")
             ))
         }
     }
@@ -197,36 +253,6 @@ fn fmt_dur(secs: i64) -> String {
 }
 
 /// 格式化并清理 Bilibili 链接。
-fn clean_bili_url(source_type: &str, source_url: &str, vid_no: i64) -> String {
-    if source_type == "bilibili" {
-        let trimmed = source_url.trim();
-        let chars: Vec<char> = trimmed.chars().collect();
-        let n = chars.len();
-        let mut found_bv = None;
-        for i in 0..n.saturating_sub(11) {
-            if chars[i] == 'B'
-                && chars[i + 1] == 'V'
-                && chars[i + 2..i + 12]
-                    .iter()
-                    .all(|c| c.is_ascii_alphanumeric())
-            {
-                found_bv = Some(chars[i..i + 12].iter().collect::<String>());
-                break;
-            }
-        }
-        if let Some(bvid) = found_bv {
-            format!("https://www.bilibili.com/video/{bvid}?p={vid_no}")
-        } else if trimmed.starts_with("http") {
-            let base = trimmed.split('?').next().unwrap_or(trimmed);
-            format!("{base}?p={vid_no}")
-        } else {
-            format!("https://www.bilibili.com/video/{trimmed}?p={vid_no}")
-        }
-    } else {
-        source_url.to_string()
-    }
-}
-
 /// HTML 字符转义，防止特殊字符（如 <, >, &, "）导致 Telegram API 解析错误
 pub fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -292,8 +318,7 @@ pub fn build_telegram_today_card(
                         format!("⬜ 打卡 P{}", task.vid_no)
                     };
                     let callback_data = format!("chk:{}:{}:{}", plan.id, task.id, target_date);
-                    let direct_url =
-                        clean_bili_url(&plan.source_type, &plan.source_url, task.vid_no);
+                    let direct_url = video_link(&plan.source_type, &plan.source_url, task.vid_no);
 
                     let mut row = vec![json!({
                         "text": btn_text,
@@ -415,18 +440,20 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
             match telegram.get_updates(offset, 25).await {
                 Ok(updates) => {
                     for u in updates {
-                        let update_id = u["update_id"].as_i64().unwrap_or(0);
-                        if update_id >= offset {
-                            offset = update_id + 1;
+                        if u.update_id >= offset {
+                            offset = u.update_id + 1;
                         }
 
                         // 1. 处理用户发送的消息
-                        if let Some(msg) = u.get("message") {
-                            let chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
-                            let text = msg["text"].as_str().unwrap_or("").trim();
-                            let user_name = msg["from"]["username"]
-                                .as_str()
-                                .or_else(|| msg["from"]["first_name"].as_str())
+                        if let Some(msg) = &u.message {
+                            let chat_id = msg.chat.id;
+                            let text = msg.text.as_deref().unwrap_or("").trim();
+                            let user_name = msg
+                                .from
+                                .as_ref()
+                                .and_then(|user| {
+                                    user.username.as_deref().or(user.first_name.as_deref())
+                                })
                                 .unwrap_or("学习者");
 
                             let first_word =
@@ -511,11 +538,16 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
                         }
 
                         // 2. 处理 Inline Keyboard 点击回调
-                        if let Some(cb) = u.get("callback_query") {
-                            let query_id = cb["id"].as_str().unwrap_or("");
-                            let chat_id = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
-                            let msg_id = cb["message"]["message_id"].as_i64().unwrap_or(0);
-                            let data = cb["data"].as_str().unwrap_or("");
+                        if let Some(cb) = &u.callback_query {
+                            let (Some(message), Some(data)) = (&cb.message, cb.data.as_deref())
+                            else {
+                                continue;
+                            };
+                            let Some(msg_id) = message.message_id else {
+                                continue;
+                            };
+                            let query_id = cb.id.as_str();
+                            let chat_id = message.chat.id;
 
                             if data.starts_with("chk:") {
                                 let parts: Vec<&str> = data.split(':').collect();
@@ -573,4 +605,27 @@ pub fn start_telegram_polling(store: Store, telegram: TelegramClient) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiResponse, TelegramUpdate};
+
+    #[test]
+    fn update_fixture_parses_messages_and_callbacks() {
+        let response: ApiResponse<Vec<TelegramUpdate>> = serde_json::from_str(
+            r#"{"ok":true,"result":[{"update_id":7,"message":{"message_id":1,"chat":{"id":42},"text":"/today","from":{"username":"learner"}}},{"update_id":8,"callback_query":{"id":"query","message":{"message_id":2,"chat":{"id":42}},"data":"chk:p:t:2024-03-01"}}]}"#,
+        )
+        .unwrap();
+        let updates = response.result.unwrap();
+        assert_eq!(updates[0].message.as_ref().unwrap().chat.id, 42);
+        assert_eq!(
+            updates[1].callback_query.as_ref().unwrap().data.as_deref(),
+            Some("chk:p:t:2024-03-01")
+        );
+        assert!(serde_json::from_str::<ApiResponse<Vec<TelegramUpdate>>>(
+            r#"{"ok":true,"result":[{"message":{"chat":{"id":42}}}]}"#
+        )
+        .is_err());
+    }
 }

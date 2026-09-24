@@ -7,4 +7,5 @@ pub mod catalog;
 pub mod model;
 pub mod plan;
 pub mod schedule_recovery;
+pub mod source;
 pub mod study;

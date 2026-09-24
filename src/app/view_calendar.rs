@@ -564,7 +564,7 @@ impl PlannerApp {
                     let st = t_item.source_type.clone();
                     let su = t_item.source_url.clone();
                     let has_source_url = !su.trim().is_empty();
-                    let is_calendar_task = st == "calendar";
+                    let is_calendar_task = SourceKind::from_tag(&st) == SourceKind::Calendar;
                     let vno = t_item.task.vid_no;
                     let edit_pid = pid.clone();
                     let edit_tid = tid.clone();

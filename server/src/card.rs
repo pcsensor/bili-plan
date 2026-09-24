@@ -1,13 +1,14 @@
 use crate::models::{PlanStatus, StudyPlan, TaskItem};
 use chrono::{Datelike, Local, NaiveDate};
+use planner_domain::source::{video_link, SourceKind};
 use serde_json::{json, Value};
 
 fn source_label(source_type: &str) -> &'static str {
-    match source_type {
-        "bilibili" => "📺 B站",
-        "jellyfin" => "🎬 Jellyfin",
-        "fnos" => "🖥️ 飞牛影视",
-        "custom" => "📝 自定义任务",
+    match SourceKind::from_tag(source_type) {
+        SourceKind::Bilibili => "📺 B站",
+        SourceKind::Jellyfin => "🎬 Jellyfin",
+        SourceKind::FnOs => "🖥️ 飞牛影视",
+        SourceKind::Custom => "📝 自定义任务",
         _ => "📁 其他来源",
     }
 }
@@ -34,29 +35,6 @@ fn get_weekday_name(d: &NaiveDate) -> &'static str {
         chrono::Weekday::Fri => "周五",
         chrono::Weekday::Sat => "周六",
         chrono::Weekday::Sun => "周日",
-    }
-}
-
-fn clean_bili_link(source_url: &str, vid_no: i64) -> String {
-    let s = source_url.trim();
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    for i in 0..n.saturating_sub(11) {
-        if chars[i] == 'B'
-            && chars[i + 1] == 'V'
-            && chars[i + 2..i + 12]
-                .iter()
-                .all(|c| c.is_ascii_alphanumeric())
-        {
-            let bvid: String = chars[i..i + 12].iter().collect();
-            return format!("https://www.bilibili.com/video/{}?p={}", bvid, vid_no);
-        }
-    }
-    if s.starts_with("http://") || s.starts_with("https://") {
-        let base = s.split('?').next().unwrap_or(s);
-        format!("{}?p={}", base, vid_no)
-    } else {
-        format!("https://www.bilibili.com/video/{}?p={}", s, vid_no)
     }
 }
 
@@ -180,11 +158,7 @@ pub fn build_today_study_card(plans: &[StudyPlan], target_date: &str) -> Value {
                 let is_done = task.completed;
 
                 // 播放链接构造
-                let video_link = if pt.plan.source_type == "bilibili" {
-                    clean_bili_link(&pt.plan.source_url, vno)
-                } else {
-                    pt.plan.source_url.clone()
-                };
+                let video_link = video_link(&pt.plan.source_type, &pt.plan.source_url, vno);
 
                 let link_suffix = if !video_link.trim().is_empty() {
                     format!(" [🔗直达]({})", video_link)

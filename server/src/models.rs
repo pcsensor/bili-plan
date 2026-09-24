@@ -106,7 +106,7 @@ pub struct FeishuCallbackRequest {
     #[serde(default)]
     pub header: Option<FeishuEventHeader>,
     #[serde(default)]
-    pub event: Option<serde_json::Value>,
+    pub event: Option<FeishuEvent>,
     #[serde(default)]
     pub action: Option<FeishuCardAction>,
     #[serde(default)]
@@ -126,16 +126,110 @@ pub struct FeishuEventHeader {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FeishuCardAction {
-    pub value: serde_json::Value,
+    pub value: FeishuActionValue,
     pub tag: Option<String>,
     pub option: Option<String>,
 }
 
-/// 飞书卡片操作数据。
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FeishuActionValue {
+    Data(CardActionData),
+    Encoded(String),
+}
+
+impl FeishuActionValue {
+    pub fn decode(&self) -> Option<CardActionData> {
+        match self {
+            Self::Data(data) => Some(data.clone()),
+            Self::Encoded(text) => serde_json::from_str(text).ok(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FeishuEventAction {
+    Wrapped(FeishuCardAction),
+    Direct(CardActionData),
+}
+
+impl FeishuEventAction {
+    pub fn decode(&self) -> Option<CardActionData> {
+        match self {
+            Self::Wrapped(action) => action.value.decode(),
+            Self::Direct(data) => Some(data.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeishuEvent {
+    pub action: Option<FeishuEventAction>,
+    pub operator: Option<FeishuOperator>,
+    pub sender: Option<FeishuSender>,
+    pub message: Option<FeishuMessage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeishuOperator {
+    pub open_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeishuSender {
+    pub sender_id: Option<FeishuSenderId>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeishuSenderId {
+    pub open_id: Option<String>,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeishuMessage {
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeishuTextContent {
+    pub text: String,
+}
+
+/// 飞书卡片操作数据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardActionData {
     pub action: String, // "checkin", "push_forward", "refresh"
     pub plan_id: Option<String>,
     pub task_id: Option<String>,
     pub date: Option<String>,
+}
+
+#[cfg(test)]
+mod feishu_callback_tests {
+    use super::{FeishuCallbackRequest, FeishuTextContent};
+
+    #[test]
+    fn old_and_new_card_payloads_decode_to_the_same_action() {
+        let old: FeishuCallbackRequest = serde_json::from_str(
+            r#"{"token":"secret","open_id":"ou_1","action":{"value":"{\"action\":\"checkin\",\"plan_id\":\"p\",\"task_id\":\"t\"}"}}"#,
+        )
+        .unwrap();
+        let new: FeishuCallbackRequest = serde_json::from_str(
+            r#"{"schema":"2.0","header":{"token":"secret"},"event":{"operator":{"open_id":"ou_1"},"action":{"value":{"action":"checkin","plan_id":"p","task_id":"t"}}}}"#,
+        )
+        .unwrap();
+        let old_action = old.action.unwrap().value.decode().unwrap();
+        let new_action = new.event.unwrap().action.unwrap().decode().unwrap();
+        assert_eq!(old_action.action, new_action.action);
+        assert_eq!(old_action.plan_id, new_action.plan_id);
+        assert_eq!(old_action.task_id, new_action.task_id);
+    }
+
+    #[test]
+    fn message_content_fixture_has_a_typed_text_field() {
+        let content: FeishuTextContent = serde_json::from_str(r#"{"text":"/today"}"#).unwrap();
+        assert_eq!(content.text, "/today");
+    }
 }

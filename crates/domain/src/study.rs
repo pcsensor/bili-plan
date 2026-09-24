@@ -6,6 +6,7 @@ use chrono::{Datelike, Duration, Local, NaiveDate};
 use std::collections::HashMap;
 
 use crate::plan::PlanOut;
+use crate::source::SourceKind;
 
 pub use crate::model::{
     deserialize_daily_notes, DailyNote, DailyNotes, DailySchedule, PlanStatus, StudyPlan, TaskItem,
@@ -108,14 +109,14 @@ pub fn create_study_plan(
     plan_out: &PlanOut,
     start_date_str: &str,
     skip_weekends: bool,
-) -> StudyPlan {
+) -> Result<StudyPlan, String> {
+    let start_date = validate_date(start_date_str)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
     let plan_id = format!("plan_{}_{}", now, fast_rand_suffix());
-    let start_date = parse_date_or_today(start_date_str);
 
     let mut schedules: Vec<DailySchedule> = Vec::new();
     let mut cur_date = start_date;
@@ -167,7 +168,7 @@ pub fn create_study_plan(
         .map(|s| s.date.clone())
         .unwrap_or_else(|| format_date(start_date));
 
-    StudyPlan {
+    Ok(StudyPlan {
         id: plan_id,
         title: title.trim().to_string(),
         source_type: source_type.to_string(),
@@ -184,7 +185,7 @@ pub fn create_study_plan(
         advance_shifts: Vec::new(),
         is_series: false,
         show_in_library: true,
-    }
+    })
 }
 
 /// 产生一个简短的随机后缀。
@@ -284,7 +285,7 @@ pub fn create_custom_study_plan(
     Ok(StudyPlan {
         id: plan_id,
         title: title.to_string(),
-        source_type: "custom".to_string(),
+        source_type: SourceKind::Custom.tag().to_string(),
         source_url: String::new(),
         scope_desc: format!("自定义任务 · 每日 {daily_minutes} 分钟"),
         total_duration: portion * days,
@@ -363,7 +364,7 @@ pub fn create_one_off_calendar_task(
     Ok(StudyPlan {
         id: plan_id.clone(),
         title: task_title.clone(),
-        source_type: "calendar".to_string(),
+        source_type: SourceKind::Calendar.tag().to_string(),
         source_url: String::new(),
         scope_desc: "日历单日任务".to_string(),
         total_duration: portion,
@@ -403,7 +404,7 @@ pub fn create_calendar_series(
     Ok(StudyPlan {
         id: plan_id.clone(),
         title: series_name.to_string(),
-        source_type: "calendar".to_string(),
+        source_type: SourceKind::Calendar.tag().to_string(),
         source_url: String::new(),
         scope_desc: "日历系列计划（按实际添加日期自动延展）".to_string(),
         total_duration: portion,
@@ -547,7 +548,7 @@ pub fn update_calendar_task(
     date_str: &str,
     minutes: i64,
 ) -> Result<(), String> {
-    if plan.source_type != "calendar" {
+    if SourceKind::from_tag(&plan.source_type) != SourceKind::Calendar {
         return Err("只能编辑通过日历创建的任务。".to_string());
     }
     let (task_title, portion) = validate_calendar_task(task_title, minutes)?;
@@ -571,7 +572,7 @@ pub fn update_calendar_task(
 
 /// 删除日历创建的一项任务。返回 `true` 表示计划已经没有任务，调用方应将计划移除。
 pub fn delete_calendar_task(plan: &mut StudyPlan, task_id: &str) -> Result<bool, String> {
-    if plan.source_type != "calendar" {
+    if SourceKind::from_tag(&plan.source_type) != SourceKind::Calendar {
         return Err("只能删除通过日历创建的任务。".to_string());
     }
     let source_index = plan

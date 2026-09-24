@@ -20,7 +20,7 @@ use chrono::Local;
 use feishu::FeishuClient;
 use models::{
     BindRequestResponse, BindStatusResponse, CardActionData, DeviceUser, FeishuCallbackRequest,
-    RegisterResponse, SyncError, SyncPayload, SyncResponse,
+    FeishuTextContent, RegisterResponse, SyncError, SyncPayload, SyncResponse,
 };
 use ratelimit::RateLimiter;
 use serde_json::{json, Value};
@@ -440,27 +440,16 @@ async fn feishu_callback(
     // 2. 飞书消息卡片交互回调 (兼容 v1 顶层 action 与 v2 event.action)
     let card_action_info: Option<(String, CardActionData)> = if let Some(action) = &req.action {
         let open_id = req.open_id.clone().unwrap_or_default();
-        let act_val: Result<CardActionData, _> = if action.value.is_string() {
-            serde_json::from_str(action.value.as_str().unwrap_or_default())
-        } else {
-            serde_json::from_value(action.value.clone())
-        };
-        act_val.ok().map(|data| (open_id, data))
+        action.value.decode().map(|data| (open_id, data))
     } else if let Some(event) = &req.event {
-        if let Some(action_val) = event.get("action") {
+        if let Some(action) = &event.action {
             let open_id = event
-                .get("operator")
-                .and_then(|op| op.get("open_id"))
-                .and_then(|v| v.as_str())
+                .operator
+                .as_ref()
+                .and_then(|operator| operator.open_id.as_deref())
                 .unwrap_or_default()
                 .to_string();
-            let raw_val = action_val.get("value").unwrap_or(action_val);
-            let act_val: Result<CardActionData, _> = if raw_val.is_string() {
-                serde_json::from_str(raw_val.as_str().unwrap_or_default())
-            } else {
-                serde_json::from_value(raw_val.clone())
-            };
-            act_val.ok().map(|data| (open_id, data))
+            action.decode().map(|data| (open_id, data))
         } else {
             None
         }
@@ -533,20 +522,23 @@ async fn feishu_callback(
 
     // 3. 飞书用户文字消息事件 (im.message.receive_v1)
     if let Some(event) = req.event {
-        if let Some(msg) = event.get("message") {
-            let open_id = event["sender"]["sender_id"]["open_id"]
-                .as_str()
+        if let Some(msg) = &event.message {
+            let sender = event
+                .sender
+                .as_ref()
+                .and_then(|sender| sender.sender_id.as_ref());
+            let open_id = sender
+                .and_then(|id| id.open_id.as_deref())
                 .unwrap_or_default();
-            let user_name = event["sender"]["sender_id"]["user_id"]
-                .as_str()
+            let user_name = sender
+                .and_then(|id| id.user_id.as_deref())
                 .unwrap_or("学习者");
-            let content_str = msg["content"].as_str().unwrap_or_default();
+            let content_str = msg.content.as_str();
 
             // 解析飞书文本内容 JSON 格式: {"text":"/bind 123456"}
-            let text = serde_json::from_str::<Value>(content_str)
-                .ok()
-                .and_then(|v| v["text"].as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| content_str.to_string())
+            let text = serde_json::from_str::<FeishuTextContent>(content_str)
+                .map(|content| content.text)
+                .unwrap_or_else(|_| content_str.to_string())
                 .trim()
                 .to_string();
 
