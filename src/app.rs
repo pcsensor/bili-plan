@@ -42,10 +42,10 @@ use crate::core::{
     advance_completed_study_tasks, append_calendar_series_task, check_cloud_bind_status,
     checkin_study_task, clear_history, create_calendar_series_plan, delete_calendar_task,
     delete_daily_note, enroll_study_plan, export_payload, generate_plan, get_daily_notes,
-    load_config, parse_days, push_forward_study_plan, record_history, remove_history,
-    remove_study_plan, request_cloud_bind_code, reschedule_unfinished_study_plan, save_config,
-    sync_with_cloud, toggle_study_plan_status, update_calendar_task, AppConfig, FetchSource,
-    ReadyState, Selection, SourceMode,
+    load_config, parse_days, push_forward_study_plan, record_history,
+    redistribute_unfinished_study_plan, remove_history, remove_study_plan, request_cloud_bind_code,
+    reschedule_unfinished_study_plan, save_config, sync_with_cloud, toggle_study_plan_status,
+    update_calendar_task, AppConfig, FetchSource, ReadyState, Selection, SourceMode,
 };
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
@@ -72,6 +72,13 @@ enum CalendarTaskTarget {
     OneOff,
     NewSeries,
     ExistingSeries,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PlanRescheduleMode {
+    #[default]
+    ShiftStart,
+    RedistributeToEnd,
 }
 
 /// 从右侧任务列表传入编辑弹窗的不可变初始值。
@@ -419,6 +426,7 @@ pub struct PlannerApp {
     /// 计划库中整体调整未完成任务日期的弹窗。
     plan_reschedule_modal_open: bool,
     plan_reschedule_plan_id: Option<String>,
+    plan_reschedule_mode: PlanRescheduleMode,
     plan_reschedule_date_input: Entity<InputState>,
 
     /// gpui-component 输入框为独立 `Entity<InputState>`，这里持有引用并
@@ -647,6 +655,7 @@ impl PlannerApp {
             custom_skip_weekends_toggle: false,
             plan_reschedule_modal_open: false,
             plan_reschedule_plan_id: None,
+            plan_reschedule_mode: PlanRescheduleMode::default(),
             plan_reschedule_date_input,
             link_input,
             cookie_input,

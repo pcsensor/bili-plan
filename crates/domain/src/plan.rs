@@ -1,6 +1,7 @@
 //! 观看计划算法与格式化，与 Python 脚本逐行对齐。
 
-use crate::catalog::{EpisodeItem, Group};
+pub use crate::catalog::EpisodeItem;
+use crate::catalog::Group;
 use serde::Serialize;
 
 /// 计划模式。

@@ -200,6 +200,7 @@ impl PlannerApp {
                 let pid_del = plan.id.clone();
                 let pid_push = plan.id.clone();
                 let pid_reschedule = plan.id.clone();
+                let pid_redistribute = plan.id.clone();
 
                 let status_badge_bg = match plan.status {
                     PlanStatus::Active => theme.primary,
@@ -282,6 +283,19 @@ impl PlannerApp {
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.open_plan_reschedule_action(
                                                     &pid_reschedule,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("redistribute-plan", p_idx))
+                                            .small()
+                                            .label("📆 调整结束日期")
+                                            .disabled(done_cnt >= total_cnt)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_plan_redistribute_action(
+                                                    &pid_redistribute,
                                                     window,
                                                     cx,
                                                 );

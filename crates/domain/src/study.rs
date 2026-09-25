@@ -3,9 +3,9 @@
 //! 提供计划实体、日历排期计算、多科目聚合今日任务、任务打卡与统计、一键顺延等功能。
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use crate::plan::PlanOut;
+use crate::plan::{build_plan, EpisodeItem, Mode, PlanOut};
 use crate::source::SourceKind;
 
 pub use crate::model::{
@@ -998,6 +998,164 @@ pub fn reschedule_unfinished_plan(
     plan.schedules = rebuilt;
     refresh_plan_schedule_summary(plan);
     Ok(true)
+}
+
+/// 从当前日期（未开始的计划从原起始日期）到目标结束日期，按剩余观看时长
+/// 重新切分视频，使每个学习日的未完成时长相差不超过一秒。先合并同一视频
+/// 的旧切片，再使用唯一的计划算法重新切片，避免同日重复的续看标志。
+/// 已完成任务保留原日期、时长、ID 和打卡状态。
+pub fn redistribute_unfinished_plan(
+    plan: &mut StudyPlan,
+    current_date_str: &str,
+    target_end_date_str: &str,
+) -> Result<bool, String> {
+    let current = validate_date(current_date_str)?;
+    let target_end = validate_date(target_end_date_str)?;
+    let plan_start = validate_date(&plan.start_date)?;
+    let start = current.max(plan_start);
+    if target_end < start {
+        return Err("结束日期不能早于剩余任务的开始日期。".to_string());
+    }
+    if plan.skip_weekends && is_weekend(target_end) {
+        return Err("该计划跳过周末，请选择工作日作为结束日期。".to_string());
+    }
+    if target_end.signed_duration_since(start).num_days() > 36_525 {
+        return Err("结束日期距离开始日期不能超过 100 年。".to_string());
+    }
+
+    // 先验证旧数据，避免在错误日期或无效目标下部分改写计划。
+    for schedule in &plan.schedules {
+        let date = validate_date(&schedule.date)?;
+        if date > target_end && schedule.tasks.iter().any(|task| task.completed) {
+            return Err("目标结束日期早于已完成任务日期，不能移动已完成记录。".to_string());
+        }
+    }
+    let mut learning_dates = Vec::new();
+    let mut day = start;
+    while day <= target_end {
+        if !plan.skip_weekends || !is_weekend(day) {
+            learning_dates.push(format_date(day));
+        }
+        if day == target_end {
+            break;
+        }
+        day = day
+            .succ_opt()
+            .ok_or_else(|| "目标日期超出支持范围。".to_string())?;
+    }
+    if learning_dates.is_empty() {
+        return Err("所选日期范围没有可安排任务的学习日。".to_string());
+    }
+
+    struct RemainingVideo {
+        title: String,
+        duration: i64,
+        old_tasks: VecDeque<TaskItem>,
+        continued_before: bool,
+        first_output: bool,
+    }
+
+    let previous = plan.clone();
+    let completed_video_ids: HashSet<i64> = plan
+        .schedules
+        .iter()
+        .flat_map(|schedule| &schedule.tasks)
+        .filter(|task| task.completed)
+        .map(|task| task.vid_no)
+        .collect();
+    let mut original = plan.schedules.clone();
+    original.sort_by(|a, b| a.date.cmp(&b.date));
+    let mut videos: BTreeMap<i64, RemainingVideo> = BTreeMap::new();
+    let mut by_date: BTreeMap<String, Vec<TaskItem>> = BTreeMap::new();
+    for schedule in original {
+        for task in schedule.tasks {
+            if task.completed {
+                by_date.entry(schedule.date.clone()).or_default().push(task);
+                continue;
+            }
+            if task.portion <= 0 {
+                return Err("计划含有非正数任务时长，无法重新分配。".to_string());
+            }
+            let video = videos.entry(task.vid_no).or_insert_with(|| RemainingVideo {
+                title: task.title.clone(),
+                duration: 0,
+                old_tasks: VecDeque::new(),
+                continued_before: completed_video_ids.contains(&task.vid_no) || task.from_prev,
+                first_output: true,
+            });
+            if video.title != task.title {
+                return Err("同一视频的切片标题不一致，无法安全重新分配。".to_string());
+            }
+            video.duration = video
+                .duration
+                .checked_add(task.portion)
+                .ok_or_else(|| "剩余时长过大，无法重新分配。".to_string())?;
+            video.old_tasks.push_back(task);
+        }
+    }
+    if videos.is_empty() {
+        return Ok(false);
+    }
+    let remaining_total = videos.values().try_fold(0_i64, |sum, video| {
+        sum.checked_add(video.duration)
+            .ok_or_else(|| "剩余时长过大，无法重新分配。".to_string())
+    })?;
+    if remaining_total < learning_dates.len() as i64 {
+        return Err("剩余时长不足以给每个学习日安排至少一秒，请缩短日期范围。".to_string());
+    }
+    let mut videos: Vec<(i64, RemainingVideo)> = videos.into_iter().collect();
+    let episodes: Vec<EpisodeItem> = videos
+        .iter()
+        .map(|(_, video)| EpisodeItem {
+            title: video.title.clone(),
+            duration: video.duration,
+        })
+        .collect();
+    let rebuilt = build_plan(&episodes, learning_dates.len() as i64, Mode::Split)?;
+
+    for (_, video) in &videos {
+        for task in &video.old_tasks {
+            crate::schedule_recovery::detach_task(plan, &task.id);
+        }
+    }
+    for (day_index, entries) in rebuilt.plan.into_iter().enumerate() {
+        for (item_index, entry) in entries.into_iter().enumerate() {
+            let (vid_no, video) = &mut videos[entry.vid_no as usize - 1];
+            let mut task = video.old_tasks.pop_front().unwrap_or_else(|| {
+                calendar_task_item(
+                    &plan.id,
+                    day_index,
+                    item_index,
+                    *vid_no,
+                    &video.title,
+                    entry.portion,
+                )
+            });
+            task.portion = entry.portion;
+            task.from_prev = entry.from_prev || (video.first_output && video.continued_before);
+            task.remainder = entry.remainder;
+            task.completed = false;
+            task.completed_at = None;
+            task.advanced_from_date = None;
+            task.advance_restored = false;
+            video.first_output = false;
+            by_date
+                .entry(learning_dates[day_index].clone())
+                .or_default()
+                .push(task);
+        }
+    }
+    plan.schedules = by_date
+        .into_iter()
+        .map(|(date, tasks)| DailySchedule {
+            day_index: 0,
+            date,
+            tasks,
+            is_rest_day: false,
+        })
+        .collect();
+    refresh_plan_schedule_summary(plan);
+    Ok(*plan != previous)
 }
 
 /// 将指定未来日期中已打卡的任务条目移动到今天。

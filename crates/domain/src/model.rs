@@ -54,9 +54,9 @@ pub struct TaskItem {
     pub title: String,
     /// 当日需学习时长（秒）
     pub portion: i64,
-    /// 是否接上一日
+    /// 是否接续同一视频的前一个切片（改期后未必在前一天）
     pub from_prev: bool,
-    /// 剩余顺延时长（秒）
+    /// 当前切片之后该视频的剩余时长（秒）
     pub remainder: i64,
     /// 是否已完成打卡
     pub completed: bool,

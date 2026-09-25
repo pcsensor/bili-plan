@@ -473,7 +473,7 @@ impl PlannerApp {
                                                             .px_1p5()
                                                             .py_0p5()
                                                             .bg(theme.accent.opacity(0.2))
-                                                            .child("接上一日")
+                                                            .child("接续前段")
                                                     }))
                                                     .children((task.remainder > 0).then(|| {
                                                         div()
@@ -481,7 +481,7 @@ impl PlannerApp {
                                                             .px_1p5()
                                                             .py_0p5()
                                                             .bg(theme.primary.opacity(0.2))
-                                                            .child("顺延至次日")
+                                                            .child("后续仍有")
                                                     })),
                                             )
                                             .child(
@@ -505,7 +505,7 @@ impl PlannerApp {
                                                             .text_size(px(11.5))
                                                             .text_color(theme.muted_foreground)
                                                             .child(format!(
-                                                                "剩余顺延：{}",
+                                                                "此视频剩余：{}",
                                                                 fmt_seconds(
                                                                     task.remainder as f64,
                                                                     true

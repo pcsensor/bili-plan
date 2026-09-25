@@ -507,6 +507,228 @@ fn reschedule_unfinished_plan_is_noop_without_a_new_start_or_open_tasks() {
 }
 
 #[test]
+fn redistribute_unfinished_plan_balances_duration_and_preserves_completed_history() {
+    let mut plan = create_custom_study_plan("课程", "2026-09-01", 7, 30, false).unwrap();
+    let original = plan.clone();
+    plan.schedules[0].tasks[0].completed = true;
+    plan.schedules[0].tasks[0].completed_at = Some(100);
+    let ids: std::collections::HashSet<_> = plan
+        .schedules
+        .iter()
+        .flat_map(|s| &s.tasks)
+        .map(|t| t.id.clone())
+        .collect();
+
+    assert!(redistribute_unfinished_plan(&mut plan, "2026-09-02", "2026-09-04").unwrap());
+    let counts: Vec<_> = ["2026-09-02", "2026-09-03", "2026-09-04"]
+        .iter()
+        .map(|date| {
+            plan.schedules
+                .iter()
+                .find(|s| s.date == *date)
+                .unwrap()
+                .tasks
+                .iter()
+                .filter(|t| !t.completed)
+                .count()
+        })
+        .collect();
+    assert_eq!(counts, [2, 2, 2]);
+    assert_eq!(plan.schedules[0].date, "2026-09-01");
+    assert_eq!(plan.schedules[0].tasks[0].completed_at, Some(100));
+    assert_eq!(plan.end_date, "2026-09-04");
+    assert_eq!(plan.total_duration, original.total_duration);
+    assert_eq!(
+        plan.schedules
+            .iter()
+            .flat_map(|s| &s.tasks)
+            .map(|t| t.id.clone())
+            .collect::<std::collections::HashSet<_>>(),
+        ids
+    );
+    assert!(!redistribute_unfinished_plan(&mut plan, "2026-09-02", "2026-09-04").unwrap());
+}
+
+#[test]
+fn redistribute_unfinished_video_slices_repairs_duplicate_day_and_balances_duration() {
+    let mut plan = create_study_plan(
+        "高数",
+        "bilibili",
+        "BV123",
+        "全集",
+        &mock_plan_out(),
+        "2026-09-01",
+        false,
+    )
+    .unwrap();
+    // 模拟旧版按任务条数重排后，视频 2 的两个切片落在同一天。
+    let moved_slice = plan.schedules[1].tasks.remove(0);
+    plan.schedules[0].tasks.push(moved_slice);
+    let original_total: i64 = plan
+        .schedules
+        .iter()
+        .flat_map(|s| &s.tasks)
+        .map(|t| t.portion)
+        .sum();
+    redistribute_unfinished_plan(&mut plan, "2026-09-01", "2026-09-04").unwrap();
+    let daily: Vec<_> = plan
+        .schedules
+        .iter()
+        .map(|s| s.tasks.iter().map(|t| t.portion).sum::<i64>())
+        .collect();
+    assert_eq!(daily, [500, 500, 500, 500]);
+    for schedule in &plan.schedules {
+        let video_ids: std::collections::HashSet<_> =
+            schedule.tasks.iter().map(|task| task.vid_no).collect();
+        assert_eq!(video_ids.len(), schedule.tasks.len());
+    }
+    let mut portions_by_video = std::collections::BTreeMap::new();
+    for task in plan.schedules.iter().flat_map(|s| &s.tasks) {
+        *portions_by_video.entry(task.vid_no).or_insert(0) += task.portion;
+    }
+    assert_eq!(portions_by_video, [(1, 600), (2, 600), (3, 800)].into());
+    assert_eq!(daily.iter().sum::<i64>(), original_total);
+    assert_eq!(plan.end_date, "2026-09-04");
+    let repaired = plan.clone();
+    assert!(!redistribute_unfinished_plan(&mut plan, "2026-09-01", "2026-09-04").unwrap());
+    assert_eq!(plan, repaired);
+}
+
+#[test]
+fn redistribute_unfinished_video_keeps_completed_slice_and_continuation() {
+    let mut plan = create_study_plan(
+        "高数",
+        "bilibili",
+        "BV123",
+        "全集",
+        &mock_plan_out(),
+        "2026-09-01",
+        false,
+    )
+    .unwrap();
+    let completed_id = plan.schedules[0].tasks[1].id.clone();
+    plan.schedules[0].tasks[1].completed = true;
+    plan.schedules[0].tasks[1].completed_at = Some(100);
+    redistribute_unfinished_plan(&mut plan, "2026-09-01", "2026-09-04").unwrap();
+    let completed = plan
+        .schedules
+        .iter()
+        .flat_map(|s| &s.tasks)
+        .find(|t| t.id == completed_id)
+        .unwrap();
+    assert!(completed.completed);
+    assert_eq!(completed.portion, 400);
+    assert_eq!(completed.completed_at, Some(100));
+    for date in ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"] {
+        let unfinished_seconds: i64 = plan
+            .schedules
+            .iter()
+            .find(|s| s.date == date)
+            .unwrap()
+            .tasks
+            .iter()
+            .filter(|t| !t.completed)
+            .map(|t| t.portion)
+            .sum();
+        assert_eq!(unfinished_seconds, 400);
+    }
+    let open_video_two: Vec<_> = plan
+        .schedules
+        .iter()
+        .flat_map(|s| &s.tasks)
+        .filter(|t| t.vid_no == 2 && !t.completed)
+        .collect();
+    assert_eq!(open_video_two.len(), 1);
+    assert_eq!(open_video_two[0].portion, 200);
+    assert!(open_video_two[0].from_prev);
+}
+
+#[test]
+fn redistribute_unfinished_rejects_more_days_than_remaining_seconds() {
+    let mut plan = create_custom_study_plan("课程", "2026-09-01", 1, 1, false).unwrap();
+    let before = plan.clone();
+    assert!(redistribute_unfinished_plan(&mut plan, "2026-09-01", "2026-11-01").is_err());
+    assert_eq!(plan, before);
+}
+
+#[test]
+fn redistribute_unfinished_plan_fills_weekdays_even_with_few_original_tasks() {
+    let mut plan = create_custom_study_plan("课程", "2026-09-04", 2, 30, true).unwrap();
+    assert!(redistribute_unfinished_plan(&mut plan, "2026-09-04", "2026-09-10").unwrap());
+    let dates: Vec<_> = plan
+        .schedules
+        .iter()
+        .filter(|s| !s.tasks.is_empty())
+        .map(|s| s.date.as_str())
+        .collect();
+    assert_eq!(
+        dates,
+        [
+            "2026-09-04",
+            "2026-09-07",
+            "2026-09-08",
+            "2026-09-09",
+            "2026-09-10"
+        ]
+    );
+    for schedule in plan.schedules.iter().filter(|s| !s.tasks.is_empty()) {
+        assert_eq!(schedule.tasks.iter().map(|t| t.portion).sum::<i64>(), 720);
+    }
+    assert_eq!(plan.end_date, "2026-09-10");
+    let before = plan.clone();
+    assert!(redistribute_unfinished_plan(&mut plan, "bad", "2026-09-11").is_err());
+    assert!(redistribute_unfinished_plan(&mut plan, "2026-09-04", "2026-09-05").is_err());
+    assert!(redistribute_unfinished_plan(&mut plan, "2026-09-11", "2026-09-10").is_err());
+    assert_eq!(plan, before);
+}
+
+#[test]
+fn redistribute_unfinished_plan_detaches_old_advance_history() {
+    let mut plan = create_custom_study_plan("课程", "2026-09-01", 3, 30, false).unwrap();
+    let second_id = plan.schedules[1].tasks[0].id.clone();
+    plan.schedules[1].tasks[0].advanced_from_date = Some("2026-09-02".to_string());
+    plan.advance_shifts
+        .push(crate::schedule_recovery::ScheduleShift {
+            trigger_task_ids: vec![second_id.clone()],
+            moves: vec![crate::schedule_recovery::TaskDateMove {
+                task_id: second_id.clone(),
+                from: "2026-09-03".to_string(),
+                to: "2026-09-02".to_string(),
+            }],
+            date_slots: vec![("2026-09-03".to_string(), "2026-09-02".to_string())],
+        });
+
+    redistribute_unfinished_plan(&mut plan, "2026-09-01", "2026-09-05").unwrap();
+    assert!(plan.advance_shifts.is_empty());
+    assert!(plan
+        .schedules
+        .iter()
+        .flat_map(|s| &s.tasks)
+        .all(|t| t.advanced_from_date.is_none()));
+    assert_eq!(
+        plan.schedules
+            .iter()
+            .flat_map(|s| &s.tasks)
+            .map(|t| t.portion)
+            .sum::<i64>(),
+        3 * 30 * 60
+    );
+    assert_eq!(plan.end_date, "2026-09-05");
+}
+
+#[test]
+fn redistribute_unfinished_plan_respects_future_start_and_completed_deadline() {
+    let mut plan = create_custom_study_plan("课程", "2026-09-10", 2, 30, false).unwrap();
+    redistribute_unfinished_plan(&mut plan, "2026-09-01", "2026-09-12").unwrap();
+    assert_eq!(plan.start_date, "2026-09-10");
+    assert_eq!(plan.end_date, "2026-09-12");
+    plan.schedules.last_mut().unwrap().tasks[0].completed = true;
+    let before = plan.clone();
+    assert!(redistribute_unfinished_plan(&mut plan, "2026-09-01", "2026-09-11").is_err());
+    assert_eq!(plan, before);
+}
+
+#[test]
 fn multi_plan_superposition_and_stats_test() {
     let plan_out = mock_plan_out();
     let plan1 = create_study_plan(

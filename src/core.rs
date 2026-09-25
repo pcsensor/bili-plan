@@ -648,6 +648,27 @@ pub fn reschedule_unfinished_study_plan(
     Ok(changed)
 }
 
+/// 按新的结束日期重排剩余任务；本地写入成功后才更新实时配置。
+pub fn redistribute_unfinished_study_plan(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    current_date: &str,
+    target_end_date: &str,
+) -> Result<bool, String> {
+    let mut next = cfg.clone();
+    let plan = next
+        .plans
+        .iter_mut()
+        .find(|plan| plan.id == plan_id)
+        .ok_or_else(|| "未找到指定计划".to_string())?;
+    let changed = study::redistribute_unfinished_plan(plan, current_date, target_end_date)?;
+    if changed {
+        try_save_config(&next)?;
+        *cfg = next;
+    }
+    Ok(changed)
+}
+
 /// 将某个未来日期已经打卡的任务划归今天，并按整日/部分完成规则更新后续排期。
 pub fn advance_completed_study_tasks(
     cfg: &mut AppConfig,

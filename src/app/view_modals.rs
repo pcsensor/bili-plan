@@ -4,6 +4,7 @@ impl PlannerApp {
     /// 计划库中整体调整未完成任务日期的弹窗。
     pub(super) fn render_plan_reschedule_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
+        let redistribute = self.plan_reschedule_mode == PlanRescheduleMode::RedistributeToEnd;
         let plan = self
             .plan_reschedule_plan_id
             .as_deref()
@@ -77,7 +78,11 @@ impl PlannerApp {
                                         div()
                                             .text_size(px(16.))
                                             .font_weight(FontWeight::BOLD)
-                                            .child(format!("调整《{plan_title}》未完成排期")),
+                                            .child(if redistribute {
+                                                format!("调整《{plan_title}》结束日期")
+                                            } else {
+                                                format!("调整《{plan_title}》未完成排期")
+                                            }),
                                     ),
                             )
                             .child(
@@ -110,7 +115,11 @@ impl PlannerApp {
                         v_flex()
                             .gap_1()
                             .child(Self::field_label(
-                                "新的未完成任务起始日期",
+                                if redistribute {
+                                    "新的结束日期"
+                                } else {
+                                    "新的未完成任务起始日期"
+                                },
                                 "YYYY-MM-DD",
                                 cx,
                             ))
@@ -124,7 +133,11 @@ impl PlannerApp {
                             .border_color(theme.border)
                             .bg(theme.primary.opacity(0.08))
                             .child(
-                                "所有未完成日期批次会整体平移相同的自然日数，批次间隔和手动周末安排保持不变；已完成任务及其打卡日期不会移动。",
+                                if redistribute {
+                                    "从今天（尚未开始的计划从原起始日）到新结束日，按剩余时长重新切分视频，让每天的未完成时长尽量相同。遵守跳过周末设置，已完成记录不移动。"
+                                } else {
+                                    "所有未完成日期批次会整体平移相同的自然日数，批次间隔和手动周末安排保持不变；已完成任务及其打卡日期不会移动。"
+                                },
                             ),
                     )
                     .child(

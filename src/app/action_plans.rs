@@ -319,6 +319,25 @@ impl PlannerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_plan_schedule_modal(plan_id, PlanRescheduleMode::ShiftStart, window, cx);
+    }
+
+    pub(super) fn open_plan_redistribute_action(
+        &mut self,
+        plan_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_plan_schedule_modal(plan_id, PlanRescheduleMode::RedistributeToEnd, window, cx);
+    }
+
+    fn open_plan_schedule_modal(
+        &mut self,
+        plan_id: &str,
+        mode: PlanRescheduleMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(plan) = self.config.plans.iter().find(|plan| plan.id == plan_id) else {
             window.push_notification(Notification::error("未找到指定计划"), cx);
             return;
@@ -333,10 +352,14 @@ impl PlannerApp {
             window.push_notification(Notification::info("该计划没有未完成任务。"), cx);
             return;
         };
-        self.plan_reschedule_date_input.update(cx, |state, cx| {
-            state.set_value(current_start.to_string(), window, cx)
-        });
+        let initial_date = match mode {
+            PlanRescheduleMode::ShiftStart => current_start.to_string(),
+            PlanRescheduleMode::RedistributeToEnd => plan.end_date.clone(),
+        };
+        self.plan_reschedule_date_input
+            .update(cx, |state, cx| state.set_value(initial_date, window, cx));
         self.plan_reschedule_plan_id = Some(plan_id.to_string());
+        self.plan_reschedule_mode = mode;
         self.plan_reschedule_modal_open = true;
         cx.notify();
     }
@@ -352,6 +375,39 @@ impl PlannerApp {
             cx.notify();
             return;
         };
+        if self.plan_reschedule_mode == PlanRescheduleMode::RedistributeToEnd {
+            let target_end = self.input_value(&self.plan_reschedule_date_input, cx);
+            let plan_title = self
+                .config
+                .plans
+                .iter()
+                .find(|plan| plan.id == plan_id)
+                .map(|plan| plan.title.clone())
+                .unwrap_or_else(|| "计划".to_string());
+            match redistribute_unfinished_study_plan(
+                &mut self.config,
+                &plan_id,
+                &today_date_str(),
+                target_end.trim(),
+            ) {
+                Ok(true) => {
+                    self.plan_reschedule_modal_open = false;
+                    self.plan_reschedule_plan_id = None;
+                    window.push_notification(
+                        Notification::success(format!(
+                            "已将《{plan_title}》按剩余时长重排至 {}，已完成记录保持原日期。",
+                            target_end.trim()
+                        )),
+                        cx,
+                    );
+                    self.trigger_auto_sync(window, cx);
+                }
+                Ok(false) => window.push_notification(Notification::info("排期未发生变化。"), cx),
+                Err(error) => window.push_notification(Notification::error(error), cx),
+            }
+            cx.notify();
+            return;
+        }
         let target_start = self.input_value(&self.plan_reschedule_date_input, cx);
         let (plan_title, current_start) = self
             .config
