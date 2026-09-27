@@ -312,7 +312,7 @@ impl PlannerApp {
         cx.notify();
     }
 
-    /// 打开整门计划的未完成任务改期弹窗，并用当前最早未完成日期预填。
+    /// 打开未完成任务重排弹窗，预填当前最早未完成日期。
     pub(super) fn open_plan_reschedule_action(
         &mut self,
         plan_id: &str,
@@ -409,45 +409,28 @@ impl PlannerApp {
             return;
         }
         let target_start = self.input_value(&self.plan_reschedule_date_input, cx);
-        let (plan_title, current_start) = self
+        let (plan_title, fixed_end) = self
             .config
             .plans
             .iter()
             .find(|plan| plan.id == plan_id)
-            .map(|plan| {
-                let start = plan
-                    .schedules
-                    .iter()
-                    .filter(|schedule| schedule.tasks.iter().any(|task| !task.completed))
-                    .map(|schedule| schedule.date.clone())
-                    .min()
-                    .unwrap_or_default();
-                (plan.title.clone(), start)
-            })
+            .map(|plan| (plan.title.clone(), plan.end_date.clone()))
             .unwrap_or_else(|| ("计划".to_string(), String::new()));
 
         match reschedule_unfinished_study_plan(&mut self.config, &plan_id, target_start.trim()) {
             Ok(true) => {
-                let direction = if target_start.trim() < current_start.as_str() {
-                    "前移"
-                } else {
-                    "后移"
-                };
                 self.plan_reschedule_modal_open = false;
                 self.plan_reschedule_plan_id = None;
                 window.push_notification(
                     Notification::success(format!(
-                        "已将《{plan_title}》未完成任务整体{direction}，最早任务从 {} 开始；已完成记录保持原日期。",
-                        target_start.trim()
+                        "已将《{plan_title}》剩余时长从 {} 均分至 {fixed_end}；已完成任务不参与重排。",
+                        target_start.trim(),
                     )),
                     cx,
                 );
                 self.trigger_auto_sync(window, cx);
             }
-            Ok(false) => window.push_notification(
-                Notification::info("目标日期未变化，或该计划已没有未完成任务。"),
-                cx,
-            ),
+            Ok(false) => window.push_notification(Notification::info("排期未发生变化。"), cx),
             Err(error) => window.push_notification(Notification::error(error), cx),
         }
         cx.notify();

@@ -630,22 +630,15 @@ pub fn push_forward_study_plan(
     Ok(changed)
 }
 
-/// 整体调整指定计划中所有未完成任务的日期，并持久化。
+/// 固定计划结束日期，从新起点重新分配未完成时长。
 pub fn reschedule_unfinished_study_plan(
     cfg: &mut AppConfig,
     plan_id: &str,
     target_start_date: &str,
 ) -> Result<bool, String> {
-    let plan = cfg
-        .plans
-        .iter_mut()
-        .find(|plan| plan.id == plan_id)
-        .ok_or_else(|| "未找到指定计划".to_string())?;
-    let changed = study::reschedule_unfinished_plan(plan, target_start_date)?;
-    if changed {
-        save_config(cfg);
-    }
-    Ok(changed)
+    save_plan_change(cfg, plan_id, |plan| {
+        study::reschedule_unfinished_plan(plan, target_start_date)
+    })
 }
 
 /// 按新的结束日期重排剩余任务；本地写入成功后才更新实时配置。
@@ -655,13 +648,23 @@ pub fn redistribute_unfinished_study_plan(
     current_date: &str,
     target_end_date: &str,
 ) -> Result<bool, String> {
+    save_plan_change(cfg, plan_id, |plan| {
+        study::redistribute_unfinished_plan(plan, current_date, target_end_date)
+    })
+}
+
+fn save_plan_change(
+    cfg: &mut AppConfig,
+    plan_id: &str,
+    change: impl FnOnce(&mut StudyPlan) -> Result<bool, String>,
+) -> Result<bool, String> {
     let mut next = cfg.clone();
     let plan = next
         .plans
         .iter_mut()
         .find(|plan| plan.id == plan_id)
         .ok_or_else(|| "未找到指定计划".to_string())?;
-    let changed = study::redistribute_unfinished_plan(plan, current_date, target_end_date)?;
+    let changed = change(plan)?;
     if changed {
         try_save_config(&next)?;
         *cfg = next;

@@ -382,7 +382,7 @@ fn push_forward_plan_test() {
 }
 
 #[test]
-fn reschedule_unfinished_plan_moves_only_open_tasks_and_keeps_batches() {
+fn reschedule_unfinished_plan_keeps_end_and_excludes_completed_today() {
     let mut plan = create_study_plan(
         "高数",
         "bilibili",
@@ -397,45 +397,57 @@ fn reschedule_unfinished_plan_moves_only_open_tasks_and_keeps_batches() {
     plan.schedules[0].tasks[0].completed = true;
     plan.schedules[0].tasks[0].completed_at = Some(100);
 
-    assert!(reschedule_unfinished_plan(&mut plan, "2026-09-05").unwrap());
+    // 即使起始日期没有变化，打卡后也必须按剩余时长重算，而不能直接返回 no-op。
+    assert!(reschedule_unfinished_plan(&mut plan, "2026-09-01").unwrap());
     let completed_day = plan
         .schedules
         .iter()
         .find(|schedule| schedule.date == "2026-09-01")
         .unwrap();
-    assert_eq!(completed_day.tasks.len(), 1);
     assert_eq!(completed_day.tasks[0].id, completed_id);
     assert!(completed_day.tasks[0].completed);
-    assert_eq!(
-        plan.schedules
+    assert_eq!(completed_day.tasks[0].completed_at, Some(100));
+    for date in ["2026-09-01", "2026-09-02"] {
+        let unfinished_seconds: i64 = plan
+            .schedules
             .iter()
-            .find(|schedule| schedule.date == "2026-09-05")
+            .find(|schedule| schedule.date == date)
             .unwrap()
             .tasks
-            .len(),
-        1
-    );
+            .iter()
+            .filter(|task| !task.completed)
+            .map(|task| task.portion)
+            .sum();
+        assert_eq!(unfinished_seconds, 700);
+    }
+    assert_eq!(plan.total_duration, 2000);
+    assert_eq!(plan.end_date, "2026-09-02");
+
+    assert!(reschedule_unfinished_plan(&mut plan, "2026-09-02").unwrap());
+    let completed = plan
+        .schedules
+        .iter()
+        .flat_map(|schedule| &schedule.tasks)
+        .find(|task| task.id == completed_id)
+        .unwrap();
+    assert_eq!(completed.completed_at, Some(100));
     assert_eq!(
         plan.schedules
             .iter()
-            .find(|schedule| schedule.date == "2026-09-06")
+            .find(|schedule| schedule.date == "2026-09-02")
             .unwrap()
             .tasks
-            .len(),
-        2
-    );
-    assert_eq!(
-        plan.schedules
             .iter()
-            .flat_map(|schedule| &schedule.tasks)
-            .count(),
-        4
+            .filter(|task| !task.completed)
+            .map(|task| task.portion)
+            .sum::<i64>(),
+        1400
     );
-    assert_eq!(plan.end_date, "2026-09-06");
+    assert_eq!(plan.end_date, "2026-09-02");
 }
 
 #[test]
-fn reschedule_unfinished_plan_can_move_backward_and_detaches_old_restore_history() {
+fn reschedule_unfinished_plan_can_start_earlier_and_detaches_old_restore_history() {
     let mut plan = create_study_plan(
         "高数",
         "bilibili",
@@ -464,10 +476,7 @@ fn reschedule_unfinished_plan_can_move_backward_and_detaches_old_restore_history
     let moved = plan
         .schedules
         .iter()
-        .find(|schedule| schedule.date == "2026-08-30")
-        .unwrap()
-        .tasks
-        .iter()
+        .flat_map(|schedule| &schedule.tasks)
         .find(|task| task.id == unfinished_id)
         .unwrap();
     assert!(moved.advanced_from_date.is_none());
@@ -476,10 +485,20 @@ fn reschedule_unfinished_plan_can_move_backward_and_detaches_old_restore_history
     assert!(plan.schedules.iter().any(|schedule| {
         schedule.date == "2026-09-01" && schedule.tasks.iter().any(|task| task.completed)
     }));
-    assert!(plan
-        .schedules
-        .iter()
-        .any(|schedule| schedule.date == "2026-08-31"));
+    for date in ["2026-08-30", "2026-08-31", "2026-09-01", "2026-09-02"] {
+        let seconds: i64 = plan
+            .schedules
+            .iter()
+            .find(|schedule| schedule.date == date)
+            .unwrap()
+            .tasks
+            .iter()
+            .filter(|task| !task.completed)
+            .map(|task| task.portion)
+            .sum();
+        assert_eq!(seconds, 350);
+    }
+    assert_eq!(plan.end_date, "2026-09-02");
 }
 
 #[test]
@@ -495,6 +514,9 @@ fn reschedule_unfinished_plan_is_noop_without_a_new_start_or_open_tasks() {
     )
     .unwrap();
     assert!(!reschedule_unfinished_plan(&mut plan, "2026-09-01").unwrap());
+    let before = plan.clone();
+    assert!(reschedule_unfinished_plan(&mut plan, "2026-09-03").is_err());
+    assert_eq!(plan, before);
     for task in plan
         .schedules
         .iter_mut()
@@ -504,6 +526,55 @@ fn reschedule_unfinished_plan_is_noop_without_a_new_start_or_open_tasks() {
     }
     assert!(!reschedule_unfinished_plan(&mut plan, "2026-09-10").unwrap());
     assert!(reschedule_unfinished_plan(&mut plan, "not-a-date").is_err());
+}
+
+#[test]
+fn reschedule_unfinished_plan_uses_learning_days_and_keeps_completed_friday() {
+    let mut plan = create_custom_study_plan("课程", "2026-09-04", 5, 30, true).unwrap();
+    let completed_id = plan.schedules[0].tasks[0].id.clone();
+    plan.schedules[0].tasks[0].completed = true;
+    plan.schedules[0].tasks[0].completed_at = Some(100);
+    plan.schedules
+        .iter_mut()
+        .find(|schedule| schedule.date == "2026-09-07")
+        .unwrap()
+        .tasks[0]
+        .portion = 2400;
+    plan.schedules
+        .iter_mut()
+        .find(|schedule| schedule.date == "2026-09-08")
+        .unwrap()
+        .tasks[0]
+        .portion = 1200;
+    assert!(reschedule_unfinished_plan(&mut plan, "2026-09-05").unwrap());
+    assert_eq!(plan.end_date, "2026-09-10");
+    let completed = plan
+        .schedules
+        .iter()
+        .flat_map(|schedule| &schedule.tasks)
+        .find(|task| task.id == completed_id)
+        .unwrap();
+    assert_eq!(completed.completed_at, Some(100));
+    for date in ["2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10"] {
+        let day = plan
+            .schedules
+            .iter()
+            .find(|schedule| schedule.date == date)
+            .unwrap();
+        assert_eq!(
+            day.tasks
+                .iter()
+                .filter(|task| !task.completed)
+                .map(|task| task.portion)
+                .sum::<i64>(),
+            1800
+        );
+    }
+    assert!(plan
+        .schedules
+        .iter()
+        .find(|schedule| schedule.date == "2026-09-05")
+        .is_some_and(|schedule| schedule.tasks.is_empty()));
 }
 
 #[test]

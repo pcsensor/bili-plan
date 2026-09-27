@@ -923,81 +923,15 @@ pub fn push_forward_plan(plan: &mut StudyPlan, destination_date_str: &str) -> Re
     Ok(true)
 }
 
-/// 将计划中所有未完成任务整体平移，使最早的未完成任务从 `target_start_date` 开始。
-///
-/// 每个未完成日期批次使用相同的自然日偏移量，因此原有批次间隔、手动周末安排与任务顺序
-/// 都会保留；已完成任务始终留在原日期。整体改期属于新的显式安排，会清除这些未完成任务
-/// 之前由“一键提前”产生的归位信号，避免以后撤销旧操作时覆盖新排期。
+/// 锁定计划当前结束日期，从指定开始日期重新均分全部未完成时长。
+/// 已完成的任务不参与计算，也不会移动。
 pub fn reschedule_unfinished_plan(
     plan: &mut StudyPlan,
     target_start_date: &str,
 ) -> Result<bool, String> {
     let target_start = validate_date(target_start_date)?;
-    let Some(current_start_text) = plan
-        .schedules
-        .iter()
-        .filter(|schedule| schedule.tasks.iter().any(|task| !task.completed))
-        .map(|schedule| schedule.date.as_str())
-        .min()
-    else {
-        return Ok(false);
-    };
-    let current_start = validate_date(current_start_text)?;
-    let offset_days = target_start.signed_duration_since(current_start).num_days();
-    if offset_days == 0 {
-        return Ok(false);
-    }
-
-    let unfinished_ids: Vec<String> = plan
-        .schedules
-        .iter()
-        .flat_map(|schedule| &schedule.tasks)
-        .filter(|task| !task.completed)
-        .map(|task| task.id.clone())
-        .collect();
-    for task_id in &unfinished_ids {
-        crate::schedule_recovery::detach_task(plan, task_id);
-    }
-
-    let mut rebuilt = Vec::new();
-    for schedule in std::mem::take(&mut plan.schedules) {
-        let source_date = validate_date(&schedule.date)?;
-        let shifted_date = source_date
-            .checked_add_signed(Duration::days(offset_days))
-            .ok_or_else(|| "目标日期超出支持范围。".to_string())?;
-        let shifted_date = format_date(shifted_date);
-        let mut completed_tasks = Vec::new();
-        let mut unfinished_tasks = Vec::new();
-        for mut task in schedule.tasks {
-            if task.completed {
-                completed_tasks.push(task);
-            } else {
-                task.advanced_from_date = None;
-                task.advance_restored = false;
-                unfinished_tasks.push(task);
-            }
-        }
-        if !completed_tasks.is_empty() {
-            rebuilt.push(DailySchedule {
-                day_index: schedule.day_index,
-                date: schedule.date,
-                tasks: completed_tasks,
-                is_rest_day: false,
-            });
-        }
-        if !unfinished_tasks.is_empty() {
-            rebuilt.push(DailySchedule {
-                day_index: schedule.day_index,
-                date: shifted_date,
-                tasks: unfinished_tasks,
-                is_rest_day: false,
-            });
-        }
-    }
-
-    plan.schedules = rebuilt;
-    refresh_plan_schedule_summary(plan);
-    Ok(true)
+    let target_end = validate_date(&plan.end_date)?;
+    redistribute_unfinished_between(plan, target_start, target_end)
 }
 
 /// 从当前日期（未开始的计划从原起始日期）到目标结束日期，按剩余观看时长
@@ -1013,6 +947,21 @@ pub fn redistribute_unfinished_plan(
     let target_end = validate_date(target_end_date_str)?;
     let plan_start = validate_date(&plan.start_date)?;
     let start = current.max(plan_start);
+    redistribute_unfinished_between(plan, start, target_end)
+}
+
+fn redistribute_unfinished_between(
+    plan: &mut StudyPlan,
+    start: NaiveDate,
+    target_end: NaiveDate,
+) -> Result<bool, String> {
+    if !plan
+        .schedules
+        .iter()
+        .any(|schedule| schedule.tasks.iter().any(|task| !task.completed))
+    {
+        return Ok(false);
+    }
     if target_end < start {
         return Err("结束日期不能早于剩余任务的开始日期。".to_string());
     }

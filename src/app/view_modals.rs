@@ -21,6 +21,16 @@ impl PlannerApp {
                     .count()
             })
             .unwrap_or(0);
+        let unfinished_seconds: i64 = plan
+            .map(|plan| {
+                plan.schedules
+                    .iter()
+                    .flat_map(|schedule| &schedule.tasks)
+                    .filter(|task| !task.completed)
+                    .map(|task| task.portion)
+                    .sum()
+            })
+            .unwrap_or(0);
         let unfinished_dates: Vec<&str> = plan
             .map(|plan| {
                 plan.schedules
@@ -32,6 +42,7 @@ impl PlannerApp {
             .unwrap_or_default();
         let current_start = unfinished_dates.iter().copied().min().unwrap_or("-");
         let current_end = unfinished_dates.iter().copied().max().unwrap_or("-");
+        let fixed_end = plan.map(|plan| plan.end_date.as_str()).unwrap_or("-");
 
         div()
             .id("plan-reschedule-backdrop")
@@ -107,9 +118,17 @@ impl PlannerApp {
                         div()
                             .text_size(px(12.5))
                             .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "当前未完成排期：{current_start} 至 {current_end} · {unfinished_count} 项任务"
-                            )),
+                            .child(if redistribute {
+                                format!(
+                                    "当前未完成排期：{current_start} 至 {current_end} · {unfinished_count} 项 · {}",
+                                    fmt_seconds(unfinished_seconds as f64, true)
+                                )
+                            } else {
+                                format!(
+                                    "结束日期固定：{fixed_end} · 剩余 {unfinished_count} 项 · {}",
+                                    fmt_seconds(unfinished_seconds as f64, true)
+                                )
+                            }),
                     )
                     .child(
                         v_flex()
@@ -118,7 +137,7 @@ impl PlannerApp {
                                 if redistribute {
                                     "新的结束日期"
                                 } else {
-                                    "新的未完成任务起始日期"
+                                    "剩余任务的新开始日期"
                                 },
                                 "YYYY-MM-DD",
                                 cx,
@@ -136,7 +155,7 @@ impl PlannerApp {
                                 if redistribute {
                                     "从今天（尚未开始的计划从原起始日）到新结束日，按剩余时长重新切分视频，让每天的未完成时长尽量相同。遵守跳过周末设置，已完成记录不移动。"
                                 } else {
-                                    "所有未完成日期批次会整体平移相同的自然日数，批次间隔和手动周末安排保持不变；已完成任务及其打卡日期不会移动。"
+                                    "结束日期保持不变；只把未完成的视频部分从新开始日期起按剩余时长均分到学习日。跳过周末的计划仍只排工作日。已完成任务不计入均分，也不会移动。"
                                 },
                             ),
                     )
