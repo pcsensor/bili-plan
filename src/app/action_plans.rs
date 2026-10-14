@@ -163,10 +163,13 @@ impl PlannerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(e) = crate::study::checkin_entire_day(&mut self.config.plans, plan_id, date) {
+        let mut next = self.config.clone();
+        if let Err(e) = crate::study::checkin_entire_day(&mut next.plans, plan_id, date) {
             window.push_notification(Notification::error(e), cx);
+        } else if let Err(e) = try_save_config(&next) {
+            window.push_notification(Notification::error(format!("保存本地配置失败: {e}")), cx);
         } else {
-            save_config(&self.config);
+            self.config = next;
             window.push_notification(
                 Notification::success("🎉 今日该科目任务已全部完成打卡！"),
                 cx,
@@ -267,8 +270,10 @@ impl PlannerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        toggle_study_plan_status(&mut self.config, plan_id);
-        self.trigger_auto_sync(window, cx);
+        match toggle_study_plan_status(&mut self.config, plan_id) {
+            Ok(()) => self.trigger_auto_sync(window, cx),
+            Err(e) => window.push_notification(Notification::error(e), cx),
+        }
         cx.notify();
     }
 
@@ -279,9 +284,13 @@ impl PlannerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        remove_study_plan(&mut self.config, plan_id);
-        window.push_notification(Notification::info("已移除该学习计划"), cx);
-        self.trigger_auto_sync(window, cx);
+        match remove_study_plan(&mut self.config, plan_id) {
+            Ok(()) => {
+                window.push_notification(Notification::info("已移除该学习计划"), cx);
+                self.trigger_auto_sync(window, cx);
+            }
+            Err(e) => window.push_notification(Notification::error(e), cx),
+        }
         cx.notify();
     }
 

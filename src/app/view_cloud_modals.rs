@@ -167,6 +167,7 @@ impl PlannerApp {
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.cloud_settings_modal_open = false;
+                                        this.cloud_unbind_confirm = false;
                                         cx.notify();
                                     })),
                             ),
@@ -184,7 +185,7 @@ impl PlannerApp {
                                 div()
                                     .text_size(px(11.5))
                                     .text_color(theme.muted_foreground)
-                                    .child("测试连接会请求 <服务器地址>/api/health。切换到另一台服务器后需重新绑定机器人。"),
+                                    .child("测试连接会请求 <服务器地址>/api/health。清空地址并保存可关闭云同步；切换服务器需重新绑定机器人。"),
                             ),
                     )
                     .children(test_result.map(|(message, success)| {
@@ -206,6 +207,49 @@ impl PlannerApp {
                                 format!("⚠️ {message}")
                             })
                     }))
+                    .when(self.is_cloud_bound(), |this| {
+                        this.child(
+                            v_flex()
+                                .gap_2()
+                                .p_3()
+                                .border_1()
+                                .border_color(theme.danger.opacity(0.5))
+                                .bg(theme.danger.opacity(0.06))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("解除绑定"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted_foreground)
+                                        .child(
+                                            "删除云端设备与机器人绑定。本地计划不会被删除；云端同步数据将随设备一并清除。",
+                                        ),
+                                )
+                                .child(
+                                    h_flex().justify_end().child(
+                                        Button::new("unbind-cloud")
+                                            .ghost()
+                                            .label(if self.cloud_unbind_confirm {
+                                                "⚠️ 确认解除绑定？"
+                                            } else {
+                                                "解除绑定"
+                                            })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if this.cloud_unbind_confirm {
+                                                    this.delete_cloud_binding_action(window, cx);
+                                                } else {
+                                                    this.cloud_unbind_confirm = true;
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    ),
+                                ),
+                        )
+                    })
                     .child(
                         h_flex()
                             .justify_end()
@@ -215,6 +259,19 @@ impl PlannerApp {
                                     .label("取消")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.cloud_settings_modal_open = false;
+                                        this.cloud_unbind_confirm = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("clear-cloud-server")
+                                    .ghost()
+                                    .label("清空地址")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cloud_server_input.update(cx, |state, cx| {
+                                            state.set_value(String::new(), window, cx);
+                                        });
+                                        this.cloud_server_test_result = None;
                                         cx.notify();
                                     })),
                             )
@@ -242,6 +299,13 @@ impl PlannerApp {
                     ),
             )
             .into_any_element()
+    }
+
+    /// 是否已建立云端绑定（设备令牌或任一机器人）。
+    pub(super) fn is_cloud_bound(&self) -> bool {
+        self.config.sync_device_token.is_some()
+            || self.config.feishu_bound
+            || self.config.telegram_bound
     }
 
     /// 渲染云端同步结果弹窗。

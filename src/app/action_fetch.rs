@@ -31,12 +31,47 @@ impl PlannerApp {
             state.set_value(self.config.sync_server_url.clone(), window, cx)
         });
         self.cloud_server_test_result = None;
+        self.cloud_unbind_confirm = false;
         self.cloud_settings_modal_open = true;
         cx.notify();
     }
 
-    /// 保存云端地址。切换到另一台服务时，旧服务的设备绑定不再有效，必须重置。
+    /// 保存云端地址。留空保存可清除云端服务配置；切换到另一台服务时重置绑定。
     pub(super) fn save_cloud_server_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.input_value(&self.cloud_server_input, cx);
+        let trimmed = raw.trim().trim_end_matches('/').to_string();
+
+        if trimmed.is_empty() {
+            let had_server = !self.config.sync_server_url.trim().is_empty();
+            let was_bound = self.is_cloud_bound();
+            self.config.sync_server_url = String::new();
+            if had_server || was_bound {
+                clear_cloud_binding_state(&mut self.config);
+            }
+            match try_save_config(&self.config) {
+                Ok(()) => {
+                    self.cloud_settings_modal_open = false;
+                    self.cloud_unbind_confirm = false;
+                    window.push_notification(
+                        Notification::success(if had_server || was_bound {
+                            "已清除云端服务器地址。"
+                        } else {
+                            "云端服务器地址未配置。"
+                        }),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(format!("保存本地配置失败: {error}")),
+                        cx,
+                    );
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let server = match self.normalized_cloud_server_url(cx) {
             Ok(server) => server,
             Err(error) => {
@@ -47,23 +82,28 @@ impl PlannerApp {
         let changed = server != self.config.sync_server_url.trim_end_matches('/');
         self.config.sync_server_url = server.clone();
         if changed {
-            self.config.sync_device_token = None;
-            self.config.sync_revision = 0;
-            self.config.feishu_bound = false;
-            self.config.feishu_user_name = None;
-            self.config.telegram_bound = false;
-            self.config.telegram_user_name = None;
+            clear_cloud_binding_state(&mut self.config);
         }
-        save_config(&self.config);
-        self.cloud_settings_modal_open = false;
-        window.push_notification(
-            Notification::success(if changed {
-                format!("已保存云端地址 {server}；请重新绑定机器人。")
-            } else {
-                format!("已保存云端地址 {server}")
-            }),
-            cx,
-        );
+        match try_save_config(&self.config) {
+            Ok(()) => {
+                self.cloud_settings_modal_open = false;
+                self.cloud_unbind_confirm = false;
+                window.push_notification(
+                    Notification::success(if changed {
+                        format!("已保存云端地址 {server}；请重新绑定机器人。")
+                    } else {
+                        format!("已保存云端地址 {server}")
+                    }),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("保存本地配置失败: {error}")),
+                    cx,
+                );
+            }
+        }
         cx.notify();
     }
 
@@ -301,7 +341,7 @@ impl PlannerApp {
                     self.config.fnos_password = self.input_value(&self.fnos_password_input, cx);
                 }
                 record_history(&mut self.config, source_mode, &input, &rd.season_title);
-                save_config(&self.config);
+                self.persist_config(window, cx);
                 // 获取成功后自动按当前天数与模式生成一次计划。
                 match self.days(cx) {
                     Ok(days) => Self::run_generate(

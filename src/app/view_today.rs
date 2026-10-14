@@ -286,7 +286,7 @@ impl PlannerApp {
         };
 
         // 任务列表分组渲染
-        let task_content: gpui::Div = if self.config.plans.is_empty() {
+        let task_content: gpui::AnyElement = if self.config.plans.is_empty() {
             bcard(cx)
                 .items_center()
                 .py_10()
@@ -320,6 +320,7 @@ impl PlannerApp {
                             cx.notify();
                         })),
                 )
+                .into_any_element()
         } else if filtered_tasks.is_empty() {
             bcard(cx)
                 .items_center()
@@ -343,332 +344,392 @@ impl PlannerApp {
                         .text_color(theme.muted_foreground)
                         .child("适当休息劳逸结合，保持最佳学习状态。"),
                 )
+                .into_any_element()
         } else {
-            // 按科目分组展示
+            // 按科目分组；整卡进虚拟列表，滚出视口的分组不再参与 layout/paint。
             let mut plan_map: std::collections::BTreeMap<String, Vec<crate::study::TodayTaskView>> =
                 std::collections::BTreeMap::new();
             for item in filtered_tasks {
                 plan_map.entry(item.plan_id.clone()).or_default().push(item);
             }
 
-            let mut group_cards = Vec::new();
-            for (grp_idx, (plan_id, items)) in plan_map.into_iter().enumerate() {
-                let plan_title = items[0].plan_title.clone();
-                let day_display = items[0].day_display.clone();
-                let source_type = items[0].source_type.clone();
-                let source_url = items[0].source_url.clone();
-                let total_in_group = items.len();
-                let total_group_duration: i64 = items.iter().map(|t| t.task.portion).sum();
-                let remaining_group_duration: i64 = items
-                    .iter()
-                    .filter(|t| !t.task.completed)
-                    .map(|t| t.task.portion)
-                    .sum();
-                let done_in_group = items.iter().filter(|t| t.task.completed).count();
-                let is_all_group_done = total_in_group > 0 && done_in_group == total_in_group;
+            let groups: Vec<TodayGroupModel> = plan_map
+                .into_iter()
+                .map(|(plan_id, items)| {
+                    let plan_title = items[0].plan_title.clone();
+                    let day_display = items[0].day_display.clone();
+                    let source_type = items[0].source_type.clone();
+                    let source_url = items[0].source_url.clone();
+                    let total = items.len();
+                    let total_duration: i64 = items.iter().map(|t| t.task.portion).sum();
+                    let remaining_duration: i64 = items
+                        .iter()
+                        .filter(|t| !t.task.completed)
+                        .map(|t| t.task.portion)
+                        .sum();
+                    let done = items.iter().filter(|t| t.task.completed).count();
+                    let selected_date = self.selected_date.clone();
+                    let tasks = items
+                        .into_iter()
+                        .map(|view| {
+                            let task = view.task;
+                            TodayTaskModel {
+                                id: task.id.clone(),
+                                vid_no: task.vid_no,
+                                title: task.title.clone(),
+                                portion: task.portion,
+                                remainder: task.remainder,
+                                from_prev: task.from_prev,
+                                completed: task.completed,
+                            }
+                        })
+                        .collect();
+                    TodayGroupModel {
+                        plan_id,
+                        plan_title,
+                        day_display,
+                        source_type,
+                        source_url,
+                        selected_date,
+                        total,
+                        done,
+                        total_duration,
+                        remaining_duration,
+                        tasks,
+                    }
+                })
+                .collect();
 
-                let pid_clone = plan_id.clone();
-                let sel_date_clone = self.selected_date.clone();
-
-                let mut task_rows = Vec::new();
-                for (item_idx, view) in items.into_iter().enumerate() {
-                    let task = view.task;
-                    let tid = task.id.clone();
-                    let st = source_type.clone();
-                    let su = source_url.clone();
-                    let has_source_url = !su.trim().is_empty();
-                    let vno = task.vid_no;
-                    let is_done = task.completed;
-
-                    let (chk_icon, chk_color) = if is_done {
-                        ("icons/square-check.svg", theme.primary)
-                    } else {
-                        ("icons/square.svg", theme.muted_foreground)
-                    };
-
-                    let btn_play_id = ("play-task", grp_idx * 1000 + item_idx);
-                    let btn_chk_id = ("check-btn", grp_idx * 1000 + item_idx);
-                    let pid_click1 = plan_id.clone();
-                    let pid_click2 = plan_id.clone();
-                    let tid_click1 = tid.clone();
-                    let tid_click2 = tid.clone();
-                    let move_seed = CalendarTaskEditSeed {
-                        plan_id: plan_id.clone(),
-                        task_id: tid.clone(),
-                        title: task.title.clone(),
-                        date: self.selected_date.clone(),
-                        portion: task.portion,
-                    };
-
-                    task_rows.push(
-                        h_flex()
-                            .id(("task-row", grp_idx * 1000 + item_idx))
-                            .items_center()
-                            .justify_between()
-                            .px_3()
-                            .py_2p5()
-                            .border_1()
-                            .border_color(if is_done {
-                                theme.primary.opacity(0.4)
-                            } else {
-                                theme.border.opacity(0.6)
-                            })
-                            .bg(if is_done {
-                                theme.primary.opacity(0.08)
-                            } else {
-                                theme.background.opacity(0.25)
-                            })
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .id(("chk-icon", grp_idx * 1000 + item_idx))
-                                            .cursor_pointer()
-                                            .p_1()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.toggle_task_checkin_action(
-                                                    &pid_click1,
-                                                    &tid_click1,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(
-                                                Icon::empty()
-                                                    .path(chk_icon)
-                                                    .size_5()
-                                                    .text_color(chk_color),
-                                            ),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_0p5()
-                                            .child(
-                                                h_flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(13.5))
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_color(if is_done {
-                                                                theme.muted_foreground
-                                                            } else {
-                                                                theme.foreground
-                                                            })
-                                                            .child(format!(
-                                                                "P{}: {}",
-                                                                task.vid_no, task.title
-                                                            )),
-                                                    )
-                                                    .children(task.from_prev.then(|| {
-                                                        div()
-                                                            .text_size(px(10.5))
-                                                            .px_1p5()
-                                                            .py_0p5()
-                                                            .bg(theme.accent.opacity(0.2))
-                                                            .child("接续前段")
-                                                    }))
-                                                    .children((task.remainder > 0).then(|| {
-                                                        div()
-                                                            .text_size(px(10.5))
-                                                            .px_1p5()
-                                                            .py_0p5()
-                                                            .bg(theme.primary.opacity(0.2))
-                                                            .child("后续仍有")
-                                                    })),
-                                            )
-                                            .child(
-                                                h_flex()
-                                                    .gap_3()
-                                                    .items_center()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.5))
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(format!(
-                                                                "⏱️ 本日任务时长：{}",
-                                                                fmt_seconds(
-                                                                    task.portion as f64,
-                                                                    true
-                                                                )
-                                                            )),
-                                                    )
-                                                    .children((task.remainder > 0).then(|| {
-                                                        div()
-                                                            .text_size(px(11.5))
-                                                            .text_color(theme.muted_foreground)
-                                                            .child(format!(
-                                                                "此视频剩余：{}",
-                                                                fmt_seconds(
-                                                                    task.remainder as f64,
-                                                                    true
-                                                                )
-                                                            ))
-                                                    })),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Button::new(("move-task", grp_idx * 1000 + item_idx))
-                                            .small()
-                                            .ghost()
-                                            .label("调整日期")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_calendar_task_edit_modal_action(
-                                                    move_seed.clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                                this.task_date_only = true;
-                                            })),
-                                    )
-                                    .children(has_source_url.then(|| {
-                                        Button::new(btn_play_id)
-                                            .icon(Icon::empty().path("icons/play.svg"))
-                                            .label("直达播放")
-                                            .small()
-                                            .on_click(move |_, _, _| {
-                                                open_video_link(&st, &su, vno);
-                                            })
-                                    }))
-                                    .child(
-                                        Button::new(btn_chk_id)
-                                            .small()
-                                            .label(if is_done { "已打卡" } else { "打卡" })
-                                            .primary()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.toggle_task_checkin_action(
-                                                    &pid_click2,
-                                                    &tid_click2,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    ),
-                            )
-                            .into_any_element(),
-                    );
-                }
-
-                group_cards.push(
-                    bcard(cx)
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            Icon::empty()
-                                                .path(source_badge(&source_type).0)
-                                                .size_4()
-                                                .text_color(theme.primary),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(15.))
-                                                .font_weight(FontWeight::BOLD)
-                                                .child(format!("《{plan_title}》 · {day_display}")),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.5))
-                                                .px_2()
-                                                .py_0p5()
-                                                .bg(if is_all_group_done {
-                                                    theme.primary
-                                                } else {
-                                                    theme.muted
-                                                })
-                                                .text_color(if is_all_group_done {
-                                                    hsla(0.0, 0.0, 0.04, 1.0)
-                                                } else {
-                                                    theme.muted_foreground
-                                                })
-                                                .child(format!(
-                                                    "完成 {done_in_group}/{total_in_group}"
-                                                )),
-                                        ),
-                                )
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_3()
-                                        .flex_shrink_0()
-                                        .child(
-                                            v_flex()
-                                                .gap_0p5()
-                                                .text_size(px(12.5))
-                                                .child(
-                                                    div().text_color(theme.muted_foreground).child(
-                                                        format!(
-                                                            "⏱️ 当日总时长：{}",
-                                                            fmt_seconds(
-                                                                total_group_duration as f64,
-                                                                true
-                                                            )
-                                                        ),
-                                                    ),
-                                                )
-                                                .child(div().text_color(theme.primary).child(
-                                                    format!(
-                                                        "当日剩余时长：{}",
-                                                        fmt_seconds(
-                                                            remaining_group_duration as f64,
-                                                            true
-                                                        )
-                                                    ),
-                                                )),
-                                        )
-                                        .children((!is_all_group_done).then(|| {
-                                            Button::new(("check-all-grp", grp_idx))
-                                                .small()
-                                                .label("一键打卡本科目今日")
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        this.checkin_entire_day_action(
-                                                            &pid_clone,
-                                                            &sel_date_clone,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    },
-                                                ))
-                                        })),
-                                ),
-                        )
-                        .child(v_flex().w_full().gap_2().children(task_rows))
-                        .into_any_element(),
-                );
+            let count = groups.len();
+            if self.today_list.item_count() != count {
+                self.today_list.reset(count);
             }
-
-            v_flex().w_full().gap_4().children(group_cards)
+            let this = cx.entity().downgrade();
+            gpui::list(self.today_list.clone(), move |ix, _window, cx| {
+                Self::render_today_group_card(ix, &groups, &this, cx)
+            })
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
         };
 
         v_flex()
-            .id("today-scroll")
+            .id("today-root")
             .size_full()
-            .overflow_y_scroll()
             .px_8()
             .py_6()
             .gap_5()
             .child(entrance("anim-stats", 0.0, stats_row))
             .child(entrance("anim-nav", 0.08, date_nav))
             .children(filter_bar.map(|f| entrance("anim-filter", 0.14, f).into_any_element()))
-            .child(entrance("anim-tasks", 0.18, task_content))
+            .child(task_content)
             .into_any_element()
     }
+
+    /// 单个科目分组卡（含任务行），供虚拟列表按需构建。
+    fn render_today_group_card(
+        ix: usize,
+        groups: &[TodayGroupModel],
+        this: &gpui::WeakEntity<Self>,
+        cx: &mut gpui::App,
+    ) -> gpui::AnyElement {
+        let Some(group) = groups.get(ix) else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let grp_idx = ix;
+        let is_all_group_done = group.total > 0 && group.done == group.total;
+        let pid_all = group.plan_id.clone();
+        let sel_date_all = group.selected_date.clone();
+
+        let mut task_rows = Vec::new();
+        for (item_idx, task) in group.tasks.iter().enumerate() {
+            let tid = task.id.clone();
+            let st = group.source_type.clone();
+            let su = group.source_url.clone();
+            let has_source_url = !su.trim().is_empty();
+            let vno = task.vid_no;
+            let is_done = task.completed;
+
+            let (chk_icon, chk_color) = if is_done {
+                ("icons/square-check.svg", theme.primary)
+            } else {
+                ("icons/square.svg", theme.muted_foreground)
+            };
+
+            let btn_play_id = ("play-task", grp_idx * 1000 + item_idx);
+            let btn_chk_id = ("check-btn", grp_idx * 1000 + item_idx);
+            let pid_click1 = group.plan_id.clone();
+            let pid_click2 = group.plan_id.clone();
+            let tid_click1 = tid.clone();
+            let tid_click2 = tid.clone();
+            let move_seed = CalendarTaskEditSeed {
+                plan_id: group.plan_id.clone(),
+                task_id: tid.clone(),
+                title: task.title.clone(),
+                date: group.selected_date.clone(),
+                portion: task.portion,
+            };
+
+            task_rows.push(
+                h_flex()
+                    .id(("task-row", grp_idx * 1000 + item_idx))
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2p5()
+                    .border_1()
+                    .border_color(if is_done {
+                        theme.primary.opacity(0.4)
+                    } else {
+                        theme.border.opacity(0.6)
+                    })
+                    .bg(if is_done {
+                        theme.primary.opacity(0.08)
+                    } else {
+                        theme.background.opacity(0.25)
+                    })
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .id(("chk-icon", grp_idx * 1000 + item_idx))
+                                    .cursor_pointer()
+                                    .p_1()
+                                    .on_click(Self::list_action(this, move |view, window, cx| {
+                                        view.toggle_task_checkin_action(
+                                            &pid_click1,
+                                            &tid_click1,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(
+                                        Icon::empty().path(chk_icon).size_5().text_color(chk_color),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.5))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(if is_done {
+                                                        theme.muted_foreground
+                                                    } else {
+                                                        theme.foreground
+                                                    })
+                                                    .child(format!(
+                                                        "P{}: {}",
+                                                        task.vid_no, task.title
+                                                    )),
+                                            )
+                                            .children(task.from_prev.then(|| {
+                                                div()
+                                                    .text_size(px(10.5))
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .bg(theme.accent.opacity(0.2))
+                                                    .child("接续前段")
+                                            }))
+                                            .children((task.remainder > 0).then(|| {
+                                                div()
+                                                    .text_size(px(10.5))
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .bg(theme.primary.opacity(0.2))
+                                                    .child("后续仍有")
+                                            })),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!(
+                                                        "⏱️ 本日任务时长：{}",
+                                                        fmt_seconds(task.portion as f64, true)
+                                                    )),
+                                            )
+                                            .children((task.remainder > 0).then(|| {
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!(
+                                                        "此视频剩余：{}",
+                                                        fmt_seconds(task.remainder as f64, true)
+                                                    ))
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(("move-task", grp_idx * 1000 + item_idx))
+                                    .small()
+                                    .ghost()
+                                    .label("调整日期")
+                                    .on_click(Self::list_action(this, move |view, window, cx| {
+                                        view.open_calendar_task_edit_modal_action(
+                                            move_seed.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                        view.task_date_only = true;
+                                    })),
+                            )
+                            .children(has_source_url.then(|| {
+                                Button::new(btn_play_id)
+                                    .icon(Icon::empty().path("icons/play.svg"))
+                                    .label("直达播放")
+                                    .small()
+                                    .on_click(move |_, _, _| {
+                                        open_video_link(&st, &su, vno);
+                                    })
+                            }))
+                            .child(
+                                Button::new(btn_chk_id)
+                                    .small()
+                                    .label(if is_done { "已打卡" } else { "打卡" })
+                                    .primary()
+                                    .on_click(Self::list_action(this, move |view, window, cx| {
+                                        view.toggle_task_checkin_action(
+                                            &pid_click2,
+                                            &tid_click2,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        bcard(cx)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                Icon::empty()
+                                    .path(source_badge(&group.source_type).0)
+                                    .size_4()
+                                    .text_color(theme.primary),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(format!(
+                                        "《{}》 · {}",
+                                        group.plan_title, group.day_display
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .px_2()
+                                    .py_0p5()
+                                    .bg(if is_all_group_done {
+                                        theme.primary
+                                    } else {
+                                        theme.muted
+                                    })
+                                    .text_color(if is_all_group_done {
+                                        hsla(0.0, 0.0, 0.04, 1.0)
+                                    } else {
+                                        theme.muted_foreground
+                                    })
+                                    .child(format!("完成 {}/{}", group.done, group.total)),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .flex_shrink_0()
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .text_size(px(12.5))
+                                    .child(div().text_color(theme.muted_foreground).child(format!(
+                                        "⏱️ 当日总时长：{}",
+                                        fmt_seconds(group.total_duration as f64, true)
+                                    )))
+                                    .child(div().text_color(theme.primary).child(format!(
+                                        "当日剩余时长：{}",
+                                        fmt_seconds(group.remaining_duration as f64, true)
+                                    ))),
+                            )
+                            .children((!is_all_group_done).then(|| {
+                                Button::new(("check-all-grp", grp_idx))
+                                    .small()
+                                    .label("一键打卡本科目今日")
+                                    .on_click(Self::list_action(this, move |view, window, cx| {
+                                        view.checkin_entire_day_action(
+                                            &pid_all,
+                                            &sel_date_all,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                            })),
+                    ),
+            )
+            .child(v_flex().w_full().gap_2().children(task_rows))
+            .into_any_element()
+    }
+}
+
+/// 今日任务行展示模型。
+struct TodayTaskModel {
+    id: String,
+    vid_no: i64,
+    title: String,
+    portion: i64,
+    remainder: i64,
+    from_prev: bool,
+    completed: bool,
+}
+
+/// 今日科目分组展示模型。
+struct TodayGroupModel {
+    plan_id: String,
+    plan_title: String,
+    day_display: String,
+    source_type: String,
+    source_url: String,
+    selected_date: String,
+    total: usize,
+    done: usize,
+    total_duration: i64,
+    remaining_duration: i64,
+    tasks: Vec<TodayTaskModel>,
 }

@@ -179,14 +179,37 @@ impl LocalConfigStore {
     }
 }
 
+/// 历史版本把云端地址默认填成该主机；现改为默认空，加载时清掉残留的旧默认值。
+const LEGACY_DEFAULT_SYNC_SERVER_URL: &str = "https://plan.pcsensor.cloud";
+
+fn migrate_legacy_default_sync_server_url(cfg: &mut AppConfig) -> bool {
+    let current = cfg.sync_server_url.trim().trim_end_matches('/');
+    if current == LEGACY_DEFAULT_SYNC_SERVER_URL {
+        cfg.sync_server_url = String::new();
+        return true;
+    }
+    false
+}
+
 /// 加载给定路径的 SQLite；数据库不存在或尚未初始化时导入旧 JSON。
 pub(super) fn load_config_at(db_path: &Path, legacy_path: &Path) -> Option<AppConfig> {
-    if db_path.exists() {
+    let mut config = if db_path.exists() {
         if let Some(config) = LocalConfigStore::load(db_path) {
-            return Some(config);
+            config
+        } else {
+            load_legacy_json(db_path, legacy_path)?
         }
+    } else {
+        load_legacy_json(db_path, legacy_path)?
+    };
+    if migrate_legacy_default_sync_server_url(&mut config) {
+        // 落盘一次，避免下次启动又读回旧默认地址。
+        let _ = LocalConfigStore::save(db_path, &config);
     }
+    Some(config)
+}
 
+fn load_legacy_json(db_path: &Path, legacy_path: &Path) -> Option<AppConfig> {
     let legacy_data = std::fs::read_to_string(legacy_path).ok()?;
     let config: AppConfig = serde_json::from_str(&legacy_data).ok()?;
     LocalConfigStore::save(db_path, &config).ok()?;

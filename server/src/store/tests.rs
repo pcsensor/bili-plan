@@ -154,6 +154,53 @@ async fn feishu_rebinding_moves_lookup_and_scheduler_without_losing_plans() {
 }
 
 #[tokio::test]
+async fn delete_device_removes_plans_notes_and_robot_bindings() {
+    let dir = std::env::temp_dir().join(format!("store_unbind_{}", rand::random::<u64>()));
+    let store = Store::new(&dir);
+    let user = store.register_device().await.unwrap();
+    let token = &user.device_token;
+    let mut notes = DailyNotes::new();
+    notes.insert(
+        "2026-09-13".to_string(),
+        vec![DailyNote {
+            id: "n1".to_string(),
+            content: "待删除备注".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            deleted: false,
+        }],
+    );
+    store
+        .sync_plans(
+            token,
+            vec![make_test_plan("kept-elsewhere", &["2026-09-13"])],
+            notes,
+        )
+        .await
+        .unwrap();
+    let code = store.generate_bind_code(token).await.unwrap();
+    store.bind_feishu_for_test(code.as_str(), "reader").await;
+    let tg_code = store.generate_bind_code(token).await.unwrap();
+    store
+        .bind_telegram_by_code(tg_code.as_str(), 42, Some("tg user"))
+        .await
+        .unwrap();
+
+    assert!(store.delete_device(token).await.unwrap());
+    assert!(Store::get_device(&store.conn.lock().unwrap(), token).is_none());
+    assert_eq!(
+        Store::load_plans(&store.conn.lock().unwrap(), token).len(),
+        0
+    );
+    assert!(store.get_plans_by_open_id("reader").await.is_none());
+    assert!(store.get_plans_by_telegram_chat_id(42).await.is_none());
+    // 幂等：设备已不存在时再次删除返回 false，不报错。
+    assert!(!store.delete_device(token).await.unwrap());
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn sync_rejects_device_that_was_never_registered() {
     let dir = std::env::temp_dir().join(format!("store_unregistered_{}", rand::random::<u64>()));
     let store = Store::new(&dir);

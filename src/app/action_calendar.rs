@@ -100,9 +100,13 @@ impl PlannerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if delete_daily_note(&mut self.config, date, note_id) {
-            window.push_notification(Notification::info("已删除该条备注"), cx);
-            self.trigger_auto_sync(window, cx);
+        match delete_daily_note(&mut self.config, date, note_id) {
+            Ok(true) => {
+                window.push_notification(Notification::info("已删除该条备注"), cx);
+                self.trigger_auto_sync(window, cx);
+            }
+            Ok(false) => {}
+            Err(e) => window.push_notification(Notification::error(e), cx),
         }
         cx.notify();
     }

@@ -17,12 +17,14 @@
 //! - 「结果」区：合集信息卡、科目选择、操作行、计划表。
 //! - 反馈走 `Notification`（自动消失）。
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{
-    canvas, div, fill, hsla, point, prelude::*, px, size, AnimationExt, App, BoxShadow, Context,
-    Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, Render, Styled,
-    Window,
+    canvas, div, hsla, point, prelude::*, px, AnimationExt, App, BoxShadow, Context, Entity,
+    Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, Render, RenderImage,
+    Styled, Window,
 };
 use gpui_component::{
     alert::Alert,
@@ -36,16 +38,18 @@ use gpui_component::{
     v_flex, ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, Theme, ThemeMode,
     TitleBar, WindowExt,
 };
+use image::{Frame, RgbaImage};
 
 use crate::core::{
     add_custom_study_plan, add_daily_note, add_one_off_calendar_task,
     advance_completed_study_tasks, append_calendar_series_task, check_cloud_bind_status,
-    checkin_study_task, clear_history, create_calendar_series_plan, delete_calendar_task,
-    delete_daily_note, enroll_study_plan, export_payload, generate_plan, get_daily_notes,
-    load_config, parse_days, push_forward_study_plan, record_history,
-    redistribute_unfinished_study_plan, remove_history, remove_study_plan, request_cloud_bind_code,
-    reschedule_unfinished_study_plan, save_config, sync_with_cloud, toggle_study_plan_status,
-    update_calendar_task, AppConfig, FetchSource, ReadyState, Selection, SourceMode,
+    checkin_study_task, clear_cloud_binding_state, clear_history, create_calendar_series_plan,
+    delete_calendar_task, delete_cloud_binding, delete_daily_note, enroll_study_plan,
+    export_payload, generate_plan, get_daily_notes, load_config, parse_days,
+    push_forward_study_plan, record_history, redistribute_unfinished_study_plan, remove_history,
+    remove_study_plan, request_cloud_bind_code, reschedule_unfinished_study_plan, sync_with_cloud,
+    toggle_study_plan_status, try_save_config, update_calendar_task, AppConfig, FetchSource,
+    ReadyState, Selection, SourceMode,
 };
 use crate::plan::{fmt_human, fmt_seconds, Mode, PlanEntry};
 use crate::study::{
@@ -181,119 +185,23 @@ fn ago_label(at: i64) -> String {
     }
 }
 
-/// 全窗口背景装饰层（画在内容层之下）：
-/// 先铺主题底色（根节点保持透明，让装饰层成为真正的最底层），
-/// 再叠细点阵纸纹与少量大尺度低透明度几何色块——右上大圆、
-/// 左下描边圆环、菱形与半调网点补丁，野兽风海报语言。
+/// 全窗口背景装饰层（画在内容层之下）。
+///
+/// 装饰（点阵、几何色块）按窗口像素栅格化成一张 `RenderImage` 并缓存，
+/// 每帧只提交 1 个 sprite；尺寸或主题变化时才重建。此前每帧用数千个
+/// `paint_quad`/`PathBuilder` 重绘，是滚轮滚动卡顿的主要来源。
 fn render_backdrop(dark: bool, base: gpui::Hsla) -> impl IntoElement {
     let paint = move |bounds: gpui::Bounds<gpui::Pixels>,
                       _: (),
                       window: &mut gpui::Window,
                       _: &mut gpui::App| {
         let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-        let (ox, oy) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
-
-        // 0. 主题底色。
-        window.paint_quad(fill(bounds, base));
-
-        // 1. 纸面点阵。
-        let dot_color = if dark {
-            hsla(0.13, 0.25, 0.92, 0.05)
-        } else {
-            hsla(0.0, 0.0, 0.04, 0.06)
-        };
-        let half = BACKDROP_DOT / 2.;
-        let mut gy = step_origin(oy);
-        while gy < oy + h {
-            let mut gx = step_origin(ox);
-            while gx < ox + w {
-                window.paint_quad(fill(
-                    gpui::Bounds {
-                        origin: point(px(gx - half), px(gy - half)),
-                        size: size(px(BACKDROP_DOT), px(BACKDROP_DOT)),
-                    },
-                    dot_color,
-                ));
-                gx += BACKDROP_GRID_STEP;
-            }
-            gy += BACKDROP_GRID_STEP;
+        if w <= 0. || h <= 0. {
+            return;
         }
-
-        // 圆形用正多边形近似（48 段已足够圆滑）。
-        let circle_pts = |cxp: f32, cyp: f32, r: f32| {
-            (0..=48)
-                .map(|i| {
-                    let a = i as f32 * std::f32::consts::TAU / 48.;
-                    point(px(cxp + r * a.cos()), px(cyp + r * a.sin()))
-                })
-                .collect::<Vec<_>>()
-        };
-        let paint_circle = |window: &mut gpui::Window, cxp: f32, cyp: f32, r: f32, color| {
-            let mut pb = gpui::PathBuilder::fill();
-            pb.add_polygon(&circle_pts(cxp, cyp, r), true);
-            if let Ok(path) = pb.build() {
-                window.paint_path(path, color);
-            }
-        };
-
-        // 2. 右上大圆（主色，极低透明度）。
-        let big_circle = if dark {
-            hsla(0.16, 1.0, 0.62, 0.05)
-        } else {
-            hsla(0.135, 1.0, 0.5, 0.10)
-        };
-        paint_circle(window, ox + w - 120., oy + 60., 190., big_circle);
-
-        // 3. 左下描边圆环。
-        let ring = if dark {
-            hsla(0.62, 0.9, 0.78, 0.08)
-        } else {
-            hsla(0.62, 1.0, 0.59, 0.10)
-        };
-        let mut pb = gpui::PathBuilder::stroke(px(5.));
-        pb.add_polygon(&circle_pts(ox + 90., oy + h - 60., 120.), true);
-        if let Ok(path) = pb.build() {
-            window.paint_path(path, ring);
-        }
-
-        // 4. 标题右侧菱形点缀。
-        let diamond = if dark {
-            hsla(0.9, 0.85, 0.75, 0.09)
-        } else {
-            hsla(0.055, 1.0, 0.53, 0.12)
-        };
-        let (dx, dy, dr) = (ox + w * 0.62, oy + 110., 14.);
-        let mut pb = gpui::PathBuilder::fill();
-        pb.add_polygon(
-            &[
-                point(px(dx), px(dy - dr)),
-                point(px(dx + dr), px(dy)),
-                point(px(dx), px(dy + dr)),
-                point(px(dx - dr), px(dy)),
-            ],
-            true,
-        );
-        if let Ok(path) = pb.build() {
-            window.paint_path(path, diamond);
-        }
-
-        // 5. 左上半调网点补丁（行进间点径衰减，波普肌理）。
-        let halftone = if dark {
-            hsla(0.13, 0.25, 0.92, 0.10)
-        } else {
-            hsla(0.0, 0.0, 0.04, 0.12)
-        };
-        for row in 0..7 {
-            for col in 0..10 {
-                let r = 4.5 - col as f32 * 0.35 - row as f32 * 0.18;
-                if r <= 0.4 {
-                    continue;
-                }
-                let hx = ox + 40. + col as f32 * 14.;
-                let hy = oy + h - 210. + row as f32 * 14.;
-                paint_circle(window, hx, hy, r, halftone);
-            }
-        }
+        let scale = window.scale_factor();
+        let image = backdrop_image(w, h, scale, dark, base);
+        let _ = window.paint_image(bounds, gpui::Corners::default(), image, 0, false);
     };
 
     div()
@@ -303,9 +211,247 @@ fn render_backdrop(dark: bool, base: gpui::Hsla) -> impl IntoElement {
         .child(canvas(|_, _, _| {}, paint))
 }
 
-/// 对齐到点阵网格的起始坐标（避免原点偏移导致边缘半格）。
-fn step_origin(origin: f32) -> f32 {
-    origin - origin % BACKDROP_GRID_STEP
+/// 背景纹理缓存键：设备像素尺寸 + 是否暗色。
+type BackdropKey = (u32, u32, bool);
+
+thread_local! {
+    /// 同一窗口同一主题下背景纹理只保留最近一张。
+    static BACKDROP_CACHE: RefCell<Option<(BackdropKey, Arc<RenderImage>)>> =
+        const { RefCell::new(None) };
+}
+
+/// 取（或按需生成）背景装饰位图。像素按设备分辨率栅格化，避免高 DPI 发糊。
+fn backdrop_image(
+    logical_w: f32,
+    logical_h: f32,
+    scale: f32,
+    dark: bool,
+    base: gpui::Hsla,
+) -> Arc<RenderImage> {
+    let dw = (logical_w * scale).ceil().max(1.) as u32;
+    let dh = (logical_h * scale).ceil().max(1.) as u32;
+    let key = (dw, dh, dark);
+
+    BACKDROP_CACHE.with(|cache| {
+        if let Some((k, img)) = cache.borrow().as_ref() {
+            if *k == key {
+                return img.clone();
+            }
+        }
+        let img = Arc::new(rasterize_backdrop(dw, dh, scale, dark, base));
+        *cache.borrow_mut() = Some((key, img.clone()));
+        img
+    })
+}
+
+/// 将底色 + 装饰一次性栅格化进 BGRA 缓冲（gpui 的 `RenderImage` 约定 BGRA）。
+fn rasterize_backdrop(dw: u32, dh: u32, scale: f32, dark: bool, base: gpui::Hsla) -> RenderImage {
+    let base_rgb = base.to_rgb();
+    let mut img = RgbaImage::from_pixel(
+        dw,
+        dh,
+        image::Rgba(rgba_bytes(base_rgb.r, base_rgb.g, base_rgb.b, 1.0)),
+    );
+
+    let w = dw as f32 / scale;
+    let h = dh as f32 / scale;
+
+    // 1. 纸面点阵。
+    let dot_color = if dark {
+        hsla(0.13, 0.25, 0.92, 0.05)
+    } else {
+        hsla(0.0, 0.0, 0.04, 0.06)
+    };
+    let half = BACKDROP_DOT / 2.;
+    let mut gy = 0.;
+    while gy < h {
+        let mut gx = 0.;
+        while gx < w {
+            fill_circle(
+                &mut img,
+                scale,
+                gx,
+                gy,
+                half.max(0.5),
+                hsla_to_bgra(dot_color),
+            );
+            gx += BACKDROP_GRID_STEP;
+        }
+        gy += BACKDROP_GRID_STEP;
+    }
+
+    // 2. 右上大圆（主色，极低透明度）。
+    let big_circle = if dark {
+        hsla(0.16, 1.0, 0.62, 0.05)
+    } else {
+        hsla(0.135, 1.0, 0.5, 0.10)
+    };
+    fill_circle(
+        &mut img,
+        scale,
+        w - 120.,
+        60.,
+        190.,
+        hsla_to_bgra(big_circle),
+    );
+
+    // 3. 左下描边圆环（≈5px 线宽）。
+    let ring = if dark {
+        hsla(0.62, 0.9, 0.78, 0.08)
+    } else {
+        hsla(0.62, 1.0, 0.59, 0.10)
+    };
+    fill_ring(&mut img, scale, 90., h - 60., 120., 2.5, hsla_to_bgra(ring));
+
+    // 4. 标题右侧菱形点缀。
+    let diamond = if dark {
+        hsla(0.9, 0.85, 0.75, 0.09)
+    } else {
+        hsla(0.055, 1.0, 0.53, 0.12)
+    };
+    let (dx, dy, dr) = (w * 0.62, 110., 14.);
+    fill_diamond(&mut img, scale, dx, dy, dr, hsla_to_bgra(diamond));
+
+    // 5. 左上半调网点补丁（行进间点径衰减，波普肌理）。
+    let halftone = if dark {
+        hsla(0.13, 0.25, 0.92, 0.10)
+    } else {
+        hsla(0.0, 0.0, 0.04, 0.12)
+    };
+    let ht = hsla_to_bgra(halftone);
+    for row in 0..7 {
+        for col in 0..10 {
+            let r = 4.5 - col as f32 * 0.35 - row as f32 * 0.18;
+            if r <= 0.4 {
+                continue;
+            }
+            let hx = 40. + col as f32 * 14.;
+            let hy = h - 210. + row as f32 * 14.;
+            fill_circle(&mut img, scale, hx, hy, r, ht);
+        }
+    }
+
+    // RenderImage 约定 BGRA；这里把 RGBA 通道写进 RgbaImage 的字节槽。
+    for px in img.pixels_mut() {
+        px.0.swap(0, 2);
+    }
+
+    let frame = Frame::new(img);
+    RenderImage::new(vec![frame])
+}
+
+fn rgba_bytes(r: f32, g: f32, b: f32, a: f32) -> [u8; 4] {
+    [
+        (r.clamp(0., 1.) * 255.).round() as u8,
+        (g.clamp(0., 1.) * 255.).round() as u8,
+        (b.clamp(0., 1.) * 255.).round() as u8,
+        (a.clamp(0., 1.) * 255.).round() as u8,
+    ]
+}
+
+fn hsla_to_bgra(c: gpui::Hsla) -> [u8; 4] {
+    let rgb = c.to_rgb();
+    // 与最终 BGRA 打包一致：先按 RGBA 写入，收尾统一 swap。
+    rgba_bytes(rgb.r, rgb.g, rgb.b, rgb.a)
+}
+
+fn blend_pixel(img: &mut RgbaImage, x: u32, y: u32, rgba: [u8; 4]) {
+    let Some(pixel) = img.get_pixel_mut_checked(x, y) else {
+        return;
+    };
+    let [r, g, b, a] = rgba;
+    if a == 0 {
+        return;
+    }
+    if a == 255 {
+        pixel.0 = [r, g, b, 255];
+        return;
+    }
+    let af = a as f32 / 255.;
+    let inv = 1. - af;
+    let dst = pixel.0;
+    pixel.0 = [
+        (r as f32 * af + dst[0] as f32 * inv) as u8,
+        (g as f32 * af + dst[1] as f32 * inv) as u8,
+        (b as f32 * af + dst[2] as f32 * inv) as u8,
+        255,
+    ];
+}
+
+/// 逻辑坐标下的实心圆（低透明度装饰，直接距离场即可）。
+fn fill_circle(img: &mut RgbaImage, scale: f32, cx: f32, cy: f32, r: f32, rgba: [u8; 4]) {
+    if r <= 0. || rgba[3] == 0 {
+        return;
+    }
+    let (scx, scy, sr) = (cx * scale, cy * scale, r * scale);
+    let x0 = ((scx - sr).floor().max(0.)) as u32;
+    let y0 = ((scy - sr).floor().max(0.)) as u32;
+    let x1 = ((scx + sr).ceil().min(img.width() as f32)) as u32;
+    let y1 = ((scy + sr).ceil().min(img.height() as f32)) as u32;
+    let r2 = sr * sr;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = x as f32 + 0.5 - scx;
+            let dy = y as f32 + 0.5 - scy;
+            if dx * dx + dy * dy <= r2 {
+                blend_pixel(img, x, y, rgba);
+            }
+        }
+    }
+}
+
+/// 描边圆环：外径 r、线宽 half_w（逻辑像素）。
+fn fill_ring(
+    img: &mut RgbaImage,
+    scale: f32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    half_w: f32,
+    rgba: [u8; 4],
+) {
+    if rgba[3] == 0 {
+        return;
+    }
+    let (scx, scy) = (cx * scale, cy * scale);
+    let outer = (r + half_w) * scale;
+    let inner = (r - half_w).max(0.) * scale;
+    let (outer2, inner2) = (outer * outer, inner * inner);
+    let x0 = ((scx - outer).floor().max(0.)) as u32;
+    let y0 = ((scy - outer).floor().max(0.)) as u32;
+    let x1 = ((scx + outer).ceil().min(img.width() as f32)) as u32;
+    let y1 = ((scy + outer).ceil().min(img.height() as f32)) as u32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = x as f32 + 0.5 - scx;
+            let dy = y as f32 + 0.5 - scy;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= outer2 && d2 >= inner2 {
+                blend_pixel(img, x, y, rgba);
+            }
+        }
+    }
+}
+
+/// 菱形（对角线半长 dr）。
+fn fill_diamond(img: &mut RgbaImage, scale: f32, cx: f32, cy: f32, dr: f32, rgba: [u8; 4]) {
+    if rgba[3] == 0 {
+        return;
+    }
+    let (scx, scy, sr) = (cx * scale, cy * scale, dr * scale);
+    let x0 = ((scx - sr).floor().max(0.)) as u32;
+    let y0 = ((scy - sr).floor().max(0.)) as u32;
+    let x1 = ((scx + sr).ceil().min(img.width() as f32)) as u32;
+    let y1 = ((scy + sr).ceil().min(img.height() as f32)) as u32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = (x as f32 + 0.5 - scx).abs();
+            let dy = (y as f32 + 0.5 - scy).abs();
+            if dx + dy <= sr {
+                blend_pixel(img, x, y, rgba);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,18 +473,18 @@ fn hard_shadow(dark: bool) -> Vec<BoxShadow> {
     }]
 }
 
-/// 卡片入场动画：quint 减速曲线（先快后慢）+ 上滑淡入；
+/// 卡片入场动画：quint 减速曲线（先快后慢）+ 淡入。
+/// 只改 opacity，不碰 top/位移：滚动重绘时不触发额外布局。
 /// `delay`（0..0.5）裁剪时间轴，实现多卡片错峰入场。
 /// `id` 需在同层兄弟间唯一（动画状态按元素 id 记账）。
 fn entrance(id: &'static str, delay: f32, el: gpui::Div) -> gpui::AnimationElement<gpui::Div> {
     let quint_out = |t: f32| 1.0 - (1.0 - t).powi(5);
     el.with_animation(
         id,
-        gpui::Animation::new(std::time::Duration::from_millis(560)),
+        gpui::Animation::new(std::time::Duration::from_millis(480)),
         move |el, delta| {
             let t = ((delta - delay) / (1. - delay).max(1e-3)).clamp(0., 1.);
-            let eased = quint_out(t);
-            el.opacity(eased).top(px((1. - eased) * 14.))
+            el.opacity(quint_out(t))
         },
     )
 }
@@ -456,6 +602,10 @@ pub struct PlannerApp {
 
     /// 计划表状态；生成/切换科目/修改天数时重建。
     plan_table: Option<Entity<TableState<PlanTableDelegate>>>,
+    /// 「我的计划库」卡片列表虚拟滚动状态。
+    my_plans_list: gpui::ListState,
+    /// 「今日打卡」科目分组卡片列表虚拟滚动状态。
+    today_list: gpui::ListState,
 
     /// 首次生成计划时已向右扩展过窗口，避免反复 resize 覆盖用户手动调整。
     window_expanded: bool,
@@ -496,9 +646,37 @@ pub struct PlannerApp {
     cloud_settings_modal_open: bool,
     cloud_testing: bool,
     cloud_server_test_result: Option<(String, bool)>,
+    /// 解除云端绑定的二次确认；首次点击打开，再次点击才真正删除。
+    cloud_unbind_confirm: bool,
 }
 
 impl PlannerApp {
+    /// 列表项点击：闭包捕获 `WeakEntity`，在 `&mut App` 里回到本视图。
+    /// `list` 的 render 回调拿不到 `Context<Self>`，不能直接 `cx.listener`。
+    fn list_action(
+        this: &gpui::WeakEntity<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static {
+        let this = this.clone();
+        move |_, window, cx| {
+            this.update(cx, |view, cx| f(view, window, cx)).ok();
+        }
+    }
+
+    /// 把当前配置写入本地库；失败时通知用户，不让“内存已改”冒充已落盘。
+    fn persist_config(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match try_save_config(&self.config) {
+            Ok(()) => true,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("保存本地配置失败: {error}")),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
     /// 创建应用视图（在 `open_window` 的构建回调内调用）。
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let link_input = cx.new(|cx| {
@@ -694,6 +872,8 @@ impl PlannerApp {
             fetch_generation: 0,
             config,
             plan_table: None,
+            my_plans_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(240.)),
+            today_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(240.)),
             window_expanded: false,
             cloud_bind_modal_open: false,
             cloud_bind_code: None,
@@ -705,6 +885,7 @@ impl PlannerApp {
             cloud_settings_modal_open: false,
             cloud_testing: false,
             cloud_server_test_result: None,
+            cloud_unbind_confirm: false,
         }
     }
 

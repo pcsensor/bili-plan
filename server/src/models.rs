@@ -55,6 +55,12 @@ pub struct RegisterResponse {
     pub device_token: String,
 }
 
+/// 设备解除绑定响应。设备已不存在时同样返回成功，便于客户端幂等清理本地状态。
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UnregisterResponse {
+    pub success: bool,
+}
+
 /// 同步失败原因。区分"令牌未知"与"存储故障"，前者要让客户端重新注册而不是重试。
 #[derive(Debug)]
 pub enum SyncError {

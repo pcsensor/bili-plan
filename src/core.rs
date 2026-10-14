@@ -14,7 +14,10 @@ use planner_domain::source::SourceKind;
 
 mod cloud;
 mod storage;
-pub use cloud::{check_cloud_bind_status, request_cloud_bind_code, sync_with_cloud};
+pub use cloud::{
+    check_cloud_bind_status, clear_cloud_binding_state, delete_cloud_binding,
+    request_cloud_bind_code, sync_with_cloud, CloudUnbindReport,
+};
 pub use storage::{load_config, save_config, try_save_config};
 #[cfg(test)]
 use storage::{load_config_at, LocalConfigStore};
@@ -89,10 +92,6 @@ pub struct HistoryEntry {
 
 use crate::study::{self, DailyNote, DailyNotes, PlanStatus, StudyPlan};
 
-fn default_sync_server_url() -> String {
-    "https://plan.pcsensor.cloud".to_string()
-}
-
 fn default_auto_sync() -> bool {
     true
 }
@@ -123,7 +122,8 @@ pub struct AppConfig {
     pub plans: Vec<StudyPlan>,
     #[serde(default, deserialize_with = "study::deserialize_daily_notes")]
     pub daily_notes: DailyNotes, // "YYYY-MM-DD" -> 多条备注（含同步删除标记）
-    #[serde(default = "default_sync_server_url")]
+    /// 云端同步服务地址。默认空：用户必须在「云端设置」里显式填写后才能绑定或同步。
+    #[serde(default)]
     pub sync_server_url: String,
     /// 云端设备令牌，由服务端注册接口签发后持久化在本机，作为所有云端请求的
     /// `Authorization: Bearer` 凭据。
@@ -155,7 +155,7 @@ impl Default for AppConfig {
             history: Vec::new(),
             plans: Vec::new(),
             daily_notes: DailyNotes::new(),
-            sync_server_url: default_sync_server_url(),
+            sync_server_url: String::new(),
             sync_device_token: None,
             sync_revision: 0,
             feishu_bound: false,
@@ -183,7 +183,7 @@ pub fn source_tag(source: SourceMode) -> &'static str {
 }
 
 /// 记录一条搜索历史：按（来源, 输入）去重、最新在前、超限截断。
-/// 纯内存操作，调用方决定何时 [`save_config`]。
+/// 纯内存操作，调用方决定何时 [`try_save_config`] / [`commit_config`]。
 pub fn record_history(cfg: &mut AppConfig, source: SourceMode, input: &str, title: &str) {
     let input = input.trim();
     if input.is_empty() {
@@ -434,6 +434,13 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// 落盘成功后才把 `next` 写回实时配置，避免“内存已改、磁盘失败”。
+fn commit_config(cfg: &mut AppConfig, next: AppConfig) -> Result<(), String> {
+    try_save_config(&next)?;
+    *cfg = next;
+    Ok(())
+}
+
 /// 把已生成的计划保存到打卡学习计划库。
 pub fn enroll_study_plan(
     cfg: &mut AppConfig,
@@ -461,9 +468,10 @@ pub fn enroll_study_plan(
     )?;
 
     // 插入或更新
-    cfg.plans.retain(|p| p.id != study_plan.id);
-    cfg.plans.insert(0, study_plan.clone());
-    save_config(cfg);
+    let mut next = cfg.clone();
+    next.plans.retain(|p| p.id != study_plan.id);
+    next.plans.insert(0, study_plan.clone());
+    commit_config(cfg, next)?;
     Ok(study_plan)
 }
 
@@ -478,8 +486,9 @@ pub fn add_custom_study_plan(
 ) -> Result<StudyPlan, String> {
     let plan =
         study::create_custom_study_plan(title, start_date, days, daily_minutes, skip_weekends)?;
-    cfg.plans.insert(0, plan.clone());
-    save_config(cfg);
+    let mut next = cfg.clone();
+    next.plans.insert(0, plan.clone());
+    commit_config(cfg, next)?;
     Ok(plan)
 }
 
@@ -491,8 +500,9 @@ pub fn add_one_off_calendar_task(
     minutes: i64,
 ) -> Result<StudyPlan, String> {
     let plan = study::create_one_off_calendar_task(task_title, date, minutes)?;
-    cfg.plans.insert(0, plan.clone());
-    save_config(cfg);
+    let mut next = cfg.clone();
+    next.plans.insert(0, plan.clone());
+    commit_config(cfg, next)?;
     Ok(plan)
 }
 
@@ -505,8 +515,9 @@ pub fn create_calendar_series_plan(
     minutes: i64,
 ) -> Result<StudyPlan, String> {
     let plan = study::create_calendar_series(series_name, task_title, date, minutes)?;
-    cfg.plans.insert(0, plan.clone());
-    save_config(cfg);
+    let mut next = cfg.clone();
+    next.plans.insert(0, plan.clone());
+    commit_config(cfg, next)?;
     Ok(plan)
 }
 
@@ -518,14 +529,14 @@ pub fn append_calendar_series_task(
     date: &str,
     minutes: i64,
 ) -> Result<(), String> {
-    let plan = cfg
+    let mut next = cfg.clone();
+    let plan = next
         .plans
         .iter_mut()
         .find(|plan| plan.id == plan_id)
         .ok_or_else(|| "未找到指定的系列计划。".to_string())?;
     study::append_calendar_series_task(plan, task_title, date, minutes)?;
-    save_config(cfg);
-    Ok(())
+    commit_config(cfg, next)
 }
 
 /// 手动调整任意来源任务的日期，并沿用本地持久化流程。
@@ -535,14 +546,14 @@ pub fn move_study_task_to_date(
     task_id: &str,
     date: &str,
 ) -> Result<(), String> {
-    let plan = cfg
+    let mut next = cfg.clone();
+    let plan = next
         .plans
         .iter_mut()
         .find(|plan| plan.id == plan_id)
         .ok_or_else(|| "未找到指定任务所属计划。".to_string())?;
     study::move_task_to_date(plan, task_id, date)?;
-    save_config(cfg);
-    Ok(())
+    commit_config(cfg, next)
 }
 
 /// 编辑右键日历创建的任务。
@@ -554,14 +565,14 @@ pub fn update_calendar_task(
     date: &str,
     minutes: i64,
 ) -> Result<(), String> {
-    let plan = cfg
+    let mut next = cfg.clone();
+    let plan = next
         .plans
         .iter_mut()
         .find(|plan| plan.id == plan_id)
         .ok_or_else(|| "未找到指定任务所属计划。".to_string())?;
     study::update_calendar_task(plan, task_id, task_title, date, minutes)?;
-    save_config(cfg);
-    Ok(())
+    commit_config(cfg, next)
 }
 
 /// 删除右键日历创建的任务；删除系列的最后一项时会同时移除空系列计划。
@@ -570,35 +581,38 @@ pub fn delete_calendar_task(
     plan_id: &str,
     task_id: &str,
 ) -> Result<(), String> {
-    let plan_index = cfg
+    let mut next = cfg.clone();
+    let plan_index = next
         .plans
         .iter()
         .position(|plan| plan.id == plan_id)
         .ok_or_else(|| "未找到指定任务所属计划。".to_string())?;
-    let remove_plan = study::delete_calendar_task(&mut cfg.plans[plan_index], task_id)?;
+    let remove_plan = study::delete_calendar_task(&mut next.plans[plan_index], task_id)?;
     if remove_plan {
-        cfg.plans.remove(plan_index);
+        next.plans.remove(plan_index);
     }
-    save_config(cfg);
-    Ok(())
+    commit_config(cfg, next)
 }
 
 /// 删除指定计划。
-pub fn remove_study_plan(cfg: &mut AppConfig, plan_id: &str) {
-    cfg.plans.retain(|p| p.id != plan_id);
-    save_config(cfg);
+pub fn remove_study_plan(cfg: &mut AppConfig, plan_id: &str) -> Result<(), String> {
+    let mut next = cfg.clone();
+    next.plans.retain(|p| p.id != plan_id);
+    commit_config(cfg, next)
 }
 
 /// 切换计划状态（在 Active 和 Paused 之间切换）。
-pub fn toggle_study_plan_status(cfg: &mut AppConfig, plan_id: &str) {
-    if let Some(plan) = cfg.plans.iter_mut().find(|p| p.id == plan_id) {
-        plan.status = match plan.status {
-            PlanStatus::Active => PlanStatus::Paused,
-            PlanStatus::Paused => PlanStatus::Active,
-            other => other,
-        };
-        save_config(cfg);
-    }
+pub fn toggle_study_plan_status(cfg: &mut AppConfig, plan_id: &str) -> Result<(), String> {
+    let mut next = cfg.clone();
+    let Some(plan) = next.plans.iter_mut().find(|p| p.id == plan_id) else {
+        return Ok(());
+    };
+    plan.status = match plan.status {
+        PlanStatus::Active => PlanStatus::Paused,
+        PlanStatus::Paused => PlanStatus::Active,
+        other => other,
+    };
+    commit_config(cfg, next)
 }
 
 /// 切换某个任务的打卡状态并持久化。
@@ -607,8 +621,9 @@ pub fn checkin_study_task(
     plan_id: &str,
     task_id: &str,
 ) -> Result<bool, String> {
-    let res = study::toggle_task_checkin(&mut cfg.plans, plan_id, task_id)?;
-    save_config(cfg);
+    let mut next = cfg.clone();
+    let res = study::toggle_task_checkin(&mut next.plans, plan_id, task_id)?;
+    commit_config(cfg, next)?;
     Ok(res)
 }
 
@@ -618,14 +633,15 @@ pub fn push_forward_study_plan(
     plan_id: &str,
     destination_date: &str,
 ) -> Result<bool, String> {
-    let plan = cfg
+    let mut next = cfg.clone();
+    let plan = next
         .plans
         .iter_mut()
         .find(|p| p.id == plan_id)
         .ok_or_else(|| "未找到指定计划".to_string())?;
     let changed = study::push_forward_plan(plan, destination_date)?;
     if changed {
-        save_config(cfg);
+        commit_config(cfg, next)?;
     }
     Ok(changed)
 }
@@ -666,8 +682,7 @@ fn save_plan_change(
         .ok_or_else(|| "未找到指定计划".to_string())?;
     let changed = change(plan)?;
     if changed {
-        try_save_config(&next)?;
-        *cfg = next;
+        commit_config(cfg, next)?;
     }
     Ok(changed)
 }
@@ -679,14 +694,15 @@ pub fn advance_completed_study_tasks(
     future_date: &str,
     today: &str,
 ) -> Result<usize, String> {
-    let plan = cfg
+    let mut next = cfg.clone();
+    let plan = next
         .plans
         .iter_mut()
         .find(|plan| plan.id == plan_id)
         .ok_or_else(|| "未找到指定计划".to_string())?;
     let moved = study::advance_completed_tasks(plan, future_date, today)?;
     if moved > 0 {
-        save_config(cfg);
+        commit_config(cfg, next)?;
     }
     Ok(moved)
 }
@@ -697,18 +713,24 @@ pub fn add_daily_note(
     date_str: &str,
     note: &str,
 ) -> Result<DailyNote, String> {
-    let item = study::add_daily_note(&mut cfg.daily_notes, date_str, note)?;
-    save_config(cfg);
+    let mut next = cfg.clone();
+    let item = study::add_daily_note(&mut next.daily_notes, date_str, note)?;
+    commit_config(cfg, next)?;
     Ok(item)
 }
 
 /// 删除一条学习备注并保留同步删除标记。
-pub fn delete_daily_note(cfg: &mut AppConfig, date_str: &str, note_id: &str) -> bool {
-    let deleted = study::delete_daily_note(&mut cfg.daily_notes, date_str, note_id);
+pub fn delete_daily_note(
+    cfg: &mut AppConfig,
+    date_str: &str,
+    note_id: &str,
+) -> Result<bool, String> {
+    let mut next = cfg.clone();
+    let deleted = study::delete_daily_note(&mut next.daily_notes, date_str, note_id);
     if deleted {
-        save_config(cfg);
+        commit_config(cfg, next)?;
     }
-    deleted
+    Ok(deleted)
 }
 
 /// 读取某日期可见的全部学习备注。
@@ -717,204 +739,4 @@ pub fn get_daily_notes<'a>(cfg: &'a AppConfig, date_str: &str) -> Vec<&'a DailyN
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_days_rejects_empty_and_nonpositive() {
-        assert!(parse_days("").is_err());
-        assert!(parse_days("  ").is_err());
-        assert!(parse_days("abc").is_err());
-        assert!(parse_days("0").is_err());
-        assert!(parse_days("-3").is_err());
-        assert_eq!(parse_days(" 30 ").unwrap(), 30);
-    }
-
-    #[test]
-    fn sanitize_strips_path_characters() {
-        assert_eq!(sanitize("a/b:c*d?e\"f<g>h|i"), "abcdefghi");
-        assert_eq!(sanitize("正常标题").len(), 12);
-        assert_eq!(sanitize(&"x".repeat(100)).len(), 40);
-    }
-
-    #[test]
-    fn source_mode_roundtrip() {
-        assert_eq!(SourceMode::from_index(0), SourceMode::Bilibili);
-        assert_eq!(SourceMode::from_index(1), SourceMode::Jellyfin);
-        assert_eq!(SourceMode::from_index(2), SourceMode::FnOs);
-        // 越界索引回退到最后一个来源，不 panic。
-        assert_eq!(SourceMode::from_index(9), SourceMode::FnOs);
-        assert_eq!(SourceMode::Bilibili.index(), 0);
-        assert_eq!(SourceMode::Jellyfin.index(), 1);
-        assert_eq!(SourceMode::FnOs.index(), 2);
-    }
-
-    #[test]
-    fn fnos_credentials_roundtrip_and_legacy_defaults() {
-        let cfg = AppConfig {
-            fnos_server_url: "http://nas:5666".to_string(),
-            fnos_username: "admin".to_string(),
-            fnos_password: "secret".to_string(),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.fnos_server_url, "http://nas:5666");
-        assert_eq!(parsed.fnos_username, "admin");
-        assert_eq!(parsed.fnos_password, "secret");
-
-        // 旧配置没有这三个键时必须能无损读入。
-        let legacy: AppConfig = serde_json::from_str(r#"{"server_url":"http://jf"}"#).unwrap();
-        assert!(legacy.fnos_server_url.is_empty());
-        assert!(legacy.fnos_username.is_empty());
-        assert!(legacy.fnos_password.is_empty());
-        assert_eq!(legacy.sync_revision, 0);
-    }
-
-    #[test]
-    fn history_distinguishes_fnos_source_tag() {
-        let mut cfg = AppConfig::default();
-        record_history(&mut cfg, SourceMode::FnOs, "fv_abc", "飞牛剧集");
-        assert_eq!(cfg.history[0].source, "fnos");
-        // 同一输入在不同来源下视为两条独立记录。
-        record_history(&mut cfg, SourceMode::Jellyfin, "fv_abc", "");
-        assert_eq!(cfg.history.len(), 2);
-    }
-
-    #[test]
-    fn record_history_dedupes_and_prepends() {
-        let mut cfg = AppConfig::default();
-        record_history(&mut cfg, SourceMode::Bilibili, " BV1abc ", "合集A");
-        record_history(&mut cfg, SourceMode::Jellyfin, "http://jf/?id=1", "课程B");
-        assert_eq!(cfg.history.len(), 2);
-        assert_eq!(cfg.history[0].source, "jellyfin");
-
-        // 相同（来源, 输入）去重并置顶，不产生重复项。
-        record_history(&mut cfg, SourceMode::Bilibili, "BV1abc", "合集A·新标题");
-        assert_eq!(cfg.history.len(), 2);
-        assert_eq!(cfg.history[0].title, "合集A·新标题");
-        // 相同输入、不同来源视为两条。
-        record_history(&mut cfg, SourceMode::Jellyfin, "BV1abc", "");
-        assert_eq!(cfg.history.len(), 3);
-        // 空白输入不记录。
-        record_history(&mut cfg, SourceMode::Bilibili, "   ", "x");
-        assert_eq!(cfg.history.len(), 3);
-    }
-
-    #[test]
-    fn record_history_caps_at_limit() {
-        let total = HISTORY_LIMIT as i64 + 5;
-        let mut cfg = AppConfig::default();
-        for i in 0..total {
-            record_history(&mut cfg, SourceMode::Bilibili, &format!("BV{i:04}"), "");
-        }
-        assert_eq!(cfg.history.len(), HISTORY_LIMIT);
-        // 最新的留在最前，最旧的被截断。
-        assert_eq!(cfg.history[0].input, format!("BV{:04}", total - 1));
-        assert_eq!(
-            cfg.history.last().unwrap().input,
-            format!("BV{:04}", total - HISTORY_LIMIT as i64)
-        );
-    }
-
-    #[test]
-    fn remove_and_clear_history() {
-        let mut cfg = AppConfig::default();
-        record_history(&mut cfg, SourceMode::Bilibili, "BV1", "A");
-        record_history(&mut cfg, SourceMode::Bilibili, "BV2", "B");
-        remove_history(&mut cfg, 0);
-        assert_eq!(cfg.history.len(), 1);
-        assert_eq!(cfg.history[0].input, "BV1");
-        remove_history(&mut cfg, 99); // 越界静默
-        assert_eq!(cfg.history.len(), 1);
-        clear_history(&mut cfg);
-        assert!(cfg.history.is_empty());
-    }
-
-    /// 旧版配置文件（只有 Jellyfin 两键）必须能无损读入，且 auto_sync 缺省为 true。
-    #[test]
-    fn legacy_config_parses_with_empty_history() {
-        let cfg: AppConfig =
-            serde_json::from_str(r#"{"server_url": "http://jf:8096", "token": "t"}"#).unwrap();
-        assert_eq!(cfg.server_url, "http://jf:8096");
-        assert!(cfg.history.is_empty());
-        assert!(cfg.auto_sync);
-    }
-
-    #[test]
-    fn auto_sync_config_roundtrip() {
-        let cfg_default = AppConfig::default();
-        assert!(cfg_default.auto_sync);
-
-        let json = serde_json::to_string(&cfg_default).unwrap();
-        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
-        assert!(parsed.auto_sync);
-
-        let parsed_false: AppConfig = serde_json::from_str(r#"{"auto_sync": false}"#).unwrap();
-        assert!(!parsed_false.auto_sync);
-    }
-
-    #[test]
-    fn daily_notes_migrate_from_legacy_single_string_format() {
-        let cfg: AppConfig =
-            serde_json::from_str(r#"{"daily_notes":{"2026-09-03":"旧版单条备注"}}"#).unwrap();
-        let notes = get_daily_notes(&cfg, "2026-09-03");
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].content, "旧版单条备注");
-    }
-
-    #[test]
-    fn local_sqlite_roundtrip_keeps_all_desktop_data() {
-        let dir = std::env::temp_dir().join(format!("bili_planner_local_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let db_path = dir.join("config.sqlite3");
-        let mut cfg = AppConfig {
-            server_url: "https://media.example.com".to_string(),
-            token: "jf-token".to_string(),
-            sync_revision: 7,
-            ..Default::default()
-        };
-        record_history(&mut cfg, SourceMode::Bilibili, "BV1test", "测试合集");
-        cfg.plans
-            .push(study::create_custom_study_plan("背单词", "2026-09-03", 3, 30, false).unwrap());
-        let plan_id = cfg.plans[0].id.clone();
-        study::checkin_entire_day(&mut cfg.plans, &plan_id, "2026-09-04").unwrap();
-        study::advance_completed_tasks(&mut cfg.plans[0], "2026-09-04", "2026-09-03").unwrap();
-        assert!(!cfg.plans[0].advance_shifts.is_empty());
-        study::add_daily_note(&mut cfg.daily_notes, "2026-09-03", "完成第一组单词").unwrap();
-
-        LocalConfigStore::save(&db_path, &cfg).unwrap();
-        let loaded = LocalConfigStore::load(&db_path).unwrap();
-        assert_eq!(loaded.server_url, cfg.server_url);
-        assert_eq!(loaded.sync_revision, 7);
-        assert_eq!(loaded.history, cfg.history);
-        assert_eq!(loaded.plans, cfg.plans);
-        assert_eq!(
-            study::get_daily_notes(&loaded.daily_notes, "2026-09-03").len(),
-            1
-        );
-    }
-
-    #[test]
-    fn local_json_is_imported_to_sqlite_and_kept_as_backup() {
-        let dir =
-            std::env::temp_dir().join(format!("bili_planner_migration_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let db_path = dir.join("config.sqlite3");
-        let json_path = dir.join("legacy.json");
-        let cfg = AppConfig {
-            sync_device_token: Some("device-token".to_string()),
-            ..Default::default()
-        };
-        std::fs::write(&json_path, serde_json::to_string(&cfg).unwrap()).unwrap();
-
-        let imported = load_config_at(&db_path, &json_path).unwrap();
-        assert_eq!(imported.sync_device_token, cfg.sync_device_token);
-        assert!(db_path.exists());
-        assert!(json_path.exists());
-        assert_eq!(
-            LocalConfigStore::load(&db_path).unwrap().sync_device_token,
-            cfg.sync_device_token
-        );
-    }
-}
+mod tests;

@@ -249,6 +249,11 @@ async fn modal_actions_prefill_and_reset_edit_state(cx: &mut TestAppContext) {
                 app.cloud_server_input.read(cx).value().to_string(),
                 "https://plan.example"
             );
+
+            // 清空配置后再打开设置面板，输入框应为清空状态
+            app.config.sync_server_url = String::new();
+            app.open_cloud_settings_action(window, cx);
+            assert_eq!(app.cloud_server_input.read(cx).value().to_string(), "");
         })
         .expect("window update should succeed");
 }

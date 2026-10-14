@@ -23,16 +23,21 @@ impl PlannerApp {
     }
 
     /// 删除单条历史。
-    pub(super) fn remove_history_entry(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn remove_history_entry(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         remove_history(&mut self.config, index);
-        save_config(&self.config);
+        self.persist_config(window, cx);
         cx.notify();
     }
 
     /// 一键清空历史。
-    pub(super) fn clear_all_history(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn clear_all_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         clear_history(&mut self.config);
-        save_config(&self.config);
+        self.persist_config(window, cx);
         cx.notify();
     }
 
@@ -56,7 +61,7 @@ impl PlannerApp {
             .border_color(hsla(0.0, 0.0, 0.04, 1.0))
             .hover(|s| s.bg(hsla(0.0, 0.0, 0.04, 0.12)))
             .child("清空")
-            .on_click(cx.listener(|this, _, _, cx| this.clear_all_history(cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.clear_all_history(window, cx)));
 
         let rows: Vec<gpui::AnyElement> = self
             .config
@@ -137,8 +142,8 @@ impl PlannerApp {
                                     .size_3p5()
                                     .text_color(muted),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_history_entry(i, cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.remove_history_entry(i, window, cx);
                             })),
                     )
                     .into_any_element()

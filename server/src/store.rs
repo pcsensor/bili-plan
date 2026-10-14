@@ -906,6 +906,22 @@ impl Store {
         inserted
     }
 
+    /// 删除设备及其云端数据（计划、备注随外键级联），并解除机器人绑定。
+    ///
+    /// 返回是否实际删除了设备行；设备不存在时返回 `false`，调用方按幂等成功处理。
+    pub async fn delete_device(&self, device_token: &str) -> Result<bool, &'static str> {
+        let mut conn = self.conn.lock().map_err(|_| "SQLite 锁异常")?;
+        let tx = conn.transaction().map_err(|_| "数据库写入失败")?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM devices WHERE device_token = ?1",
+                [device_token],
+            )
+            .map_err(|_| "数据库写入失败")?;
+        tx.commit().map_err(|_| "数据库写入失败")?;
+        Ok(deleted > 0)
+    }
+
     /// Allow the scheduler to retry a failed send in its next polling cycle.
     pub async fn release_pushed_date(&self, open_id: &str, push_type: &str, date: &str) {
         if let Ok(conn) = self.conn.lock() {

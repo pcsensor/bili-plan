@@ -154,13 +154,23 @@ fn persist_cloud_token(cfg: &mut AppConfig, token: String) {
 ///
 /// 只有服务端回带 `unknown_device` 机器错误码的 404 才说明本机令牌已不被承认。
 /// 普通代理/路由 404 不会触发轮换；替换令牌也只在目标请求重试成功后持久化。
+fn require_cloud_server(cfg: &AppConfig) -> Result<String, CloudFailure> {
+    let server = cfg.sync_server_url.trim().trim_end_matches('/').to_string();
+    if server.is_empty() {
+        return Err(CloudFailure::Other(
+            "尚未配置云端服务器地址，请先在「云端设置」中填写。".to_string(),
+        ));
+    }
+    Ok(server)
+}
+
 fn cloud_request(
     cfg: &mut AppConfig,
     path: &str,
     request: CloudRequest<'_>,
     timeout: std::time::Duration,
 ) -> Result<serde_json::Value, CloudFailure> {
-    let server = cfg.sync_server_url.trim_end_matches('/').to_string();
+    let server = require_cloud_server(cfg)?;
     let existing_token = cfg
         .sync_device_token
         .clone()
@@ -199,6 +209,67 @@ fn cloud_request(
     }
 }
 
+/// 清空云端绑定相关的本地状态。保留 `sync_server_url`，方便之后重新绑定。
+pub fn clear_cloud_binding_state(cfg: &mut AppConfig) {
+    cfg.sync_device_token = None;
+    cfg.sync_revision = 0;
+    cfg.feishu_bound = false;
+    cfg.feishu_user_name = None;
+    cfg.telegram_bound = false;
+    cfg.telegram_user_name = None;
+}
+
+/// 解除绑定的本地结果。
+///
+/// 本地状态总是被清空：云端失联时用户仍须能切断绑定，不能把网络失败当成解绑失败。
+#[derive(Debug, Clone)]
+pub struct CloudUnbindReport {
+    /// 展示给用户的说明。
+    pub message: String,
+    /// 云端是否确认删除了设备（失联时为 false）。
+    pub remote_cleaned: bool,
+}
+
+/// 解除本机与云端的绑定：尽力删除云端设备，并清空本地令牌、版本与机器人绑定状态。
+///
+/// 服务端已不存在该设备时按成功处理（幂等）。网络失败**不阻止**本地解绑，
+/// 只在返回消息中说明云端清理未完成；保留 `sync_server_url`，方便之后重新绑定。
+pub fn delete_cloud_binding(cfg: &mut AppConfig) -> CloudUnbindReport {
+    let existing_token = cfg
+        .sync_device_token
+        .clone()
+        .filter(|token| !token.trim().is_empty());
+    let mut remote_failure = None;
+    if let Some(token) = existing_token {
+        // 不能走 `cloud_request`：它会在 unknown_device 时自动重新注册，与解除绑定相反。
+        // 未配置地址时跳过远程删除：本地解绑仍必须成功。
+        let remote = require_cloud_server(cfg).and_then(|server| {
+            send_cloud(
+                &server,
+                "/api/device/unregister",
+                CloudRequest::PostEmpty,
+                &token,
+                CLOUD_TIMEOUT,
+            )
+        });
+        match remote {
+            Ok(_) | Err(CloudFailure::UnknownDevice) => {}
+            Err(failure) => remote_failure = Some(failure.message()),
+        }
+    }
+    clear_cloud_binding_state(cfg);
+    match remote_failure {
+        None => CloudUnbindReport {
+            message: "已解除云端绑定；本地计划仍保留，可随时重新绑定。".to_string(),
+            remote_cleaned: true,
+        },
+        Some(reason) => CloudUnbindReport {
+            message: format!("已解除本地绑定；云端清理未完成（{reason}）。服务恢复后可忽略，或重新绑定以继续云同步。"),
+            remote_cleaned: false,
+        },
+    }
+}
+
 /// 请求云端 6 位绑定验证码。
 pub fn request_cloud_bind_code(cfg: &mut AppConfig) -> Result<(String, u64), String> {
     let data = cloud_request(
@@ -213,7 +284,7 @@ pub fn request_cloud_bind_code(cfg: &mut AppConfig) -> Result<(String, u64), Str
         .ok_or_else(|| "缺少 bind_code".to_string())?
         .to_string();
     let expires = data["expires_in_secs"].as_u64().unwrap_or(600);
-    save_config(cfg);
+    try_save_config(cfg)?;
     Ok((code, expires))
 }
 
@@ -230,7 +301,7 @@ pub fn check_cloud_bind_status(cfg: &mut AppConfig) -> Result<bool, String> {
     cfg.feishu_user_name = data["feishu_user_name"].as_str().map(|s| s.to_string());
     cfg.telegram_bound = data["telegram_bound"].as_bool().unwrap_or(false);
     cfg.telegram_user_name = data["telegram_user_name"].as_str().map(|s| s.to_string());
-    save_config(cfg);
+    try_save_config(cfg)?;
 
     Ok(bound)
 }

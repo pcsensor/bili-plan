@@ -20,7 +20,7 @@ use chrono::Local;
 use feishu::FeishuClient;
 use models::{
     BindRequestResponse, BindStatusResponse, CardActionData, DeviceUser, FeishuCallbackRequest,
-    FeishuTextContent, RegisterResponse, SyncError, SyncPayload, SyncResponse,
+    FeishuTextContent, RegisterResponse, SyncError, SyncPayload, SyncResponse, UnregisterResponse,
 };
 use ratelimit::RateLimiter;
 use serde_json::{json, Value};
@@ -47,6 +47,9 @@ const BIND_REQUEST_PER_TOKEN: u32 = 10;
 const BIND_REQUEST_PER_IP: u32 = 40;
 const BIND_STATUS_PER_TOKEN: u32 = 60;
 const BIND_STATUS_PER_IP: u32 = 300;
+/// 解除绑定是低频破坏性操作，额度只需挡住脚本滥用。
+const UNREGISTER_PER_TOKEN: u32 = 10;
+const UNREGISTER_PER_IP: u32 = 40;
 
 #[derive(Clone)]
 struct AppState {
@@ -214,6 +217,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health_check))
         .route("/api/device/register", post(register_device))
+        .route("/api/device/unregister", post(unregister_device))
         .route("/api/bind/request", post(request_bind_code))
         .route("/api/bind/status", get(query_bind_status))
         .route("/api/sync", post(sync_plans))
@@ -277,6 +281,41 @@ async fn register_device(
     Ok(Json(RegisterResponse {
         device_token: user.device_token,
     }))
+}
+
+/// 解除设备与云端的绑定：删除设备行及级联的计划/备注，并同时解除飞书/Telegram 绑定。
+///
+/// 令牌只走 `Authorization: Bearer`。设备已不存在时按幂等成功返回，方便客户端清理本地状态。
+async fn unregister_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Json<UnregisterResponse>, ApiError> {
+    let user = authorize_device(
+        &state,
+        &headers,
+        &peer,
+        RatePolicy {
+            scope: "unregister",
+            token_limit: UNREGISTER_PER_TOKEN,
+            ip_limit: UNREGISTER_PER_IP,
+            window: HOUR,
+        },
+    )
+    .await?;
+    let deleted = state
+        .store
+        .delete_device(&user.device_token)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // 令牌是不记名密钥，不能落进日志；只记来源 IP 与是否实际删除。
+    let ip = auth::client_ip(&headers, Some(&peer));
+    info!(
+        "已为 {} 解除云端绑定（设备存在={}）",
+        ip,
+        if deleted { "是" } else { "否" }
+    );
+    Ok(Json(UnregisterResponse { success: true }))
 }
 
 /// 客户端请求 6 位绑定码。
@@ -660,6 +699,39 @@ mod tests {
             .unwrap();
         let bind_json = serde_json::to_value(bind.0).unwrap();
         assert!(bind_json.get("device_token").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unregister_requires_bearer_and_removes_device() {
+        let dir = std::env::temp_dir().join(format!("bili_unbind_{}", rand::random::<u64>()));
+        let store = Store::new(&dir);
+        let token = store.register_device().await.unwrap().device_token;
+        let state = AppState {
+            store: store.clone(),
+            feishu: FeishuClient::new("test-app", "test-secret"),
+            feishu_verification_token: "test-verification".to_string(),
+            limiter: RateLimiter::new(),
+        };
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let rejected =
+            unregister_device(State(state.clone()), HeaderMap::new(), ConnectInfo(peer)).await;
+        assert_eq!(rejected.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        let ok = unregister_device(State(state.clone()), headers.clone(), ConnectInfo(peer))
+            .await
+            .unwrap();
+        assert!(ok.0.success);
+        assert!(store.get_device_by_token(&token).await.unwrap().is_none());
+
+        // 设备已删除后再解除：返回 unknown_device，客户端按幂等成功清理本地。
+        let again = unregister_device(State(state), headers, ConnectInfo(peer)).await;
+        let (status, body) = again.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["code"], "unknown_device");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -165,7 +165,7 @@ impl PlannerApp {
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.config.auto_sync = !this.config.auto_sync;
-                save_config(&this.config);
+                this.persist_config(window, cx);
                 let state_str = if this.config.auto_sync {
                     "开启"
                 } else {

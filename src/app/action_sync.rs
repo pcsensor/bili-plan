@@ -52,7 +52,7 @@ impl PlannerApp {
                             this.config.sync_device_token = synced_cfg.sync_device_token;
                         }
                         this.config.sync_revision = synced_cfg.sync_revision;
-                        save_config(&this.config);
+                        this.persist_config(window, cx);
 
                         let feishu_status = if this.config.feishu_bound {
                             format!(
@@ -143,7 +143,7 @@ impl PlannerApp {
                             this.config.sync_device_token = synced_cfg.sync_device_token;
                         }
                         this.config.sync_revision = synced_cfg.sync_revision;
-                        save_config(&this.config);
+                        this.persist_config(window, cx);
                         window.push_notification(
                             Notification::success("☁️ 检测到修改，已自动同步到云端"),
                             cx,
@@ -177,6 +177,35 @@ impl PlannerApp {
             }
             Err(e) => {
                 window.push_notification(Notification::error(e), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 解除云端绑定：删除云端设备与机器人绑定，并清空本机令牌与版本。
+    ///
+    /// 云端失联时仍解除本地绑定，只在提示里说明云端清理未完成。
+    pub(super) fn delete_cloud_binding_action(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let report = delete_cloud_binding(&mut self.config);
+        self.cloud_unbind_confirm = false;
+        self.cloud_settings_modal_open = false;
+        match try_save_config(&self.config) {
+            Ok(()) => {
+                if report.remote_cleaned {
+                    window.push_notification(Notification::success(report.message), cx);
+                } else {
+                    window.push_notification(Notification::warning(report.message), cx);
+                }
+            }
+            Err(e) => {
+                window.push_notification(
+                    Notification::error(format!("{} 但保存本地配置失败：{e}", report.message)),
+                    cx,
+                );
             }
         }
         cx.notify();
